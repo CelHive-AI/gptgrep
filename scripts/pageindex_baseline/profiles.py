@@ -39,4 +39,3 @@ def resolve(args) -> dict:
         "index_effort_note": "Upstream index effort is unspecified; executed local index effort is an explicit backend adaptation.",
         "historical_reproduction_claimed": False,
     }
-

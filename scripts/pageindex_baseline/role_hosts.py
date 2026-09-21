@@ -26,4 +26,3 @@ class RoleHost:
                 return self.shared.complete(instructions, state, schema)
             finally:
                 self.shared.model, self.shared.effort, self.shared.phase = previous
-

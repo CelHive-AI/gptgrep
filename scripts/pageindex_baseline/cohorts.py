@@ -30,4 +30,3 @@ def select(value: str, size: int, groups: dict[str, set[int]]) -> list[int]:
     if not selected or any(not 0 <= row < size for row in selected):
         raise ValueError("Invalid selected source rows")
     return selected
-
