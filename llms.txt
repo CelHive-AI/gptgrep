@@ -5,10 +5,10 @@
 - [Goal contract](workspace/harness-config/goal-contract.json): live PageIndex comparison gates; a preview release alone does not meet them.
 - [Current research gaps](workspace/issues/research-gaps.json): source-backed failures and next experiments.
 - [Architecture](docs/architecture.md): parsing, trees, trigram filtering, Jev and the local Codex host.
-- [Primary-source research](docs/research/README.md): detailed reports and source distinctions.
+- Local research entry: `docs/research/README.md` (ignored and untracked).
 - [Flash stage coverage](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md): verified port stages, LiteParse alternatives and pending parity.
-- [Paired baseline plan](docs/research/paired-baseline-plan.md): actual upstream execution, backend substitutions and comparison controls.
-- [Evaluation method](docs/research/evaluation-method.md): correctness, quality, latency, cost and failure denominators.
+- Local paired plan: `docs/research/paired-baseline-plan.md` (ignored and untracked).
+- [Baseline runner](scripts/pageindex_baseline/README.md): reproducible controls, execution and accounting.
 - [Local host defaults](config/codex-host.toml): gpt-5.6-luna / max; account selected at runtime.
 - [Release workflow](docs/release.md): source binding, native dependency notices and relocation.
 

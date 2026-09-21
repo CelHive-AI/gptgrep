@@ -9,9 +9,10 @@ inference occurs only when the caller selects `hybrid`, `semantic`, `judge`, `as
 or `summarize`. The reasoning agent can compose searches, inspect trees and read
 bounded nodes before answering.
 
-This is an initial development release. See [architecture](docs/architecture.md),
-[source research](docs/research/README.md), and the explicit
+This is an initial development release. See [architecture](docs/architecture.md)
+and the explicit
 [Flash stage coverage](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md).
+Maintainer research notes under `docs/research/` are local-only and untracked.
 
 ## Build and use
 
@@ -131,8 +132,8 @@ prompts are never silently truncated. This completion mode does not claim citati
 verification. It supports the declared provider bridge used to run original
 PageIndex summary/optimization prompts during comparative evaluation.
 
-The app-server API is experimental. Source/protocol findings and actual supported
-boundaries are recorded in [the host report](docs/research/codex-host.md).
+The app-server API is experimental. Supported boundaries and configuration are
+recorded in [the host crate documentation](crates/gptgrep-host/README.md).
 
 ## Optional incur interface
 
@@ -173,8 +174,9 @@ live host/provider receipts are separate evidence.
 External PageIndex data is referenced by a pinned manifest and is not redistributed.
 Running GPTgrep on that subset is distinct from executing the original PageIndex
 SDK baseline. Historical upstream benchmark numbers are not GPTgrep measurements.
-See [evaluation method](docs/research/evaluation-method.md) for denominators,
-ablation boundaries, failed cases and cost accounting.
+See [the baseline runner](scripts/pageindex_baseline/README.md) for denominators,
+ablation boundaries, failed cases and cost accounting. Detailed local research
+and experimental interpretation remain under the ignored `docs/research/` path.
 
 ## Limits of this release
 

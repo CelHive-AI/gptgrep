@@ -16,6 +16,7 @@ Never modify the upstream reference checkouts. Pin reused source and retain lice
 Keep credentials in the process environment; never commit credentials or private corpora.
 Public artifacts must not contain private session identities or machine paths.
 Private evidence and exact native provenance belong under .local/ or workspace/handoff/.
+Keep docs/research/ local-only, ignored and untracked; preserve its files locally.
 Every completed code round requires a commit and verified refs/notes/commits PoUW.
 Back up Git history and notes to a local verified bundle under .local/backups/;
 push source and tags to the authorized origin when release checks pass. Do not push
