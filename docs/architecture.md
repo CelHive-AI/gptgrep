@@ -1,5 +1,7 @@
 # GPTgrep architecture
 
+English | [简体中文](architecture.zh-CN.md) | [日本語](architecture.ja.md)
+
 GPTgrep gives a reasoning agent fast, inspectable access to local documents. It
 keeps exact retrieval, probabilistic judgments, and model-written synthesis as
 separate operations with separate receipts.
@@ -126,6 +128,9 @@ Long snippets are bounded around the match instead of truncating preceding
 context and losing the match. Text byte intervals preserve CRLF and Unicode.
 The core precomputes line offsets once per document and stops formatting after
 the requested regex result count, so output limits also bound presentation work.
+Node reads provide `node_offset` and `next_offset` for bounded continuation.
+Each delivered window is revalidated at its exact offset and length; native grep
+context that crosses a node boundary retains its context and has no node cursor.
 
 The native CLI is the canonical grep interface. Its optional incur wrapper passes
 typed JSON requests to native argv without shell interpolation. MCP, updater and

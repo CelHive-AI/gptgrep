@@ -1,5 +1,7 @@
 # GPTgrep
 
+English | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
+
 Local document retrieval for agents: **Rust parsing and document trees, embedded
 trigram grep, optional Jev routing/reranking, and a local Codex reasoning host**.
 No vector database, no search daemon, and no MCP server.
@@ -57,6 +59,9 @@ gptgrep --llms
 `--limit` bounds returned results. `--context` defaults to zero. Exit status is 0
 for success/matches, 1 for no matches, and 2 for an error or excluded stale
 evidence. JSON is one object on stdout; diagnostics belong on stderr.
+Node reads return `next_offset`; pass that value to `read --offset` to continue.
+Offsets count UTF-8 bytes within the node, and each window retains exact source
+coordinates. This lets agents inspect large sections without an unbounded reply.
 
 ## Jev helper
 
