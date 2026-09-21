@@ -90,14 +90,19 @@ class IndexProvider(CustomLLM):
         if model != INDEX_ALIAS:
             raise CustomLLMError(401, "Adapter refuses a changed indexing model")
         try:
-            value, _ = self.host.complete(
+            selected_model = self.host.model
+            value, report = self.host.complete(
                 "Return the assistant response to the supplied conversation exactly as requested, inside the text field.",
                 {"messages": messages}, TEXT_SCHEMA,
             )
         except AdapterError as error:
             raise CustomLLMError(error.status_code, f"{error.code}: {error}") from error
+        return self._response(value, report.get("model", selected_model))
+
+    @staticmethod
+    def _response(value, model):
         response = ModelResponse(
-            model=self.host.model,
+            model=model,
             choices=[{"index": 0, "message": {"role": "assistant", "content": value["text"]}, "finish_reason": "stop"}],
         )
         # Upstream indexing ignores usage. Actual native usage is authoritative in
@@ -106,7 +111,17 @@ class IndexProvider(CustomLLM):
         return response
 
     async def acompletion(self, model, messages, **kwargs):
-        return await asyncio.to_thread(self.completion, model, messages, **kwargs)
+        if model != INDEX_ALIAS:
+            raise CustomLLMError(401, "Adapter refuses a changed indexing model")
+        selected_model = self.host.model
+        try:
+            value, report = await self.host.acomplete(
+                "Return the assistant response to the supplied conversation exactly as requested, inside the text field.",
+                {"messages": messages}, TEXT_SCHEMA,
+            )
+        except AdapterError as error:
+            raise CustomLLMError(error.status_code, f"{error.code}: {error}") from error
+        return self._response(value, report.get("model", selected_model))
 
 
 def register_index_provider(host):
@@ -178,21 +193,25 @@ class ResponsesTransport(httpx.AsyncBaseTransport):
             raise RuntimeError("The baseline adapter supports non-streaming Responses only")
         if body.get("model") != self.host.model:
             raise RuntimeError("The baseline request changed the selected chat model")
-        wire = {"phase": self.host.phase, "request_sha256": sha(body),
+        selected_model = self.host.model
+        wire = {"phase": self.host.phase, "requested_service_tier": getattr(self.host, "service_tier", "fast"), "request_sha256": sha(body),
                 "instructions_sha256": sha(body.get("instructions")), "input_sha256": sha(body.get("input")),
                 "tool_schemas_sha256": sha(body.get("tools")), "request_bytes": len(request.content)}
         try:
             instructions, state, schema, provenance = decision_request(body)
             wire.update(provenance)
-            value, _ = await asyncio.to_thread(
-                self.host.complete, instructions, state, schema,
-            )
-            response = response_body(body, value, self.host.model)
+            value, report = await self.host.acomplete(instructions, state, schema)
+            response = response_body(body, value, report.get("model", selected_model))
             wire.update(status="completed", output_sha256=sha(response["output"]),
+                        effective_service_tier=report.get("effective_service_tier"),
                         index_context=index_context_observation(body.get("input", [])),
                         assistant_tool_calls=sum(item["type"] == "function_call" for item in response["output"]))
             self.wire_receipts.append(wire)
             return httpx.Response(200, json=response, request=request)
+        except asyncio.CancelledError:
+            wire.update(status="interrupted", error_code="host_cancelled")
+            self.wire_receipts.append(wire)
+            raise
         except (AdapterError, ValueError, jsonschema.ValidationError) as error:
             wire.update(status="failed", error_code=getattr(error, "code", type(error).__name__))
             self.wire_receipts.append(wire)

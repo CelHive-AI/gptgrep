@@ -4,6 +4,135 @@ mod mandatory;
 use crate::{protocol, retrieval::Evidence};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
 
+#[test]
+fn service_tier_configuration_preserves_supported_values() {
+    assert_eq!(HostConfig::default().service_tier, "fast");
+    for tier in ["fast", "priority", "flex", "default"] {
+        let config = HostConfig {
+            service_tier: tier.into(),
+            ..HostConfig::default()
+        };
+        validate_config(&config, "query").unwrap();
+        assert_eq!(config.service_tier, tier);
+    }
+    for tier in ["", "auto", "scale", "FAST", " fast", "fast\n"] {
+        let config = HostConfig {
+            service_tier: tier.into(),
+            ..HostConfig::default()
+        };
+        assert!(validate_config(&config, "query").is_err());
+    }
+}
+
+#[tokio::test]
+async fn service_tier_acknowledgement_preserves_absence_and_fast_aliases() {
+    let cwd = tempfile::tempdir().unwrap();
+    for (requested, reported) in [
+        ("fast", None),
+        ("fast", Some(Value::Null)),
+        ("fast", Some(json!("priority"))),
+        ("fast", Some(json!("fast"))),
+        ("priority", Some(json!("fast"))),
+        ("flex", Some(json!("flex"))),
+        ("default", Some(json!("default"))),
+    ] {
+        let expected = reported.as_ref().and_then(Value::as_str).map(str::to_owned);
+        let (client, server) = tokio::io::duplex(65536);
+        let (reader, writer) = tokio::io::split(client);
+        let (server_reader, mut server_writer) = tokio::io::split(server);
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(server_reader);
+            handshake_thread(&mut reader, &mut server_writer, false, requested, reported).await;
+            handshake_turn(&mut reader, &mut server_writer, false, requested).await;
+            send(&mut server_writer, json!({"method":"turn/completed","params":{
+                "threadId":"thread-native","turn":{"id":"turn-native","status":"completed","items":[
+                {"type":"agentMessage","phase":"final_answer","text":"{}"}]}
+            }})).await;
+        });
+        let config = HostConfig {
+            service_tier: requested.into(),
+            ..HostConfig::default()
+        };
+        let state = json!({});
+        let schema = json!({});
+        let outcome = protocol::run(
+            BufReader::new(reader),
+            writer,
+            cwd.path(),
+            &config,
+            protocol::Workflow::Completion {
+                instructions: "Return an empty object.",
+                state: &state,
+                schema: &schema,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(outcome.service_tier, expected);
+        assert_eq!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("did not report an effective thread service tier")),
+            expected.is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn changed_or_malformed_service_tier_stops_before_inference_without_fallback() {
+    let cwd = tempfile::tempdir().unwrap();
+    for reported in [
+        json!("default"),
+        json!("flex"),
+        json!(""),
+        json!(true),
+        json!([]),
+    ] {
+        let (client, server) = tokio::io::duplex(65536);
+        let (reader, writer) = tokio::io::split(client);
+        let (server_reader, mut server_writer) = tokio::io::split(server);
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(server_reader);
+            handshake_thread(
+                &mut reader,
+                &mut server_writer,
+                false,
+                "fast",
+                Some(reported),
+            )
+            .await;
+            let mut next = String::new();
+            assert_eq!(
+                reader.read_line(&mut next).await.unwrap(),
+                0,
+                "Unexpected inference or fallback request: {next}"
+            );
+        });
+        let state = json!({});
+        let schema = json!({});
+        let error = protocol::run(
+            BufReader::new(reader),
+            writer,
+            cwd.path(),
+            &HostConfig::default(),
+            protocol::Workflow::Completion {
+                instructions: "Return an empty object.",
+                state: &state,
+                schema: &schema,
+            },
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("service tier"), "{error}");
+        server.await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn broader_effective_permissions_are_rejected_before_turn_start() {
     let root = fixture().await;
@@ -633,6 +762,16 @@ async fn handshake(reader: &mut Reader, writer: &mut Writer) {
     let _ = handshake_mode(reader, writer, true).await;
 }
 async fn handshake_mode(reader: &mut Reader, writer: &mut Writer, dynamic: bool) -> Value {
+    handshake_thread(reader, writer, dynamic, "fast", Some(json!("priority"))).await;
+    handshake_turn(reader, writer, dynamic, "fast").await
+}
+async fn handshake_thread(
+    reader: &mut Reader,
+    writer: &mut Writer,
+    dynamic: bool,
+    requested_tier: &str,
+    effective_tier: Option<Value>,
+) {
     let init = receive(reader).await;
     assert_eq!(init["method"], "initialize");
     assert_eq!(init["params"]["capabilities"]["experimentalApi"], true);
@@ -649,6 +788,11 @@ async fn handshake_mode(reader: &mut Reader, writer: &mut Writer, dynamic: bool)
     let params = &thread["params"];
     assert_eq!(params["model"], DEFAULT_MODEL);
     assert_eq!(params["config"]["model_reasoning_effort"], "max");
+    assert_eq!(params["serviceTier"], requested_tier);
+    assert_eq!(params["config"]["service_tier"], requested_tier);
+    if matches!(requested_tier, "fast" | "priority") {
+        assert_eq!(params["config"]["features.fast_mode"], true);
+    }
     assert_eq!(params["ephemeral"], true);
     assert_eq!(params["environments"], json!([]));
     assert_eq!(
@@ -677,17 +821,26 @@ async fn handshake_mode(reader: &mut Reader, writer: &mut Writer, dynamic: bool)
     } else {
         assert_eq!(params["dynamicTools"], json!([]));
     }
-    send(
-        writer,
-        json!({"id":3,"result":{
-            "thread":{"id":"thread-native"},"model":DEFAULT_MODEL,"modelProvider":"openai","reasoningEffort":"max",
-            "approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}
-        }}),
-    )
-    .await;
+    let mut result = json!({
+        "thread":{"id":"thread-native"},"model":DEFAULT_MODEL,"modelProvider":"openai","reasoningEffort":"max",
+        "approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}
+    });
+    if let Some(tier) = effective_tier {
+        result["serviceTier"] = tier;
+    }
+    send(writer, json!({"id":3,"result":result})).await;
+}
+async fn handshake_turn(
+    reader: &mut Reader,
+    writer: &mut Writer,
+    dynamic: bool,
+    requested_tier: &str,
+) -> Value {
     let turn = receive(reader).await;
     assert_eq!(turn["method"], "turn/start");
     assert_eq!(turn["params"]["effort"], "max");
+    assert_eq!(turn["params"]["serviceTier"], requested_tier);
+    assert!(turn["params"].get("serviceTierForTurn").is_none());
     if dynamic {
         assert_eq!(
             turn["params"]["outputSchema"]["additionalProperties"],
@@ -807,6 +960,7 @@ async fn mock_model_drives_real_catalog_tree_read_and_checked_citations() {
     assert_eq!(outcome.turn_id, "turn-native");
     assert_eq!(outcome.model, DEFAULT_MODEL);
     assert_eq!(outcome.effort.as_deref(), Some("max"));
+    assert_eq!(outcome.service_tier.as_deref(), Some("priority"));
     assert_eq!(outcome.usage.unwrap()["total"]["totalTokens"], 123);
     assert_eq!(answer, "Records are retained for seven years.");
     assert!(!insufficient);

@@ -15,6 +15,7 @@ import statistics
 import subprocess
 import sys
 import time
+import jsonschema
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts/pageindex_baseline"))
@@ -23,7 +24,7 @@ import profiles
 import cohorts
 from bridge import AdapterError, LocalCodex, json_bytes, owned_process
 from role_hosts import RoleHost
-from run import fingerprint, judge_constants, private_directory, write_json
+from run import checkpoint_attempt, fingerprint, judge_constants, private_directory, write_json
 
 
 def ask_arguments(binary: Path, root: Path, row: dict, args) -> list[str]:
@@ -31,7 +32,8 @@ def ask_arguments(binary: Path, root: Path, row: dict, args) -> list[str]:
     return [str(binary), "ask", "--document=" + row["doc_id"],
             "--jev-model", args.jev_model, "--codex-bin", args.codex_bin,
             "--codex-home", str(args.codex_home.expanduser().resolve()), "--model", args.model,
-            "--reasoning-effort", args.reasoning_effort, "--timeout", str(args.timeout),
+            "--reasoning-effort", args.reasoning_effort, "--service-tier", args.service_tier,
+            "--timeout", str(args.timeout),
             "--max-tool-calls", str(args.max_tool_calls), "--json", "--", row["question"], str(root)]
 
 
@@ -48,6 +50,22 @@ def jev_receipt(report: dict) -> dict | None:
         if isinstance(nested, dict) and isinstance(nested.get("jev"), dict):
             return nested["jev"]
     return None
+
+
+def service_tier_metadata(requested: str, report: dict) -> dict:
+    return {"requested_service_tier": requested,
+            "reported_requested_service_tier": report.get("requested_service_tier"),
+            "effective_service_tier": report.get("effective_service_tier")}
+
+
+def tier_matches(requested: str, observed: str | None) -> bool:
+    # The local Codex protocol may acknowledge fast as its priority alias.
+    # Absence is unobserved, never confirmation that the requested tier applied.
+    if observed is None:
+        return True
+    if not isinstance(observed, str):
+        return False
+    return ("priority" if requested == "fast" else requested) == ("priority" if observed == "fast" else observed)
 
 
 def jev_cost(jev: dict | None) -> dict:
@@ -107,6 +125,8 @@ def native_metrics(report: dict, doc_id: str, gold_pages: set[int]) -> dict:
         "cited_target_pages": sorted({page for citation in cited if citation.get("path") == doc_id
                                      for page in range(citation.get("page_start", 1), citation.get("page_end", 0) + 1)}),
         "native_host_usage": report.get("usage"), "native_host_elapsed_ms": report.get("elapsed_ms", report.get("host_retrieval", {}).get("elapsed_ms")),
+        "requested_service_tier": report.get("requested_service_tier"),
+        "effective_service_tier": report.get("effective_service_tier"),
         "jev_search_elapsed_ms": sum(search_times) if search_times and all(isinstance(value, (int, float)) for value in search_times) else None,
         "native_startup_elapsed_ms": None, "model_inference_elapsed_ms": None,
         "timing_components_may_overlap": True,
@@ -126,6 +146,7 @@ def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeo
             output.write(json_bytes(payload))
         receipt = {"ordinal": number, "phase": payload["phase"], "operation": "native_ask",
                    "requested_model": payload["model"], "requested_effort": payload["reasoning_effort"],
+                   "requested_service_tier": payload["service_tier"],
                    "request_sha256": locks.digest(request_path), "host_invoked": True}
         shared.start_attempt(receipt)
         started = time.perf_counter()
@@ -142,10 +163,15 @@ def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeo
             receipt["jev"] = jev_receipt(report)
             receipt["retrieval_failure"] = report.get("retrieval")
             receipt["host_retrieval_failure"] = report.get("host_retrieval")
+            receipt.update(service_tier_metadata(payload["service_tier"], report))
             if process.returncode != 0 or report.get("status") != "completed":
                 raise RuntimeError(str(report.get("code", "native_ask_failed")))
             if report.get("model") != payload["model"] or report.get("requested_reasoning_effort") != payload["reasoning_effort"]:
                 raise ValueError("Native reader changed model/effort")
+            if not tier_matches(payload["service_tier"], report.get("requested_service_tier")):
+                raise ValueError("Native reader changed requested service tier")
+            if not tier_matches(payload["service_tier"], report.get("effective_service_tier")):
+                raise ValueError("Native reader acknowledged a different service tier")
             if report.get("auth_mode") != "chatgpt" or report.get("model_provider") != "openai" or not report.get("thread_id") or not report.get("turn_id"):
                 raise ValueError("Native reader identity is unavailable")
             receipt.update(status="completed", model=report["model"], model_provider=report["model_provider"],
@@ -208,7 +234,7 @@ def summarize(cases: list[dict], expected: int) -> dict:
     core = all(case.get("metrics", {}).get("jev_core_observed") for case in completed) and len(completed) == expected
     correct = sum(case["judge"]["equivalent"] is True for case in judged)
     latency = [case["elapsed_ms"] for case in cases if isinstance(case.get("elapsed_ms"), (int, float))]
-    costs = [case.get("metrics", {}).get("jev_accounting", {}) for case in cases]
+    costs = [case.get("cumulative_jev_cost", case.get("metrics", {}).get("jev_accounting", {})) for case in cases]
     cost_complete = expected > 0 and len(costs) == expected and all(cost.get("accounting_complete") for cost in costs)
     known_costs = [cost["known_cost_subtotal_usd"] for cost in costs if cost.get("known_cost_subtotal_usd") is not None]
     return {
@@ -227,6 +253,7 @@ def summarize(cases: list[dict], expected: int) -> dict:
         "measured_jev_cost_usd": math.fsum(known_costs) if cost_complete and known_costs else None,
         "known_jev_cost_subtotal_usd": math.fsum(known_costs) if known_costs else None,
         "total_provider_billing_usd": None,
+        "latency_scope": "latest selected reader attempt; all attempt times remain in cumulative accounting",
         "no_universal_winner_claim": True,
     }
 
@@ -267,14 +294,195 @@ def compare_reports(native: dict, baseline: dict) -> dict:
 
 
 def materialize_corpus(source_directory: Path, corpus: Path, source_hashes: dict) -> None:
-    corpus.mkdir()
+    corpus.mkdir(exist_ok=True)
+    if {path.name for path in corpus.iterdir() if not path.name.startswith(".")} - set(source_hashes):
+        raise ValueError("Private corpus contains an unexpected document")
     for name, expected in source_hashes.items():
         destination = corpus / name
         if destination.parent != corpus or destination.suffix.lower() != ".pdf":
             raise ValueError("Only source-relative PDF filenames enter the evaluation corpus")
-        shutil.copyfile(source_directory / name, destination)
+        if destination.exists():
+            if locks.digest(destination) != expected:
+                raise ValueError("Existing private source differs; never overwrite a source beneath citations")
+            continue
+        if (corpus / ".gptgrep").exists():
+            raise ValueError("An indexed corpus has a missing source; use a new private run")
+        temporary = corpus / (".copying-" + name)
+        shutil.copyfile(source_directory / name, temporary)
+        if locks.digest(temporary) != expected:
+            raise ValueError("Source changed during private corpus copy")
+        temporary.replace(destination)
         if locks.digest(destination) != expected:
             raise ValueError("Source changed during private corpus copy")
+
+
+def run_binding(manifest: dict) -> str:
+    # The invocation ceiling may change; existing attempts still consume it.
+    # This never changes reader conditions or the selected cohort.
+    return fingerprint({key: value for key, value in manifest.items() if key != "max_host_invocations"})
+
+
+def reuse_manifest(path: Path, manifest: dict) -> str:
+    binding = run_binding(manifest)
+    if path.exists():
+        if run_binding(locks.read_json(path)) != binding:
+            raise ValueError("Native run source/binary/profile/query/input conditions changed; use a new run directory")
+    else:
+        with path.open("x", encoding="utf-8") as output:
+            json.dump(manifest, output, ensure_ascii=False, indent=2, allow_nan=False)
+            output.flush()
+            os.fsync(output.fileno())
+    return binding
+
+
+def can_retry_reader(case: dict, retry_failed: bool) -> bool:
+    status = case.get("status")
+    return status in ("not_run", "budget_blocked", "build_failed") or (retry_failed and status != "completed")
+
+
+def completed_host_response(ordinal: int, request: dict, model: str, effort: str,
+                            phase: str, shared: LocalCodex, service_tier: str) -> tuple[dict, dict] | None:
+    """Reconcile durable outcomes before deciding whether a call may be retried."""
+    if type(ordinal) is not int or ordinal < 1:
+        raise ValueError("Invalid retained host ordinal")
+    if ordinal > len(shared.calls):
+        return None
+    call = shared.calls[ordinal - 1]
+    request_path, response_path = (shared.run_dir / "calls" / f"{ordinal:05d}.{kind}.json" for kind in ("request", "response"))
+    expected = hashlib.sha256(json_bytes(request)).hexdigest()
+    if call.get("ordinal") != ordinal or call.get("request_sha256") != expected or locks.digest(request_path) != expected:
+        raise ValueError("Retained host request binding differs")
+    if locks.read_json(request_path) != request:
+        raise ValueError("Retained host request contents differ")
+    if call.get("status") != "completed":
+        if response_path.exists():
+            if call.get("response_sha256") and call["response_sha256"] != locks.digest(response_path):
+                raise ValueError("Retained host response digest differs")
+            try:
+                previous = locks.read_json(response_path)
+            except (ValueError, UnicodeDecodeError):
+                previous = None
+            if isinstance(previous, dict) and previous.get("status") == "completed":
+                raise ValueError("A retained completed response lacks a validated completion receipt; refuse a replacement call")
+        return None
+    if (call.get("phase"), call.get("requested_model"), call.get("requested_effort")) != (phase, model, effort):
+        raise ValueError("Retained host phase or profile differs")
+    if not tier_matches(service_tier, call.get("requested_service_tier")):
+        raise ValueError("Retained host requested service tier differs")
+    if locks.digest(response_path) != call.get("response_sha256"):
+        raise ValueError("Retained host response digest differs")
+    report = locks.read_json(response_path)
+    if report.get("status") != "completed" or report.get("model") != model or report.get("requested_reasoning_effort") != effort:
+        raise ValueError("Retained host outcome or profile differs")
+    if report.get("effective_reasoning_effort") not in (None, effort):
+        raise ValueError("Retained host effective effort differs")
+    if not tier_matches(service_tier, report.get("requested_service_tier")):
+        raise ValueError("Retained host reported service tier differs")
+    if not tier_matches(service_tier, report.get("effective_service_tier")):
+        raise ValueError("Retained host acknowledged service tier differs")
+    if report.get("auth_mode") != "chatgpt" or report.get("model_provider") != "openai":
+        raise ValueError("Retained host runtime differs")
+    identity = report.get("thread_id"), report.get("turn_id")
+    if not all(isinstance(value, str) and value for value in identity) or identity != (call.get("thread_id"), call.get("turn_id")):
+        raise ValueError("Retained host native session differs")
+    return report, call
+
+
+def validate_cached_reader(case: dict, row: dict, args, run_dir: Path, shared: LocalCodex,
+                           corpus: Path, source_hashes: dict, canonical: dict, generation: dict) -> dict:
+    receipt = case["host_receipt"]
+    ordinal = receipt["ordinal"]
+    if type(ordinal) is not int or not 1 <= ordinal <= len(shared.calls) or shared.calls[ordinal - 1] != receipt:
+        raise ValueError("Cached reader receipt differs from the cumulative host ledger")
+    payload = reader_payload(row, args)
+    completed = completed_host_response(ordinal, payload, args.model, args.reasoning_effort, payload["phase"], shared, args.service_tier)
+    if completed is None:
+        raise ValueError("Cached reader has no completed host outcome")
+    report, _ = completed
+    if report.get("status") != "completed" or report.get("generation") != generation["generation"]:
+        raise ValueError("Cached reader status or index generation differs")
+    if report.get("model") != args.model or report.get("requested_reasoning_effort") != args.reasoning_effort:
+        raise ValueError("Cached reader model or effort differs")
+    if not isinstance(report.get("answer"), str) or not isinstance(report.get("tool_calls"), list) or not isinstance(report.get("citations"), list) or not isinstance(report.get("jev"), dict):
+        raise ValueError("Cached reader response structure differs")
+    verify_native_evidence(report, corpus, {row["doc_id"]: source_hashes[row["doc_id"]]}, canonical)
+    return report
+
+
+def reader_payload(row: dict, args) -> dict:
+    return {"operation": "ask", "phase": f"answer:native:row-{row['source_row']}",
+            "question": row["question"], "document": row["doc_id"],
+            "model": args.model, "reasoning_effort": args.reasoning_effort, "service_tier": args.service_tier}
+
+
+def recover_judge(ordinal: int, prompt: str, constants: dict, host: RoleHost) -> tuple[dict, dict] | None:
+    request = {"instructions": prompt, "state": {}, "schema": constants["SCHEMA"]}
+    completed = completed_host_response(ordinal, request, host.model, host.effort, host.phase, host.shared, host.service_tier)
+    if completed is None:
+        return None
+    report, _ = completed
+    value = report.get("value")
+    jsonschema.Draft202012Validator(constants["SCHEMA"]).validate(value)
+    return value, report
+
+
+def validate_cached_judge(judge: dict, prompt: str, constants: dict, host: RoleHost) -> None:
+    ordinal = judge.get("host_ordinal")
+    if type(ordinal) is not int or not 1 <= ordinal <= len(host.calls):
+        raise ValueError("Cached judge has no cumulative host receipt")
+    completed = recover_judge(ordinal, prompt, constants, host)
+    if completed is None:
+        raise ValueError("Cached judge has no completed host outcome")
+    value, _ = completed
+    if any(judge.get(key) != value.get(key) for key in constants["SCHEMA"].get("required", [])):
+        raise ValueError("Cached judge verdict differs from its native response")
+
+
+def cumulative_accounting(shared: LocalCodex, run_dir: Path) -> dict:
+    """Count every native ask attempt, including retries and missing final output."""
+    recoveries = {}
+    for path in (run_dir / "cases").glob("*/reader-attempts/*/accounting.json"):
+        value = locks.read_json(path)
+        ordinal = value["ordinal"]
+        if value.get("host_started") is False and ordinal is None:
+            continue
+        if ordinal in recoveries:
+            raise ValueError("Duplicate native-attempt accounting ordinal")
+        recoveries[ordinal] = value
+    attempts = []
+    for call in shared.calls:
+        if call.get("operation") != "native_ask" and not call.get("phase", "").startswith("answer:native:"):
+            continue
+        ordinal = call["ordinal"]
+        jev = call.get("jev")
+        source = "host_receipt"
+        if jev is None:
+            response = run_dir / "calls" / f"{ordinal:05d}.response.json"
+            if response.exists() and call.get("response_sha256") == locks.digest(response):
+                try:
+                    jev = jev_receipt(locks.read_json(response))
+                    source = "retained_cli_response"
+                except (ValueError, TypeError):
+                    pass
+        if jev is None and ordinal in recoveries:
+            jev, source = recoveries[ordinal].get("jev"), "durable_host_ledger"
+        attempts.append({"ordinal": ordinal, "phase": call.get("phase"), "status": call.get("status"),
+                         "source": source if jev is not None else "unavailable", "jev": jev,
+                         "cost": jev_cost(jev), "elapsed_ms": call.get("elapsed_ms"), "host_usage": call.get("usage")})
+    costs = [attempt["cost"] for attempt in attempts]
+    known = [cost["known_cost_subtotal_usd"] for cost in costs if cost.get("known_cost_subtotal_usd") is not None]
+    complete = bool(costs) and all(cost.get("accounting_complete") for cost in costs)
+    durations = [attempt["elapsed_ms"] for attempt in attempts if isinstance(attempt["elapsed_ms"], (int, float))]
+    duration_missing = len(attempts) - len(durations)
+    duration_known = math.fsum(durations)
+    return {"native_ask_attempts": len(attempts), "attempts": attempts,
+            "accounting_complete": complete,
+            "unknown_accounting_attempts": sum(not cost.get("accounting_complete") for cost in costs),
+            "known_jev_cost_subtotal_usd": math.fsum(known) if known else None,
+            "measured_jev_cost_usd": math.fsum(known) if complete and known else None,
+            "native_ask_wall_ms": duration_known if duration_missing == 0 else None,
+            "native_ask_wall_ms_known_subtotal": duration_known,
+            "native_ask_wall_ms_missing": duration_missing}
 
 
 def native_snapshot(corpus: Path, source_hashes: dict) -> dict:
@@ -328,7 +536,7 @@ def verify_native_evidence(report: dict, corpus: Path, sources: dict, text: dict
 
 def execute(args) -> dict:
     profile = profiles.resolve(args)
-    profile["roles"]["index"] = {"engine": "deterministic_native", "model": None, "reasoning_effort": None}
+    profile["roles"]["index"] = {"engine": "deterministic_native", "model": None, "reasoning_effort": None, "service_tier": None}
     profile["index_effort_note"] = "Native build is deterministic; no Jev or generative indexing stage is claimed."
     binary = args.binary.expanduser().resolve()
     judge_binary = (args.judge_binary or args.binary).expanduser().resolve()
@@ -342,19 +550,19 @@ def execute(args) -> dict:
     names = sorted({row["doc_id"] for row in rows})
     run_dir = args.run_dir.expanduser().resolve()
     private_directory(run_dir)
-    if (run_dir / "manifest.json").exists():
-        raise ValueError("This experiment is already materialized; use a new run directory")
     corpus = run_dir / "corpus"
-    if corpus.exists():
-        raise ValueError("Corpus destination already exists; use a new run directory")
     manifest = {
-        "schema_version": "gptgrep.system-eval.v1", "variant": "gptgrep-native-jev",
+        "schema_version": "gptgrep.system-eval.v2", "variant": "gptgrep-native-jev",
         "profile": profile, "source_rows": indices, "question_count": len(rows), "document_count": len(names),
         "cohort_manifest_sha256": cohort_sha,
         "question_sha256": fingerprint(rows), "source_hashes": {name: locks.digest(benchmark / "documents" / name) for name in names},
         "binary_sha256": locks.digest(binary), "judge_binary_sha256": locks.digest(judge_binary),
         "source_and_dependencies": verified, "known_document_scope": True,
         "max_host_invocations": args.max_model_calls, "host_timeout_secs": args.timeout,
+        "host_input_cap": args.max_input_bytes, "build_timeout_secs": args.build_timeout,
+        "service_tier": args.service_tier,
+        "effective_tier_basis": "Codex thread/start acknowledgement; not independent provider billing confirmation",
+        "codex_bin": args.codex_bin, "codex_home": str(args.codex_home.expanduser().resolve()),
         "max_tool_calls": args.max_tool_calls, "jev_model_requested": args.jev_model,
         "judge_source_sha256": locks.digest(judge_source / "eval/judge.py"),
         "adapter_files": {name: locks.digest(REPO / "scripts/pageindex_baseline" / name)
@@ -365,64 +573,164 @@ def execute(args) -> dict:
     }
     with (run_dir / ".owner.lock").open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with (run_dir / "manifest.json").open("x") as output:
-            json.dump(manifest, output, ensure_ascii=False, indent=2)
+        binding = reuse_manifest(run_dir / "manifest.json", manifest)
+        checkpoint_attempt(run_dir / "invocation.json", {"stage": args.stage, "run_binding": binding,
+                           "max_host_invocations": args.max_model_calls, "retry_failed": args.retry_failed})
         if args.stage == "plan":
-            return {**manifest, "status": "plan_prepared", "comparison_eligible": False, "host_invocations": 0}
+            ledger = run_dir / "host-calls.jsonl"
+            count = len(ledger.read_text().splitlines()) if ledger.exists() else 0
+            return {**manifest, "status": "plan_prepared", "comparison_eligible": False,
+                    "host_invocations": count, "new_host_invocations": 0}
         if args.max_model_calls <= 0:
             raise ValueError("Live evaluation requires an explicit positive host-invocation budget")
         materialize_corpus(benchmark / "documents", corpus, manifest["source_hashes"])
         shared = LocalCodex(judge_binary, args.codex_bin, args.codex_home.expanduser().resolve(), run_dir,
-                            args.max_model_calls, args.timeout, args.model, args.reasoning_effort, args.max_input_bytes)
+                            args.max_model_calls, args.timeout, args.model, args.reasoning_effort, args.max_input_bytes,
+                            service_tier=args.service_tier)
         judge_host = RoleHost(shared, "judge", profile["roles"]["judge"])
-        build_args = build_arguments(binary, corpus, args.optimize_merge)
-        started = time.perf_counter()
-        try:
-            process = owned_process(build_args, run_dir, args.build_timeout)
-            (run_dir / "build.response.json").write_bytes(process.stdout)
-            build = locks.read_json(run_dir / "build.response.json")
-            build_ok = process.returncode == 0 and build.get("indexed_files") == len(names)
-            build["exit_code"] = process.returncode
-        except Exception as error:
-            build, build_ok = {"error": str(error)}, False
-        build.update(wall_ms=(time.perf_counter() - started) * 1000, status="completed" if build_ok else "failed",
-                     model_invocations=0, jev_indexing_stage=False)
-        write_json(run_dir / "build.json", build)
-        try:
-            canonical = native_snapshot(corpus, manifest["source_hashes"]) if build_ok else {}
-        except Exception as error:
-            canonical, build_ok = {}, False
-            build.update(status="failed", source_integrity_error=str(error))
-            write_json(run_dir / "build.json", build)
+        build_path = run_dir / "build.json"
+        build = locks.read_json(build_path) if build_path.exists() else {"status": "not_built"}
+        if build["status"] != "completed" and (build["status"] == "not_built" or args.retry_failed):
+            if any(call.get("phase", "").startswith("answer:native:") for call in shared.calls):
+                raise ValueError("Refuse to rebuild an index beneath retained reader attempts or citations")
+            attempt = int(build.get("build_attempt", 0)) + 1
+            build = {"status": "started", "build_attempt": attempt, "model_invocations": 0, "jev_indexing_stage": False}
+            checkpoint_attempt(build_path, build)
+            started = time.perf_counter()
+            try:
+                process = owned_process(build_arguments(binary, corpus, args.optimize_merge), run_dir, args.build_timeout)
+                raw_path = run_dir / f"build-{attempt:04d}.response.json"
+                with raw_path.open("xb") as output:
+                    output.write(process.stdout)
+                built = locks.read_json(raw_path)
+                build.update(result=built, exit_code=process.returncode, response_sha256=locks.digest(raw_path))
+                if process.returncode != 0 or built.get("indexed_files") != len(names):
+                    raise ValueError("Native corpus build did not complete every selected document")
+                native_snapshot(corpus, manifest["source_hashes"])
+                build.update(status="completed", generation_binding=locks.read_json(corpus / ".gptgrep/CURRENT.json"))
+            except Exception as error:
+                build.update(status="failed", error=str(error))
+            build["wall_ms"] = (time.perf_counter() - started) * 1000
+            checkpoint_attempt(build_path, build)
+        build_ok = build["status"] == "completed"
+        if build_ok and locks.read_json(corpus / ".gptgrep/CURRENT.json") != build["generation_binding"]:
+            raise ValueError("Cached native generation changed; never rebuild beneath saved citations")
+        canonical = native_snapshot(corpus, manifest["source_hashes"]) if build_ok else {}
         constants = judge_constants(judge_source)
         cases = []
         for row in rows:
             case_dir = run_dir / "cases" / f"{row['source_row']:03d}"
-            case_dir.mkdir(parents=True)
-            case = {"source_row": row["source_row"], "doc_id": row["doc_id"], "status": "not_run",
-                    "case_identity": fingerprint({"row": row, "manifest": manifest})}
+            case_dir.mkdir(parents=True, exist_ok=True)
+            case_path = case_dir / "case.json"
+            identity = fingerprint({"row": row, "run_binding": binding})
+            initial = {"source_row": row["source_row"], "doc_id": row["doc_id"], "status": "not_run", "case_identity": identity}
+            case = locks.read_json(case_path) if case_path.exists() else initial.copy()
+            if case.get("case_identity") != identity:
+                raise ValueError("Cached native case inputs differ")
+            if case["status"] != "completed" and case.get("reader_attempt") is not None:
+                attempt_dir = case_dir / "reader-attempts" / f"{case['reader_attempt']:04d}"
+                start = locks.read_json(attempt_dir / "start.json")
+                if start.get("case_identity") != identity:
+                    raise ValueError("Retained reader start identity differs")
+                payload = reader_payload(row, args)
+                accounting_path = attempt_dir / "accounting.json"
+                accounting = locks.read_json(accounting_path) if accounting_path.exists() else {}
+                never_started = accounting.get("host_started") is False
+                if never_started:
+                    if accounting.get("ordinal") is not None or accounting.get("planned_ordinal") != start["host_ordinal"]:
+                        raise ValueError("Retained no-invocation marker differs")
+                    if start["host_ordinal"] <= len(shared.calls) and shared.calls[start["host_ordinal"] - 1].get("phase") == payload["phase"]:
+                        raise ValueError("Retained no-invocation marker contradicts an actual reader receipt")
+                completed = None if never_started else completed_host_response(
+                    start["host_ordinal"], payload, args.model, args.reasoning_effort, payload["phase"], shared, args.service_tier)
+                if completed is not None:
+                    if not build_ok:
+                        raise ValueError("Retained completed reader has no validated stable index")
+                    saved_report, receipt = completed
+                    recovered_case = {**case, "host_receipt": receipt}
+                    saved_report = validate_cached_reader(recovered_case, row, args, run_dir, shared, corpus,
+                                                          manifest["source_hashes"], canonical, build["generation_binding"])
+                    metrics = native_metrics(saved_report, row["doc_id"], set(json.loads(row["evidence_pages"])))
+                    metrics.update(verify_native_evidence(saved_report, corpus,
+                                   {row["doc_id"]: manifest["source_hashes"][row["doc_id"]]}, canonical))
+                    recovered_case.update(status="completed", elapsed_ms=receipt.get("elapsed_ms"),
+                                          metrics=metrics, recovered_completed_reader=True)
+                    recovered_case.pop("error", None)
+                    recovered_case.pop("error_code", None)
+                    accounting_path = attempt_dir / "accounting.json"
+                    if not accounting_path.exists():
+                        write_json(accounting_path, {"ordinal": receipt["ordinal"], "jev": jev_receipt(saved_report)})
+                    case = recovered_case
+                    checkpoint_attempt(case_path, case)
+            if case["status"] in ("started", "validating"):
+                # The previous owner ended without a final case checkpoint. Keep
+                # that attempt and its uncertain usage; do not replay it implicitly.
+                attempt_dir = case_dir / "reader-attempts" / f"{case['reader_attempt']:04d}"
+                start = locks.read_json(attempt_dir / "start.json")
+                accounting_path = attempt_dir / "accounting.json"
+                if not accounting_path.exists():
+                    if start["host_ordinal"] > len(shared.calls):
+                        # The case checkpoint preceded request creation. No native
+                        # process can have started without that durable request.
+                        write_json(accounting_path, {"ordinal": None, "planned_ordinal": start["host_ordinal"], "host_started": False, "jev": None})
+                    else:
+                        paths = set((corpus / ".gptgrep/host-attempts").glob("*.jsonl"))
+                        fresh = sorted(path for path in paths if path.name not in start["prior_ledgers"])
+                        try:
+                            recovery_path = attempt_dir / "ledger-recovery.json"
+                            recovered = locks.read_json(recovery_path) if recovery_path.exists() else [ledger_recovery(path) for path in fresh]
+                            if not recovery_path.exists():
+                                write_json(recovery_path, recovered)
+                            write_json(accounting_path, {"ordinal": start["host_ordinal"],
+                                       "jev": recovered[0]["jev"] if len(recovered) == 1 else None})
+                        except Exception as error:
+                            write_json(accounting_path, {"ordinal": start["host_ordinal"], "jev": None, "error": str(error)})
+                case.update(status="interrupted", error="Prior reader attempt has no completed case checkpoint")
+                checkpoint_attempt(case_path, case)
+            report = None
             if not build_ok:
+                if case["status"] == "completed":
+                    raise ValueError("Completed reader has no validated stable index")
                 case.update(status="build_failed", error="Native corpus build did not complete")
-            else:
-                payload = {"operation": "ask", "phase": f"answer:native:row-{row['source_row']}",
-                           "question": row["question"], "document": row["doc_id"],
-                           "model": args.model, "reasoning_effort": args.reasoning_effort}
+                checkpoint_attempt(case_path, case)
+            elif case["status"] == "completed":
+                report = validate_cached_reader(case, row, args, run_dir, shared, corpus,
+                                                manifest["source_hashes"], canonical, build["generation_binding"])
+            elif can_retry_reader(case, args.retry_failed):
+                if len(shared.calls) >= shared.max_calls:
+                    if case["status"] in ("not_run", "budget_blocked", "build_failed"):
+                        case["status"] = "budget_blocked"
+                    case["retry_budget_blocked"] = True
+                    checkpoint_attempt(case_path, case)
+                    cases.append(case)
+                    continue
+                attempt = int(case.get("reader_attempt", 0)) + 1
+                attempt_dir = case_dir / "reader-attempts" / f"{attempt:04d}"
+                attempt_dir.mkdir(parents=True)
+                ledger_directory = corpus / ".gptgrep/host-attempts"
+                before_ledgers = set(ledger_directory.glob("*.jsonl"))
+                write_json(attempt_dir / "start.json", {"host_ordinal": len(shared.calls) + 1,
+                           "case_identity": identity, "prior_ledgers": sorted(path.name for path in before_ledgers)})
+                case = {**initial, "status": "started", "reader_attempt": attempt}
+                checkpoint_attempt(case_path, case)
                 try:
-                    ledger_directory = corpus / ".gptgrep/host-attempts"
-                    before_ledgers = set(ledger_directory.glob("*.jsonl"))
-                    report, receipt = invoke_native(shared, ask_arguments(binary, corpus, row, args), payload, args.timeout + 60)
-                    write_json(case_dir / "native-response.json", report)
+                    report, receipt = invoke_native(shared, ask_arguments(binary, corpus, row, args), reader_payload(row, args), args.timeout + 60)
+                    write_json(attempt_dir / "native-response.json", report)
+                    case.update(status="validating", elapsed_ms=receipt["elapsed_ms"], host_receipt=receipt,
+                                metrics=native_metrics(report, row["doc_id"], set(json.loads(row["evidence_pages"]))))
+                    checkpoint_attempt(case_path, case)
                     recovered = [ledger_recovery(path) for path in sorted(set(ledger_directory.glob("*.jsonl")) - before_ledgers)]
-                    write_json(case_dir / "ledger-recovery.json", recovered)
+                    write_json(attempt_dir / "ledger-recovery.json", recovered)
                     case["native_attempt_ledgers"] = [{key: value for key, value in item.items() if key != "jev"} for item in recovered]
                     if jev_receipt(report) is None and len(recovered) == 1:
-                        # Preserve the original CLI response above; this annotation is
-                        # explicitly recovered accounting and never changes its status.
                         report = {**report, "jev": recovered[0]["jev"], "jev_receipt_source": "durable_host_ledger"}
+                    write_json(attempt_dir / "accounting.json", {"ordinal": receipt["ordinal"], "jev": jev_receipt(report)})
                     case.update(status=receipt["status"], elapsed_ms=receipt["elapsed_ms"], host_receipt=receipt,
                                 metrics=native_metrics(report, row["doc_id"], set(json.loads(row["evidence_pages"]))))
                     case["metrics"]["jev_receipt_source"] = report.get("jev_receipt_source", "final_cli_report" if jev_receipt(report) is not None else "unavailable")
                     if receipt["status"] == "completed":
+                        if report.get("generation") != build["generation_binding"]["generation"]:
+                            raise ValueError("Native response used a changed index generation")
                         validation_started = time.perf_counter()
                         case["metrics"].update(verify_native_evidence(report, corpus,
                             {row["doc_id"]: manifest["source_hashes"][row["doc_id"]]}, canonical))
@@ -430,30 +738,85 @@ def execute(args) -> dict:
                         response = report.get("answer", "")
                         if not isinstance(response, str):
                             raise ValueError("Native response has no answer string")
-                        prompt = constants["PROMPT"].format(question=" ".join(row["question"].split()),
-                                                           answer=row["answer"], answer_format=row["answer_format"],
-                                                           response=response[:constants["MAX_RESPONSE_CHARS"]])
-                        judge_host.phase = f"judge:native:row-{row['source_row']}"
-                        try:
-                            verdict, _ = judge_host.complete(prompt, {}, constants["SCHEMA"])
-                            case["judge"] = {"status": "completed", **verdict, "model": judge_host.model,
-                                             "reasoning_effort": judge_host.effort, "rubric_sha256": fingerprint(constants["PROMPT"]),
-                                             "schema_sha256": fingerprint(constants["SCHEMA"]),
-                                             "response_truncated": len(response) > constants["MAX_RESPONSE_CHARS"]}
-                        except Exception as error:
-                            case["judge"] = {"status": "unavailable", "error": str(error)}
                     else:
                         case["error"] = receipt.get("error")
                 except Exception as error:
                     case.update(status="failed", error=str(error), error_code=getattr(error, "code", type(error).__name__))
-            write_json(case_dir / "case.json", case)
+                checkpoint_attempt(case_path, case)
+            if case["status"] == "completed":
+                response = report["answer"]
+                prompt = constants["PROMPT"].format(question=" ".join(row["question"].split()),
+                                                   answer=row["answer"], answer_format=row["answer_format"],
+                                                   response=response[:constants["MAX_RESPONSE_CHARS"]])
+                judge = case.get("judge", {})
+                judge_host.phase = f"judge:native:row-{row['source_row']}"
+                if judge.get("status") != "completed" and judge.get("host_ordinal") is not None:
+                    recovered = recover_judge(judge["host_ordinal"], prompt, constants, judge_host)
+                    if recovered is not None:
+                        verdict, completion_report = recovered
+                        case["judge"] = judge = {"status": "completed", **verdict, "model": judge_host.model,
+                            "reasoning_effort": judge_host.effort, "host_ordinal": judge["host_ordinal"],
+                            **service_tier_metadata(judge_host.service_tier, completion_report),
+                            "rubric_sha256": fingerprint(constants["PROMPT"]), "schema_sha256": fingerprint(constants["SCHEMA"]),
+                            "response_truncated": len(response) > constants["MAX_RESPONSE_CHARS"], "recovered_completed_judge": True}
+                        checkpoint_attempt(case_path, case)
+                if judge.get("status") == "completed":
+                    validate_cached_judge(judge, prompt, constants, judge_host)
+                else:
+                    if judge.get("status") == "started":
+                        case["judge"] = judge = {**judge, "status": "unavailable", "error": "Prior judge attempt was interrupted"}
+                        checkpoint_attempt(case_path, case)
+                    if not judge or judge.get("status") == "budget_blocked" or args.retry_failed:
+                        if len(shared.calls) >= shared.max_calls:
+                            if not judge or judge.get("status") == "budget_blocked":
+                                case["judge"] = {"status": "budget_blocked"}
+                        else:
+                            judge_host.phase = f"judge:native:row-{row['source_row']}"
+                            case["judge"] = {"status": "started", "host_ordinal": len(shared.calls) + 1}
+                            checkpoint_attempt(case_path, case)
+                            try:
+                                verdict, completion_report = judge_host.complete(prompt, {}, constants["SCHEMA"])
+                                case["judge"] = {"status": "completed", **verdict, "model": judge_host.model,
+                                                 "reasoning_effort": judge_host.effort, "host_ordinal": shared.calls[-1]["ordinal"],
+                                                 **service_tier_metadata(judge_host.service_tier, completion_report),
+                                                 "rubric_sha256": fingerprint(constants["PROMPT"]), "schema_sha256": fingerprint(constants["SCHEMA"]),
+                                                 "response_truncated": len(response) > constants["MAX_RESPONSE_CHARS"]}
+                            except Exception as error:
+                                case["judge"] = {**case["judge"], "status": "unavailable", "error": str(error)}
+                        checkpoint_attempt(case_path, case)
             cases.append(case)
         if locks.digest(binary) != manifest["binary_sha256"] or locks.digest(judge_binary) != manifest["judge_binary_sha256"]:
             raise ValueError("Executable changed during the evaluation")
+        cumulative = cumulative_accounting(shared, run_dir)
+        for case in cases:
+            attempts = [attempt for attempt in cumulative["attempts"] if attempt["phase"] == f"answer:native:row-{case['source_row']}"]
+            costs = [attempt["cost"] for attempt in attempts]
+            known = [cost["known_cost_subtotal_usd"] for cost in costs if cost.get("known_cost_subtotal_usd") is not None]
+            case["cumulative_jev_cost"] = {"accounting_complete": bool(costs) and all(cost["accounting_complete"] for cost in costs),
+                                           "known_cost_subtotal_usd": math.fsum(known) if known else None,
+                                           "native_ask_attempts": len(attempts),
+                                           "unknown_accounting_attempts": sum(not cost["accounting_complete"] for cost in costs)}
+            known = [attempt["elapsed_ms"] for attempt in attempts if isinstance(attempt["elapsed_ms"], (int, float))]
+            missing = len(attempts) - len(known)
+            case["cumulative_reader_wall_ms"] = math.fsum(known) if missing == 0 else None
+            case["cumulative_reader_wall_ms_known_subtotal"] = math.fsum(known)
+            case["cumulative_reader_wall_ms_missing"] = missing
         summary = summarize(cases, len(rows))
+        summary.update(jev_cost_accounting_complete=cumulative["accounting_complete"],
+                       measured_jev_cost_usd=cumulative["measured_jev_cost_usd"],
+                       known_jev_cost_subtotal_usd=cumulative["known_jev_cost_subtotal_usd"],
+                       cost_scope="all native ask attempts, including failed/interrupted retries")
+        observed_wall = [call["elapsed_ms"] for call in shared.calls
+                         if type(call.get("elapsed_ms")) in (int, float) and math.isfinite(call["elapsed_ms"]) and call["elapsed_ms"] >= 0]
+        missing_wall = len(shared.calls) - len(observed_wall)
+        known_wall = math.fsum(observed_wall)
         report = {**manifest, "status": "completed" if summary["comparison_eligible"] else "incomplete",
                   "build_result": build, "summary": summary, "cases": cases, "host_invocations": len(shared.calls),
                   "completed_host_turns": sum(call["status"] == "completed" for call in shared.calls),
+                  "cumulative_attempt_accounting": cumulative,
+                  "all_host_wall_ms": known_wall if missing_wall == 0 else None,
+                  "all_host_wall_ms_known_subtotal": known_wall, "all_host_wall_ms_missing": missing_wall,
+                  "host_usage_missing": sum(call.get("usage") is None for call in shared.calls),
                   "cohorts": {name: summarize([case for case in cases if case["source_row"] in members], len(set(indices) & members))
                               for name, members in groups.items()},
                   "timing_note": "Native ask latency includes Jev and Codex. Fresh-host SDK and persistent native-reader overhead remain distinct.",
@@ -487,13 +850,14 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--build-timeout", type=int, default=300)
     parser.add_argument("--optimize-merge", action="store_true")
+    parser.add_argument("--retry-failed", action="store_true", help="Retry failed/interrupted work; completed reader/judge outcomes are always reused")
     args = parser.parse_args()
     if min(args.timeout, args.build_timeout, args.max_tool_calls, args.max_input_bytes) <= 0 or args.max_model_calls < 0:
         parser.error("Invalid execution bounds")
     try:
         report = execute(args)
     except Exception as error:
-        report = {"schema_version": "gptgrep.system-eval.v1", "status": "failed", "error": str(error)}
+        report = {"schema_version": "gptgrep.system-eval.v2", "status": "failed", "error": str(error)}
     print(json.dumps({key: report.get(key) for key in (
         "schema_version", "status", "variant", "question_count", "document_count", "host_invocations", "summary", "error"
     )}, indent=2))

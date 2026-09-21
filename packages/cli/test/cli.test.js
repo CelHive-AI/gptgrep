@@ -106,7 +106,7 @@ test('schema discovery is local and exposes the JSON request contract', async ()
 })
 
 test('explicit Codex host commands preserve model settings and flag-like data', async () => {
-  const defaults = ['--codex-bin=codex', '--model=gpt-5.6-luna', '--reasoning-effort=max', '--timeout', '180', '--max-tool-calls', '12']
+  const defaults = ['--codex-bin=codex', '--model=gpt-5.6-luna', '--reasoning-effort=max', '--service-tier=fast', '--timeout', '180', '--max-tool-calls', '12']
   const ask = JSON.parse((await run(['ask', '--request', '{"question":"--mcp","root":"/docs space"}', '--json'])).stdout)
   assert.deepEqual(ask.args, ['ask', ...defaults, '--json', '--', '--mcp', '/docs space'])
   const summary = JSON.parse((await run(['summarize', '--request', '{"nodeId":"document:node","root":"/docs","codexHome":"/account space"}', '--json'])).stdout)
@@ -114,15 +114,23 @@ test('explicit Codex host commands preserve model settings and flag-like data', 
   const schema = JSON.parse((await run(['request-schema', 'ask', '--json'])).stdout)
   assert.equal(schema.properties.model.default, 'gpt-5.6-luna')
   assert.equal(schema.properties.reasoningEffort.default, 'max')
+  assert.equal(schema.properties.serviceTier.default, 'fast')
   assert.equal(schema.properties.jevModel.type, 'string')
   assert.equal(schema.properties.document.type, 'string')
+})
+
+test('service tier is explicit and validated independently of model selection', async () => {
+  const result = JSON.parse((await run(['ask', '--request', '{"question":"query","serviceTier":"flex"}', '--json'])).stdout)
+  assert.ok(result.args.includes('--service-tier=flex'))
+  await assert.rejects(run(['ask', '--request', '{"question":"query","serviceTier":"unknown"}', '--json']),
+    (error) => /INVALID_REQUEST/.test(error.stdout))
 })
 
 test('Jev models and document scopes remain literal arguments and separate from Codex models', async () => {
   const document = 'notes/$(printf not-executed) --schema.md'
   const search = JSON.parse((await run(['search', '--request', JSON.stringify({ query: '--mcp', document, model: '~typesafe/jev-latest' }), '--json'])).stdout)
   assert.deepEqual(search.args, ['search', '--mode', 'hybrid', '--limit', '20', '--context', '0', '--min-score', '0.5', '--model=~typesafe/jev-latest', `--document=${document}`, '--json', '--', '--mcp', '.'])
-  const host = ['--codex-bin=codex', '--model=gpt-6-astra', '--reasoning-effort=max', '--timeout', '180', '--max-tool-calls', '12', '--jev-model=typesafe/jev-1.13', `--document=${document}`]
+  const host = ['--codex-bin=codex', '--model=gpt-6-astra', '--reasoning-effort=max', '--service-tier=fast', '--timeout', '180', '--max-tool-calls', '12', '--jev-model=typesafe/jev-1.13', `--document=${document}`]
   const common = { model: 'gpt-6-astra', jevModel: 'typesafe/jev-1.13', document }
   const ask = JSON.parse((await run(['ask', '--request', JSON.stringify({ question: '--json', ...common }), '--json'])).stdout)
   assert.deepEqual(ask.args, ['ask', ...host, '--json', '--', '--json', '.'])

@@ -41,7 +41,7 @@ flowchart TD
 | `packages/cli` | 可选的 incur 展示与接口发现包装层 | Node 和已发布的 incur 0.5.1 |
 
 宿主配置的默认值为本项目选定的 `model = "gpt-5.6-luna"` 和
-`model_reasoning_effort = "max"`。这些设置仅用于本地辅助模型，不会改变开发智能体的模型。
+`model_reasoning_effort = "max"`，以及 `service_tier = "fast"`。这些设置仅用于本地辅助模型，不会改变开发智能体的模型。
 运行时的 `CODEX_HOME` 用于选择已有的账户隔离环境。
 程序不读取或复制认证文件、不修改全局配置，也不执行交互式登录。
 

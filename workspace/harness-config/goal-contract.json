@@ -6,7 +6,8 @@
   "authority": "User project ownership mandate; routine implementation, harness, CI and releases authorized within the agreed direction",
   "host_defaults": {
     "model": "gpt-5.6-luna",
-    "model_reasoning_effort": "max"
+    "model_reasoning_effort": "max",
+    "service_tier": "fast"
   },
   "benchmark": {
     "repository": "https://github.com/VectifyAI/PageIndex-OSS-Benchmark",
@@ -16,7 +17,14 @@
     "document_count": 34,
     "baseline": "Actual pinned PageIndex Flash/local SDK execution; local Codex backend substitution explicitly identified",
     "historical_readme_scores_are_acceptance": false,
-    "gptgrep_only_subset_run_is_baseline": false
+    "gptgrep_only_subset_run_is_baseline": false,
+    "index_reasoning_effort": "medium (documented API default, explicit through adapted runtime)",
+    "index_concurrency": {
+      "summary_upstream": 64,
+      "expansion_upstream": 32,
+      "host_ceiling": 64,
+      "reported_measurement": "observed process overlap; no inferred provider concurrency"
+    }
   },
   "gates": [
     {
@@ -130,5 +138,6 @@
     "offline_tests": "implementation correctness only, not benchmark results",
     "failures": "all selected tasks remain in denominator",
     "adapter_qualification": "actual successful source-bound SDK tool roundtrip retained from live benchmark, not process-only acceptance"
-  }
+  },
+  "runtime_privacy": "Use caller-selected authenticated runtime with portable public parameters; custom workstation launchers/account routing remain ignored local-only"
 }

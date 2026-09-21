@@ -108,6 +108,8 @@ class AdapterUnitTests(unittest.TestCase):
             def complete(self, instructions, state, schema):
                 self.seen = state
                 return {"text": "controlled summary"}, {}
+            async def acomplete(self, instructions, state, schema):
+                return self.complete(instructions, state, schema)
         host = FakeHost()
         register_index_provider(host)
         reply = litellm.completion(model=PROVIDER + "/" + INDEX_ALIAS,
@@ -201,6 +203,8 @@ class ActualSdkTransportTests(unittest.IsolatedAsyncioTestCase):
                     assert "ORACLE_PAGE_TWO" in json.dumps(state["input"])
                     return {"text": "Read ORACLE_PAGE_TWO.", "tool_calls": []}, {}
                 return {"text": "", "tool_calls": [{"name": "read_fixture", "arguments": '{"page":2}'}]}, {}
+            async def acomplete(self, instructions, state, schema):
+                return self.complete(instructions, state, schema)
 
         host = FakeHost()
         transport = ResponsesTransport(host)

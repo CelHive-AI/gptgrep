@@ -27,6 +27,7 @@ use tokio::{
 
 pub const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 pub const DEFAULT_REASONING_EFFORT: &str = "max";
+pub const DEFAULT_SERVICE_TIER: &str = "fast";
 
 #[derive(Debug)]
 pub struct HostCapabilityError;
@@ -43,6 +44,7 @@ pub struct HostConfig {
     pub codex_home: PathBuf,
     pub model: String,
     pub reasoning_effort: String,
+    pub service_tier: String,
     pub timeout_secs: u64,
     pub max_tool_calls: usize,
     pub max_input_bytes: usize,
@@ -62,6 +64,7 @@ impl Default for HostConfig {
                 }),
             model: DEFAULT_MODEL.into(),
             reasoning_effort: DEFAULT_REASONING_EFFORT.into(),
+            service_tier: DEFAULT_SERVICE_TIER.into(),
             timeout_secs: 180,
             max_tool_calls: 12,
             max_input_bytes: 256 * 1024,
@@ -87,6 +90,8 @@ pub struct HostReport {
     pub codex_home: PathBuf,
     pub requested_reasoning_effort: String,
     pub effective_reasoning_effort: Option<String>,
+    pub requested_service_tier: String,
+    pub effective_service_tier: Option<String>,
     pub answer: String,
     pub citations: Vec<Citation>,
     pub tool_calls: Vec<ToolReceipt>,
@@ -189,6 +194,8 @@ async fn execute_with_client(
         codex_home: home,
         requested_reasoning_effort: config.reasoning_effort.clone(),
         effective_reasoning_effort: result.effort,
+        requested_service_tier: config.service_tier.clone(),
+        effective_service_tier: result.service_tier,
         answer,
         citations,
         tool_calls: evidence.receipts.clone(),
@@ -411,6 +418,13 @@ fn validate_config(config: &HostConfig, question: &str) -> Result<()> {
             "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
         ),
         "Invalid reasoning effort"
+    );
+    ensure!(
+        matches!(
+            config.service_tier.as_str(),
+            "fast" | "priority" | "flex" | "default"
+        ),
+        "Invalid service tier; supported values are fast, priority, flex, default"
     );
     ensure!(!config.codex_bin.is_empty(), "Codex binary is empty");
     Ok(())

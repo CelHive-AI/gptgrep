@@ -16,6 +16,7 @@ pub(crate) struct Outcome {
     pub model: String,
     pub provider: String,
     pub effort: Option<String>,
+    pub service_tier: Option<String>,
     pub answer: String,
     pub usage: Option<Value>,
     pub warnings: Vec<String>,
@@ -172,6 +173,12 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     }
     thread_config["mcp_servers"] = Value::Object(disabled);
     thread_config["model_reasoning_effort"] = json!(config.reasoning_effort);
+    thread_config["service_tier"] = json!(config.service_tier);
+    // Fast's request/config alias is normalized only when this feature is enabled.
+    // Scope the override to the ephemeral thread rather than the caller's profile.
+    if matches!(config.service_tier.as_str(), "fast" | "priority") {
+        thread_config["features.fast_mode"] = json!(true);
+    }
     drop(configured);
     let (instructions, prompt, schema, tools, max_output_bytes) = match &workflow {
         Workflow::Retrieval {
@@ -214,6 +221,7 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             "thread/start",
             json!({
                 "model":config.model,"modelProvider":"openai","allowProviderModelFallback":false,"cwd":cwd,
+                "serviceTier":config.service_tier,
                 "approvalPolicy":"never","sandbox":"read-only","ephemeral":true,"environments":[],
                 "runtimeWorkspaceRoots":[],"selectedCapabilityRoots":[],
                 "config":thread_config,"baseInstructions":instructions,
@@ -244,12 +252,19 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             "Codex changed the requested reasoning effort"
         );
     }
+    let service_tier = acknowledged_service_tier(&thread, &config.service_tier)?;
     let mut warnings=vec!["Codex has no public dynamic-tools-only allowlist. Configurable integrations and environment access are disabled; any unexpected server request is denied.".into()];
     if effort.is_none() {
         warnings.push("Codex did not report effective thread reasoning effort; the requested effort is explicitly sent on turn/start.".into());
     }
+    if service_tier.is_none() {
+        warnings.push("Codex did not report an effective thread service tier; the requested tier is explicitly sent on thread/start and turn/start. Provider routing and billing tier remain unobserved.".into());
+    }
+    // Use the persistent serviceTier override: unlike serviceTierForTurn, it
+    // normalizes Codex's user-facing fast alias to the provider's priority value.
     rpc.send(json!({"id":4,"method":"turn/start","params":{
         "threadId":thread_id,"model":config.model,"effort":config.reasoning_effort,
+        "serviceTier":config.service_tier,
         "approvalPolicy":"never","sandboxPolicy":{"type":"readOnly","networkAccess":false},
         "input":[{"type":"text","text":prompt.to_string(),"text_elements":[]}],"outputSchema":schema
     }}))
@@ -378,10 +393,24 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         model,
         provider,
         effort,
+        service_tier,
         answer: answer.ok_or_else(|| anyhow!("Codex completed without a final answer"))?,
         usage,
         warnings,
     })
+}
+
+fn acknowledged_service_tier(thread: &Value, requested: &str) -> Result<Option<String>> {
+    let actual = match thread.get("serviceTier") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(value)) => value,
+        Some(_) => return Err(anyhow!("Codex reported an invalid service tier")),
+    };
+    let equivalent = actual == requested
+        || (matches!(actual.as_str(), "fast" | "priority")
+            && matches!(requested, "fast" | "priority"));
+    ensure!(equivalent, "Codex changed the requested service tier");
+    Ok(Some(actual.clone()))
 }
 
 fn validate_item(item: &Value) -> Result<()> {

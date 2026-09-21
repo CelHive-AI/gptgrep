@@ -97,6 +97,7 @@ Jev 使用 OpenRouter 的强类型 **Decisions API**，而非 chat completions�
 ```toml
 model = "gpt-5.6-luna"
 model_reasoning_effort = "max"
+service_tier = "fast"
 approval_policy = "never"
 sandbox_mode = "read-only"
 ```
@@ -108,11 +109,10 @@ sandbox_mode = "read-only"
 
 ```sh
 gptgrep ask 'What is the recovery procedure, and how long are snapshots kept?' \
-  ./documents --codex-bin codex --codex-home /path/to/codex-home --json
+  ./documents --json
 
 gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
-  --codex-bin codex --codex-home /path/to/codex-home \
-  --model gpt-5.6-luna --reasoning-effort max --json
+  --model gpt-5.6-luna --reasoning-effort max --service-tier fast --json
 ```
 
 启动 Codex 之前，宿主会执行必需的 Jev 混合检索，并将有大小限制的证据交给推理模型。

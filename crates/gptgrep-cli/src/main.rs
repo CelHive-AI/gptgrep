@@ -48,6 +48,12 @@ struct HostArgs {
     model: String,
     #[arg(long, default_value = "max")]
     reasoning_effort: String,
+    #[arg(
+        long,
+        default_value = "fast",
+        help = "Codex service tier; fast requests priority service"
+    )]
+    service_tier: String,
     #[arg(long, default_value_t = 180)]
     timeout: u64,
     #[arg(long, default_value_t = 12)]
@@ -76,6 +82,7 @@ impl HostArgs {
             jev_model: None,
             document: None,
             reasoning_effort: self.reasoning_effort,
+            service_tier: self.service_tier,
             timeout_secs: self.timeout,
             max_tool_calls: self.max_tool_calls,
             max_input_bytes: self.max_input_bytes,
@@ -228,9 +235,9 @@ fn contract() -> Value {
             "status":{"usage":"gptgrep status ROOT --json","scope":"existing indexed files; index discovers new files"},
             "parse":{"usage":"gptgrep parse FILE --json","effect":"local parser"},
             "judge":{"usage":"gptgrep judge --input FILE [--model MODEL] --json","input":{"state":"JSON","questions":"Choice/Noul/Score map"},"effect":"explicit remote Decisions call"},
-            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"jev-model":{"type":"string","default":"typesafe/jev-1.13"},"document":{"type":"string"}},"defaults":{"model":"gpt-5.6-luna","reasoning_effort":"max","timeout_seconds":180,"max_tool_calls":12}},
+            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"jev-model":{"type":"string","default":"typesafe/jev-1.13"},"document":{"type":"string"}},"defaults":{"model":"gpt-5.6-luna","reasoning_effort":"max","service_tier":"fast","timeout_seconds":180,"max_tool_calls":12}},
             "summarize":{"usage":"gptgrep summarize DOCUMENT_ID:NODE_ID --root ROOT [host options] --json","effect":"required Jev retrieval in the selected document, then model-written summary with issued evidence citations"},
-            "host-complete":{"usage":"gptgrep host-complete --input FILE_OR_DASH [host options] --json","input":{"instructions":"string","state":"JSON","schema":"JSON Schema object"},"effect":"explicit schema-validated local Codex completion; no citation assertion","defaults":{"max_input_bytes":262144},"hard_max_input_bytes":1048576},
+            "host-complete":{"usage":"gptgrep host-complete --input FILE_OR_DASH [host options] --json","input":{"instructions":"string","state":"JSON","schema":"JSON Schema object"},"effect":"explicit schema-validated local Codex completion; no citation assertion","defaults":{"max_input_bytes":262144,"service_tier":"fast"},"hard_max_input_bytes":1048576},
             "doctor":{"usage":"gptgrep doctor --json","effect":"local capability probe"}
         },
         "search_output":{"fields":["schema_version","query","mode","document_scope","root","generation","index_used","source_fresh","minimum_relevance_score","hits","coverage","metrics","warnings"],"hit_fields":["path","node_id","title","line_start","line_end","page_start","page_end","match_line","match_column","byte_start","byte_end","column_start","node_offset","next_offset","coordinate_system","text","text_truncated","score","confidence","literal_anchor","source_sha256","source_fresh","citation"]},

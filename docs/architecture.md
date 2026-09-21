@@ -43,9 +43,9 @@ flowchart TD
 | `packages/cli` | Optional incur presentation and discovery wrapper | Node and published incur 0.5.1 |
 
 The host profile defaults are `model = "gpt-5.6-luna"` and
-`model_reasoning_effort = "max"`, as selected for this project. They are local
+`model_reasoning_effort = "max"`, with `service_tier = "fast"`, as selected for this project. They are local
 helper settings; they do not change the development agent's model. Runtime
-`CODEX_HOME` selects an existing account cell. The program does not read/copy auth
+`CODEX_HOME` selects an existing Codex configuration and authentication directory. The program does not read/copy auth
 files, change global profiles, or perform an interactive login.
 
 ## Ingestion and snapshot consistency

@@ -113,6 +113,7 @@ Jev はチャット補完ではなく、OpenRouter の型付き **Decisions API*
 ```toml
 model = "gpt-5.6-luna"
 model_reasoning_effort = "max"
+service_tier = "fast"
 approval_policy = "never"
 sandbox_mode = "read-only"
 ```
@@ -125,11 +126,10 @@ sandbox_mode = "read-only"
 
 ```sh
 gptgrep ask 'What is the recovery procedure, and how long are snapshots kept?' \
-  ./documents --codex-bin codex --codex-home /path/to/codex-home --json
+  ./documents --json
 
 gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
-  --codex-bin codex --codex-home /path/to/codex-home \
-  --model gpt-5.6-luna --reasoning-effort max --json
+  --model gpt-5.6-luna --reasoning-effort max --service-tier fast --json
 ```
 
 Codex を起動する前に、ホストは必須の Jev ハイブリッド検索を実行し、上限付きの根拠を

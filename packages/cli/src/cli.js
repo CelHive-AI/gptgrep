@@ -21,6 +21,7 @@ const host = {
   jevModel: z.string().min(1).max(128).optional().describe('Jev Decisions model; native default applies when omitted'),
   document,
   reasoningEffort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']).default('max'),
+  serviceTier: z.enum(['fast', 'priority', 'flex', 'default']).default('fast'),
   timeout: z.number().int().min(1).max(900).default(180),
   maxToolCalls: z.number().int().min(1).max(64).default(12),
 }
@@ -68,6 +69,7 @@ const descriptions = {
 
 const hostArguments = (r) => [
   `--codex-bin=${r.codexBin}`, `--model=${r.model}`, `--reasoning-effort=${r.reasoningEffort}`,
+  `--service-tier=${r.serviceTier}`,
   '--timeout', String(r.timeout), '--max-tool-calls', String(r.maxToolCalls),
   ...(r.codexHome === undefined ? [] : [`--codex-home=${r.codexHome}`]),
   ...(r.jevModel === undefined ? [] : [`--jev-model=${r.jevModel}`]),

@@ -9,10 +9,13 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import subprocess
+import signal
+import threading
 import sys
 import time
 import types
@@ -56,6 +59,14 @@ def checkpoint_attempt(path: Path, value: dict) -> None:
 
 def may_attempt(status: str, retry_failed: bool) -> bool:
     return status in ("not_indexed", "not_answered", "budget_blocked", "index_unavailable") or (retry_failed and status != "completed")
+
+
+def timing_fields(calls, name="wall_ms", source="elapsed_ms") -> dict:
+    values = [item.get(source) for item in calls]
+    known = [value for value in values if type(value) in (int, float) and math.isfinite(value) and value >= 0]
+    missing = len(values) - len(known)
+    subtotal = math.fsum(known)
+    return {name: subtotal if missing == 0 else None, name + "_known_subtotal": subtotal, name + "_missing": missing}
 
 
 def benchmark_qualification(answer, index, stored_pages, page_count, run_dir, host, plan):
@@ -223,6 +234,9 @@ def reader_request(row: dict, document_id: str, effort: str, max_turns: int) -> 
 def execute(args) -> dict:
     from bridge import LocalCodex
     profile = profiles.resolve(args)
+    index_host_concurrency = getattr(args, "index_host_concurrency", 64)
+    if not 1 <= index_host_concurrency <= 64:
+        raise ValueError("Index host concurrency must be1..64")
     roots = {name: getattr(args, name).expanduser().resolve() for name in ("upstream", "benchmark", "run_dir")}
     upstream, benchmark, run_dir = roots["upstream"], roots["benchmark"], roots["run_dir"]
     judge_source = args.judge_source.expanduser().resolve() if args.judge_source else None
@@ -246,6 +260,7 @@ def execute(args) -> dict:
     plan = {
         "schema_version": "gptgrep.pageindex.pair.v5", "stage": args.stage, "variants": variants,
         "profile": profile,
+        "requested_service_tier": args.service_tier,
         "known_document_scope": True,
         "cohort_manifest_sha256": cohort_sha,
         "source_rows": selected, "question_count": len(rows), "document_count": len(filenames),
@@ -256,10 +271,12 @@ def execute(args) -> dict:
         "model": args.model, "reasoning_effort": args.reasoning_effort,
         "host_input_cap": args.max_input_bytes, "host_output_cap": 131072,
         "max_host_invocations": args.max_model_calls, "host_timeout_secs": args.timeout,
-        "sdk_max_turns": args.max_turns, "host_concurrency": 1,
+        "sdk_max_turns": args.max_turns, "host_concurrency": index_host_concurrency,
+        "host_concurrency_by_role": {"index": index_host_concurrency, "reader": 1, "judge": 1},
         "upstream_defaults": {"benchmark_max_turns_argument": None, "pinned_sdk_effective_max_turns": 10,
-                              "benchmark_concurrency": 5},
-        "concurrency_adaptation": "Serial model invocations for controlled per-query measurement",
+                              "benchmark_concurrency": 5, "index_summary_concurrency": 64,
+                              "index_expansion_concurrency": 32},
+        "concurrency_adaptation": "Upstream index scheduling retained under an explicit host ceiling; reader and judge serial1, not upstream QA-throughput5 reproduction",
         "turn_budget_unit": "Original Agents SDK model-loop turns; not native tool-call count",
         "source_hashes": {name: locks.digest(benchmark / "documents" / name) for name in filenames},
         "question_sha256": fingerprint(rows), "adapter_files": adapter_files,
@@ -277,7 +294,7 @@ def execute(args) -> dict:
         initial_plan = run_dir / "plan.json"
         if initial_plan.exists():
             prior = locks.read_json(initial_plan)
-            for key in ("variants", "source_rows", "source_hashes", "question_sha256", "cohort_manifest_sha256", "source_and_dependencies", "adapter_files", "model", "reasoning_effort", "profile", "host_input_cap", "host_binary_sha256", "sdk_max_turns", "host_timeout_secs"):
+            for key in ("variants", "source_rows", "source_hashes", "question_sha256", "cohort_manifest_sha256", "source_and_dependencies", "adapter_files", "model", "reasoning_effort", "profile", "host_input_cap", "host_binary_sha256", "sdk_max_turns", "host_timeout_secs", "host_concurrency_by_role"):
                 if prior.get(key) != plan.get(key):
                     raise ValueError("Run identity changed; use a new private directory without rewriting prior evidence")
         else:
@@ -292,11 +309,20 @@ def execute(args) -> dict:
         if args.stage in ("judge", "run") and judge_source is None:
             raise ValueError("Judge stages require the locked private judge source")
         host = LocalCodex(binary, args.codex_bin, args.codex_home.expanduser().resolve(), run_dir,
-                          args.max_model_calls, args.timeout, args.model, args.reasoning_effort, args.max_input_bytes)
+                          args.max_model_calls, args.timeout, args.model, args.reasoning_effort, args.max_input_bytes,
+                          host_concurrency=index_host_concurrency, service_tier=args.service_tier)
         index_host = RoleHost(host, "index", profile["roles"]["index"])
         chat_host = RoleHost(host, "chat", profile["roles"]["chat"])
         judge_host = RoleHost(host, "judge", profile["roles"]["judge"])
         before_cwd = Path.cwd()
+        previous_signals = {}
+        if threading.current_thread() is threading.main_thread():
+            def interrupted(signum, _frame):
+                failure = KeyboardInterrupt("Baseline interrupted; owned host cleanup requested")
+                failure.exit_code = 128 + signum
+                raise failure
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous_signals[signum] = signal.signal(signum, interrupted)
         os.chdir(run_dir)
         try:
             locks.import_upstream(upstream)
@@ -329,6 +355,7 @@ def execute(args) -> dict:
                                                      "effort": args.reasoning_effort, "input_cap": args.max_input_bytes,
                                                      "adapter": adapter_files, "dependencies": verified["dependencies"],
                                                      "all_role_profiles": profile,
+                                                     "host_concurrency_by_role": plan["host_concurrency_by_role"],
                                                      "host_binary_sha256": plan["host_binary_sha256"]})
                             if cache_path.exists():
                                 record = locks.read_json(cache_path)
@@ -351,7 +378,15 @@ def execute(args) -> dict:
                                 record.update(status="started", host_call_start=before_calls + 1)
                                 checkpoint_attempt(cache_path, record)
                                 try:
-                                    doc = client.submit_document(str(benchmark / "documents" / name), mode="flash", wait=True)
+                                    try:
+                                        doc = client.submit_document(str(benchmark / "documents" / name), mode="flash", wait=True)
+                                    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+                                        host.cancel()
+                                        raise
+                                    finally:
+                                        # SDK cancellation drains per-call owned-process cleanup and receipts
+                                        # before another document can change the phase or ordinal slice.
+                                        host.drain()
                                     tree = client.get_document_structure(doc["doc_id"])
                                     pages = client.get_ocr(doc["doc_id"], format="page")["result"]
                                     if len(pages) != metadata[name]["pages"]:
@@ -369,6 +404,7 @@ def execute(args) -> dict:
                                 record.update(elapsed_ms=(time.perf_counter() - started) * 1000,
                                               host_invocations=len(host.calls) - before_calls,
                                               host_call_ordinals=[call["ordinal"] for call in host.calls[before_calls:]],
+                                              achieved_host_concurrency=host.concurrency_report(host.calls[before_calls:]),
                                               rejections=host.rejections[before_rejections:])
                                 checkpoint_attempt(cache_path, record)
                             index_records.append({key: value for key, value in record.items() if key != "tree"})
@@ -494,6 +530,8 @@ def execute(args) -> dict:
                 or (args.stage in ("judge", "run") and baseline_eligible)
             )
             status = "adapter_capability_unavailable" if args.stage != "index" and not adapter_verified else ("completed" if stage_complete else "incomplete")
+            outer_timing = timing_fields(host.calls, "host_process_wall_ms")
+            inner_timing = timing_fields(host.calls, "reported_host_wall_ms", "reported_host_elapsed_ms")
             result = {**plan, "status": status, "adapter_capability_verified": adapter_verified,
                       "benchmark_qualification": qualifications,
                       "baseline_eligible": baseline_eligible, "indexes": index_records,
@@ -502,16 +540,15 @@ def execute(args) -> dict:
                       "host_calls_by_role": {
                           role: {"attempts": len(items), "completed": sum(item.get("status") == "completed" for item in items),
                                  "failed_or_interrupted": sum(item.get("status") != "completed" for item in items),
-                                 "wall_ms": sum(item.get("elapsed_ms", 0) for item in items),
+                                 **timing_fields(items),
                                  "usage_missing": sum(item.get("usage") is None for item in items)}
                           for role, items in ((name, [call for call in host.calls if call.get("phase", "").split(":", 1)[0] == name])
                                               for name in ("index", "answer", "judge", "interrupted_unknown"))},
                       "adapter_rejections": len(host.rejections), "paired_baseline_complete": paired_complete,
-                      "host_process_wall_ms": sum(call.get("elapsed_ms", 0) for call in host.calls),
-                      "reported_host_wall_ms": sum(call["reported_host_elapsed_ms"] for call in host.calls
-                                                    if isinstance(call.get("reported_host_elapsed_ms"), (int, float))),
-                      "reported_host_timing_missing": sum(not isinstance(call.get("reported_host_elapsed_ms"), (int, float))
-                                                          for call in host.calls),
+                      "achieved_host_concurrency": host.concurrency_report(),
+                      **outer_timing, **inner_timing,
+                      "reported_host_timing_missing": inner_timing["reported_host_wall_ms_missing"],
+                      "host_elapsed_aggregation": "Sum of per-invocation durations, not elapsed concurrent benchmark wall time; measured process overlap is separate",
                       "native_initialization_timing_available": False,
                       "gptgrep_comparison_complete": False, "provider_request_count": None, "billing_usd": None,
                       "usage_source": "private host-calls.jsonl; SDK aggregate usage is not authoritative",
@@ -519,7 +556,14 @@ def execute(args) -> dict:
             write_json(run_dir / "summary.json", result)
             return result
         finally:
-            os.chdir(before_cwd)
+            try:
+                host.close(cancel=True)
+                write_json(run_dir / "host-concurrency.json", host.concurrency_report())
+                write_json(run_dir / "adapter-rejections.json", host.rejections)
+            finally:
+                for signum, previous in previous_signals.items():
+                    signal.signal(signum, previous)
+                os.chdir(before_cwd)
 
 
 def main() -> int:
@@ -538,16 +582,21 @@ def main() -> int:
     parser.add_argument("--reasoning-effort")
     profiles.add_arguments(parser)
     parser.add_argument("--max-model-calls", type=int, default=0, help="Cap total local host invocations for this run;0 forbids model calls")
+    parser.add_argument("--index-host-concurrency", type=int, default=64, help="Owned index-host upper ceiling1..64; upstream summary64/expansion32 scheduling still applies")
     parser.add_argument("--max-input-bytes", type=int, default=262144)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--max-turns", type=int, default=10, help="Original SDK model-loop turns (source default10); distinct from native tool-call count")
     parser.add_argument("--capability-receipt", type=Path, help="Optional historical supporting receipt; does not qualify this benchmark")
     parser.add_argument("--retry-failed", action="store_true", help="Retry failed/interrupted stages while retaining immutable prior attempts and all billed calls")
     args = parser.parse_args()
-    if args.max_model_calls < 0 or not 1 <= args.max_input_bytes <= 1048576 or args.timeout <= 0 or args.max_turns <= 0:
+    if args.max_model_calls < 0 or not 1 <= args.max_input_bytes <= 1048576 or args.timeout <= 0 or args.max_turns <= 0 or not 1 <= args.index_host_concurrency <= 64:
         parser.error("Invalid call, input, time or turn bounds")
     try:
         report = execute(args)
+    except KeyboardInterrupt as error:
+        report = {"schema_version": "gptgrep.pageindex.pair.v5", "stage": args.stage, "status": "interrupted",
+                  "error": "Interrupted; started attempts and any known usage remain in the private host ledger",
+                  "exit_code": getattr(error, "exit_code", 130), "paired_baseline_complete": False}
     except Exception as error:
         report = {"schema_version": "gptgrep.pageindex.pair.v5", "stage": args.stage, "status": "failed",
                   "error": str(error), "paired_baseline_complete": False}
@@ -556,7 +605,7 @@ def main() -> int:
         "schema_version", "stage", "status", "question_count", "document_count", "physical_pages",
         "full_62_task_scope", "host_invocations", "completed_host_turns", "summary", "paired_baseline_complete", "error"
     )}, indent=2))
-    return 0 if report["status"] in ("completed", "plan_prepared") else 1
+    return 0 if report["status"] in ("completed", "plan_prepared") else report.get("exit_code", 1)
 
 
 if __name__ == "__main__":

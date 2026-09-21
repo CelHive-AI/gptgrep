@@ -112,6 +112,7 @@ are:
 ```toml
 model = "gpt-5.6-luna"
 model_reasoning_effort = "max"
+service_tier = "fast"
 approval_policy = "never"
 sandbox_mode = "read-only"
 ```
@@ -124,11 +125,10 @@ documents headless device-code setup when no login exists.
 
 ```sh
 gptgrep ask 'What is the recovery procedure, and how long are snapshots kept?' \
-  ./documents --codex-bin codex --codex-home /path/to/codex-home --json
+  ./documents --json
 
 gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
-  --codex-bin codex --codex-home /path/to/codex-home \
-  --model gpt-5.6-luna --reasoning-effort max --json
+  --model gpt-5.6-luna --reasoning-effort max --service-tier fast --json
 ```
 
 Before starting Codex, the host executes required Jev hybrid retrieval and

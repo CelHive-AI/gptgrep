@@ -23,6 +23,9 @@ priors or few-shot task examples in prompts, indexes, caches or selection rules.
 Build indexes from raw documents alone; keep judge state out of reader sessions.
 Keep credentials in the process environment; never commit credentials or private corpora.
 Public artifacts must not contain private session identities or machine paths.
+Keep workstation-specific launchers, account routing, authentication fixtures and
+developer profiles in ignored local configuration. Public interfaces and examples
+use the standard Codex CLI and portable parameters; never publish local aliases.
 Private evidence and exact native provenance belong under .local/ or workspace/handoff/.
 Keep docs/research/ local-only, ignored and untracked; preserve its files locally.
 Keep workspace/exec-plans/ and workspace/issues/ local-only, ignored and untracked too.
