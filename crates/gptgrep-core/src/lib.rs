@@ -71,7 +71,7 @@ pub struct IndexReport {
     pub tree_profile: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
     pub path: String,
     pub node_id: String,
@@ -104,9 +104,11 @@ pub struct Hit {
     pub citation: String,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Coverage {
     pub indexed_files: usize,
+    /// Documents in the selected search scope, before candidate filtering.
+    pub scoped_files: usize,
     pub candidate_files: usize,
     pub verified_files: usize,
     pub routed_documents: usize,
@@ -118,20 +120,25 @@ pub struct Coverage {
     pub semantic_scope_complete: bool,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     pub elapsed_ms: u128,
+    /// Logical Jev call attempts, including a pre-call observer that may stop
+    /// before network I/O. Never a claim of physical provider requests.
+    pub jev_calls_attempted: usize,
+    /// Successful validated Jev responses observed by this search.
     pub jev_requests: usize,
     pub jev_models: Vec<String>,
     pub jev_usage: Vec<Value>,
     pub jev_candidate_bytes: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchReport {
     pub schema_version: String,
     pub query: String,
     pub mode: String,
+    pub document_scope: Option<String>,
     pub root: PathBuf,
     pub generation: String,
     pub index_used: bool,
@@ -146,6 +153,8 @@ pub struct SearchReport {
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
     pub mode: String,
+    /// Exact normalized source-relative path from the current index, if scoped.
+    pub document: Option<String>,
     pub limit: usize,
     pub context: usize,
     pub case_insensitive: bool,
@@ -159,7 +168,8 @@ pub struct SearchOptions {
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
-            mode: "regex".into(),
+            mode: "hybrid".into(),
+            document: None,
             limit: 20,
             context: 0,
             case_insensitive: false,
@@ -170,6 +180,161 @@ impl Default for SearchOptions {
             min_score: 0.5,
         }
     }
+}
+
+/// Partial accounting for a failed mandatory Jev search stage. Causes are
+/// sanitized and bounded; provider bodies, credentials and raw error chains are
+/// not exposed. Metrics retain observed successful responses and their bounded
+/// provider usage, even when a later attempted call fails.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JevSearchError {
+    /// `initialization`, `document_routing`, or `evidence_reranking`.
+    pub stage: String,
+    pub metrics: Metrics,
+    pub coverage: Coverage,
+    pub document_scope: Option<String>,
+    pub generation: Option<String>,
+    pub cause: String,
+    /// Always false: failed calls can incur usage that was never returned.
+    pub accounting_complete: bool,
+}
+
+impl std::fmt::Display for JevSearchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Jev search failed during {}: {} (accounting incomplete)",
+            self.stage, self.cause
+        )
+    }
+}
+
+impl std::error::Error for JevSearchError {}
+
+/// Nonterminal metadata receipt emitted before a logical call attempt and after
+/// each validated reply. A caller can persist these before the next await so
+/// cancellation does not discard already observed usage. No source text, request
+/// payload, credential or raw provider body is included.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JevSearchProgress {
+    pub stage: String,
+    /// `before_call` or `after_reply`.
+    pub event: String,
+    pub metrics: Metrics,
+    pub coverage: Coverage,
+    pub document_scope: Option<String>,
+    pub generation: Option<String>,
+    /// Progress is nonterminal; final accounting belongs to the completed run.
+    pub accounting_complete: bool,
+}
+
+pub type JevSearchObserver<'a> = dyn Fn(&JevSearchProgress) -> Result<()> + Send + Sync + 'a;
+
+fn jev_search_error(
+    stage: &str,
+    error: anyhow::Error,
+    metrics: &Metrics,
+    coverage: &Coverage,
+    scope: Option<&str>,
+    generation: Option<&str>,
+    started: Instant,
+) -> JevSearchError {
+    let message = error.to_string();
+    let cause = if message == "OPENROUTER_API_KEY is not available" {
+        message
+    } else if message.contains("API key") {
+        "Jev credentials are missing or invalid".into()
+    } else if let Some(status) = message
+        .strip_prefix("Jev provider returned HTTP ")
+        .and_then(|tail| tail.split(';').next())
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| (100..=599).contains(value))
+    {
+        format!("Jev provider returned HTTP {status}; request was not retried")
+    } else if message.contains("timed out") {
+        "Jev request timed out; usage may be unknown; no retry or fallback".into()
+    } else if message.contains("transport failed") {
+        "Jev transport failed; usage may be unknown; no retry or fallback".into()
+    } else if message.contains("byte limit") {
+        "Jev request or response exceeded its byte limit".into()
+    } else if message == "Invalid Jev model identifier" {
+        message
+    } else {
+        "Jev request or response validation failed; no local fallback".into()
+    };
+    let mut metrics = metrics.clone();
+    metrics.elapsed_ms = started.elapsed().as_millis();
+    JevSearchError {
+        stage: stage.into(),
+        metrics,
+        coverage: coverage.clone(),
+        document_scope: scope.map(str::to_owned),
+        generation: generation.map(str::to_owned),
+        cause,
+        accounting_complete: false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_jev(
+    observer: Option<&JevSearchObserver<'_>>,
+    stage: &str,
+    event: &str,
+    metrics: &Metrics,
+    coverage: &Coverage,
+    options: &SearchOptions,
+    generation: &str,
+    started: Instant,
+) -> Result<()> {
+    let Some(observer) = observer else {
+        return Ok(());
+    };
+    let mut current = metrics.clone();
+    current.elapsed_ms = started.elapsed().as_millis();
+    let progress = JevSearchProgress {
+        stage: stage.into(),
+        event: event.into(),
+        metrics: current,
+        coverage: coverage.clone(),
+        document_scope: options.document.clone(),
+        generation: Some(generation.into()),
+        accounting_complete: false,
+    };
+    observer(&progress).map_err(|error| {
+        let mut failure = jev_search_error(stage, error, metrics, coverage, options.document.as_deref(), Some(generation), started);
+        failure.cause = if event == "before_call" {
+            "Jev progress observer failed before the call; no provider call was started".into()
+        } else {
+            "Jev progress observer failed after a validated reply; no further provider call was started".into()
+        };
+        anyhow::Error::new(failure)
+    })
+}
+
+fn scoped_documents<'a>(
+    documents: &'a [Document],
+    requested: Option<&str>,
+) -> Result<Vec<&'a Document>> {
+    let Some(requested) = requested else {
+        return Ok(documents.iter().collect());
+    };
+    let path = Path::new(requested);
+    let normalized: PathBuf = path.components().collect();
+    ensure!(
+        !requested.is_empty()
+            && requested.len() <= 4096
+            && !requested.contains('\0')
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+            && normalized.as_os_str() == path.as_os_str(),
+        "document scope must be an exact normalized source-relative path"
+    );
+    let document = documents
+        .iter()
+        .find(|document| document.path == requested)
+        .with_context(|| format!("document not present in current index: {requested}"))?;
+    Ok(vec![document])
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -924,6 +1089,41 @@ fn literal_anchor(query: &str, line: &str) -> bool {
 }
 
 pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result<SearchReport> {
+    search_using_client(root, query, options, None, None).await
+}
+
+/// Run the same search engine with an explicitly supplied Jev transport. This is
+/// useful for embedding and loopback tests; it never disables Jev in hybrid or
+/// semantic mode. Explicit regex/lexical modes do not invoke the supplied client.
+/// The supplied client's model/endpoint configuration is authoritative.
+pub async fn search_with_client(
+    root: &Path,
+    query: &str,
+    options: &SearchOptions,
+    client: &JevClient,
+) -> Result<SearchReport> {
+    search_using_client(root, query, options, Some(client), None).await
+}
+
+/// Search with bounded progress receipts. A failed observer stops the workflow
+/// before the next provider call and returns a JevSearchError with known usage.
+pub async fn search_with_client_and_observer(
+    root: &Path,
+    query: &str,
+    options: &SearchOptions,
+    client: &JevClient,
+    observer: &JevSearchObserver<'_>,
+) -> Result<SearchReport> {
+    search_using_client(root, query, options, Some(client), Some(observer)).await
+}
+
+async fn search_using_client(
+    root: &Path,
+    query: &str,
+    options: &SearchOptions,
+    supplied_client: Option<&JevClient>,
+    observer: Option<&JevSearchObserver<'_>>,
+) -> Result<SearchReport> {
     let started = Instant::now();
     ensure!(
         matches!(
@@ -951,23 +1151,37 @@ pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result
         options.min_score.is_finite() && (0.0..=1.0).contains(&options.min_score),
         "min-score must be a finite value in 0..1"
     );
-    let client = if model_assisted {
-        Some(JevClient::from_env(options.model.as_deref())?)
-    } else {
-        None
-    };
     let snapshot = Snapshot::open(root)?;
-    let docs: HashMap<_, _> = snapshot
-        .manifest
-        .documents
-        .iter()
-        .map(|d| (d.id.as_str(), d))
-        .collect();
+    let scoped = scoped_documents(&snapshot.manifest.documents, options.document.as_deref())?;
+    let docs: HashMap<_, _> = scoped.iter().copied().map(|d| (d.id.as_str(), d)).collect();
     let mut coverage = Coverage {
-        indexed_files: docs.len(),
+        indexed_files: snapshot.manifest.documents.len(),
+        scoped_files: scoped.len(),
         ..Default::default()
     };
     let mut metrics = Metrics::default();
+    let client = if model_assisted {
+        Some(match supplied_client {
+            Some(client) => client.clone(),
+            None => JevClient::from_env(options.model.as_deref()).map_err(|error| {
+                jev_search_error(
+                    "initialization",
+                    error,
+                    &metrics,
+                    &coverage,
+                    options.document.as_deref(),
+                    Some(&snapshot.manifest.generation),
+                    started,
+                )
+            })?,
+        })
+    } else {
+        None
+    };
+    let indexed_document = options
+        .document
+        .as_ref()
+        .map(|_| PathBuf::from(format!("{}.txt", scoped[0].id)));
     let mut warnings = Vec::new();
     let mut freshness = HashMap::new();
     let mut texts = HashMap::new();
@@ -995,7 +1209,7 @@ pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result
         let verifier = regex::RegexBuilder::new(&verification_pattern)
             .case_insensitive(options.case_insensitive || options.mode != "regex")
             .build()?;
-        let matches = gptgrep_index::search(
+        let matches = gptgrep_index::search_with_document_and_predicate(
             &snapshot.dir.join("trigram"),
             &pattern,
             options.case_insensitive || options.mode != "regex",
@@ -1004,6 +1218,19 @@ pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result
                 options.limit + 1
             } else {
                 10_000
+            },
+            indexed_document.as_deref(),
+            |relative| {
+                let id = relative
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .context("invalid trigram document path")?;
+                let document = docs
+                    .get(id)
+                    .context("trigram document missing from manifest")?;
+                Ok(*freshness
+                    .entry(document.id.clone())
+                    .or_insert_with(|| snapshot.fresh(document)))
             },
         )?;
         coverage.candidate_files = matches.candidate_files;
@@ -1084,12 +1311,7 @@ pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result
     if let Some(client) = client {
         // Document routing is a semantic lane independent of lexical matches. Coverage is explicit.
         let mut routing = Vec::new();
-        for doc in snapshot
-            .manifest
-            .documents
-            .iter()
-            .take(options.routing_docs)
-        {
+        for doc in scoped.iter().copied().take(options.routing_docs) {
             let fresh = *freshness
                 .entry(doc.id.clone())
                 .or_insert_with(|| snapshot.fresh(doc));
@@ -1120,20 +1342,49 @@ pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result
                 text: truncate(&description, 900).0.to_owned(),
             });
         }
+        coverage.stale_files = known_stale_paths(&freshness, &docs);
         coverage.routed_documents = routing.len();
-        coverage.semantic_scope_complete = routing.len() == docs.len();
+        coverage.semantic_scope_complete = routing.len() == scoped.len();
         if !coverage.semantic_scope_complete {
-            warnings.push("Semantic routing covers a bounded document prefix; increase --routing-docs up to 32 or search narrower roots. Lexical retrieval covers the indexed corpus.".into());
+            warnings.push("Semantic routing covers a bounded document prefix; increase --routing-docs up to 32, select --document, or search narrower roots. Lexical retrieval uses the same explicit document scope.".into());
         }
         if !routing.is_empty() {
             metrics.jev_candidate_bytes += routing.iter().map(|c| c.text.len()).sum::<usize>();
-            let ranked = client
-                .rerank(query, &routing)
-                .await
-                .context("Jev document routing failed; no silent local fallback")?;
+            metrics.jev_calls_attempted += 1;
+            observe_jev(
+                observer,
+                "document_routing",
+                "before_call",
+                &metrics,
+                &coverage,
+                options,
+                &snapshot.manifest.generation,
+                started,
+            )?;
+            let ranked = client.rerank(query, &routing).await.map_err(|error| {
+                jev_search_error(
+                    "document_routing",
+                    error,
+                    &metrics,
+                    &coverage,
+                    options.document.as_deref(),
+                    Some(&snapshot.manifest.generation),
+                    started,
+                )
+            })?;
             metrics.jev_requests += 1;
             metrics.jev_models.push(ranked.model);
             metrics.jev_usage.push(ranked.usage);
+            observe_jev(
+                observer,
+                "document_routing",
+                "after_reply",
+                &metrics,
+                &coverage,
+                options,
+                &snapshot.manifest.generation,
+                started,
+            )?;
             let mut ranks = ranked.rankings;
             ranks.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
             // Reserve half the final budget for tree candidates, protecting no-keyword recall.
@@ -1143,19 +1394,15 @@ pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result
                 .iter()
                 .take(8)
                 .filter_map(|r| docs.get(r.id.as_str()).copied())
+                .map(|document| (document, leaf_nodes(&document.nodes)))
                 .collect();
-            let max_depth = selected.iter().map(|d| d.nodes.len()).max().unwrap_or(0);
+            let max_depth = selected
+                .iter()
+                .map(|(_, leaves)| leaves.len())
+                .max()
+                .unwrap_or(0);
             for offset in 0..max_depth {
-                for doc in &selected {
-                    let leaves: Vec<_> = doc
-                        .nodes
-                        .iter()
-                        .filter(|n| {
-                            !doc.nodes
-                                .iter()
-                                .any(|c| c.parent_id.as_deref() == Some(&n.id))
-                        })
-                        .collect();
+                for (doc, leaves) in &selected {
                     if let Some(node) = leaves.get(offset) {
                         let h = hit(
                             doc,
@@ -1179,8 +1426,11 @@ pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result
                     break;
                 }
             }
-            coverage.truncated |=
-                selected.iter().map(|d| d.nodes.len()).sum::<usize>() > hits.len();
+            coverage.truncated |= selected
+                .iter()
+                .map(|(doc, _)| doc.nodes.len())
+                .sum::<usize>()
+                > hits.len();
         }
         coverage.truncated |= hits.len() > options.max_candidates;
         hits.truncate(options.max_candidates);
@@ -1197,23 +1447,59 @@ pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result
                 })
                 .collect();
             metrics.jev_candidate_bytes += candidates.iter().map(|c| c.text.len()).sum::<usize>();
-            let ranked = client
-                .rerank(query, &candidates)
-                .await
-                .context("Jev evidence reranking failed; no silent local fallback")?;
+            metrics.jev_calls_attempted += 1;
+            observe_jev(
+                observer,
+                "evidence_reranking",
+                "before_call",
+                &metrics,
+                &coverage,
+                options,
+                &snapshot.manifest.generation,
+                started,
+            )?;
+            let ranked = client.rerank(query, &candidates).await.map_err(|error| {
+                jev_search_error(
+                    "evidence_reranking",
+                    error,
+                    &metrics,
+                    &coverage,
+                    options.document.as_deref(),
+                    Some(&snapshot.manifest.generation),
+                    started,
+                )
+            })?;
             metrics.jev_requests += 1;
             metrics.jev_models.push(ranked.model);
             metrics.jev_usage.push(ranked.usage);
             coverage.reranked_candidates = candidates.len();
+            observe_jev(
+                observer,
+                "evidence_reranking",
+                "after_reply",
+                &metrics,
+                &coverage,
+                options,
+                &snapshot.manifest.generation,
+                started,
+            )?;
             let scores: HashMap<_, _> = ranked
                 .rankings
                 .into_iter()
                 .map(|r| (r.id.clone(), r))
                 .collect();
             for (i, h) in hits.iter_mut().enumerate() {
-                let rank = scores
-                    .get(&format!("c{i}"))
-                    .context("Jev omitted a candidate")?;
+                let rank = scores.get(&format!("c{i}")).ok_or_else(|| {
+                    jev_search_error(
+                        "evidence_reranking",
+                        anyhow::anyhow!("Jev omitted a candidate"),
+                        &metrics,
+                        &coverage,
+                        options.document.as_deref(),
+                        Some(&snapshot.manifest.generation),
+                        started,
+                    )
+                })?;
                 h.score = rank.score;
                 h.confidence = rank.confidence;
             }
@@ -1234,12 +1520,7 @@ pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result
             });
         }
     }
-    coverage.stale_files = freshness
-        .iter()
-        .filter(|(_, fresh)| !**fresh)
-        .filter_map(|(id, _)| docs.get(id.as_str()).map(|d| d.path.clone()))
-        .collect();
-    coverage.stale_files.sort();
+    coverage.stale_files = known_stale_paths(&freshness, &docs);
     if !coverage.stale_files.is_empty() {
         warnings.push("Stale/deleted source documents were excluded; rerun index before relying on a negative result.".into());
     }
@@ -1269,6 +1550,7 @@ pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result
         schema_version: SCHEMA.into(),
         query: query.into(),
         mode: options.mode.clone(),
+        document_scope: options.document.clone(),
         root: snapshot.manifest.root,
         generation: snapshot.manifest.generation,
         index_used: true,
@@ -1279,6 +1561,36 @@ pub async fn search(root: &Path, query: &str, options: &SearchOptions) -> Result
         metrics,
         warnings,
     })
+}
+
+/// Two linear passes preserve source/preorder while removing parents. Compute
+/// once per selected document, not once per candidate round.
+fn leaf_nodes(nodes: &[TreeNode]) -> Vec<&TreeNode> {
+    let parents: HashSet<&str> = nodes
+        .iter()
+        .filter_map(|node| node.parent_id.as_deref())
+        .collect();
+    nodes
+        .iter()
+        .filter(|node| !parents.contains(node.id.as_str()))
+        .collect()
+}
+
+fn known_stale_paths(
+    freshness: &HashMap<String, bool>,
+    documents: &HashMap<&str, &Document>,
+) -> Vec<String> {
+    let mut paths: Vec<_> = freshness
+        .iter()
+        .filter(|(_, fresh)| !**fresh)
+        .filter_map(|(id, _)| {
+            documents
+                .get(id.as_str())
+                .map(|document| document.path.clone())
+        })
+        .collect();
+    paths.sort();
+    paths
 }
 
 /// Inspect all indexed documents without loading their body text.
@@ -1292,6 +1604,679 @@ pub fn catalog(root: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn regex_options() -> SearchOptions {
+        SearchOptions {
+            mode: "regex".into(),
+            ..Default::default()
+        }
+    }
+
+    async fn mock_jev(
+        statuses: Vec<u16>,
+    ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/api/alpha/decisions", listener.local_addr()?);
+        let client = JevClient::with_endpoint("synthetic-core-test-key", None, &endpoint)?;
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for (ordinal, status) in statuses.into_iter().enumerate() {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut bytes = Vec::new();
+                let body = loop {
+                    let mut buffer = [0; 4096];
+                    let count =
+                        tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buffer))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    assert!(bytes.len() <= 128 * 1024);
+                    if let Some(offset) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers =
+                            String::from_utf8_lossy(&bytes[..offset]).to_ascii_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse::<usize>()
+                            .unwrap();
+                        if bytes.len() >= offset + 4 + length {
+                            break serde_json::from_slice::<Value>(
+                                &bytes[offset + 4..offset + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                bodies.push(body.clone());
+                if status == 0 {
+                    // Cancellation fixture: the test explicitly aborts this server.
+                    std::future::pending::<()>().await;
+                }
+                let response = if status == 200 {
+                    let answers: serde_json::Map<String, Value> = body["questions"]
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .map(|id| {
+                            (
+                                id.clone(),
+                                json!({"type":"score","score":3.0,"confidence":0.9}),
+                            )
+                        })
+                        .collect();
+                    json!({"model":format!("typesafe/jev-fixture-{ordinal}"),"answers":answers,
+                        "usage":{"input_tokens":100+ordinal,"output_tokens":2,"cost":0.001*(ordinal+1) as f64}}).to_string()
+                } else {
+                    "secret-provider-body-sentinel".into()
+                };
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Service Unavailable"
+                };
+                let wire = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+                socket.write_all(wire.as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        Ok((client, server))
+    }
+
+    #[tokio::test]
+    async fn default_hybrid_requires_credentials_without_local_fallback() -> Result<()> {
+        assert_eq!(SearchOptions::default().mode, "hybrid");
+        assert_eq!(SearchOptions::default().document, None);
+        const CHILD: &str = "GPTGREP_CORE_NO_KEY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "tests::default_hybrid_requires_credentials_without_local_fallback",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("OPENROUTER_API_KEY")
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "isolated no-key test failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+        ensure!(
+            std::env::var_os("OPENROUTER_API_KEY").is_none(),
+            "child test requires an absent key"
+        );
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("notes.txt"), "needle locally exists")?;
+        let indexed = index(directory.path(), 10).await?;
+        let error = search(directory.path(), "needle", &SearchOptions::default())
+            .await
+            .unwrap_err();
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed initialization failure")?;
+        assert_eq!(failure.stage, "initialization");
+        assert_eq!(failure.cause, "OPENROUTER_API_KEY is not available");
+        assert_eq!(failure.metrics.jev_calls_attempted, 0);
+        assert_eq!(failure.metrics.jev_requests, 0);
+        assert_eq!(
+            failure.generation.as_deref(),
+            Some(indexed.generation.as_str())
+        );
+        assert!(!failure.accounting_complete);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_document_is_not_starved_by_unrelated_match_limits() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        // Pick arbitrary synthetic filenames by their actual internal hash order.
+        // The selected text file must sort after the unrelated file in tgrep.
+        let mut names: Vec<_> = (0..20)
+            .map(|index| format!("synthetic-{index}.txt"))
+            .collect();
+        names.sort_by_key(|name| digest(name.as_bytes()));
+        let unrelated = &names[0];
+        let selected = &names[names.len() - 1];
+        fs::write(
+            directory.path().join(unrelated),
+            "needle unrelated\n".repeat(12000),
+        )?;
+        fs::write(
+            directory.path().join(selected),
+            "needle selected evidence\n",
+        )?;
+        index(directory.path(), 10).await?;
+        let unscoped = search(
+            directory.path(),
+            "needle",
+            &SearchOptions {
+                limit: 1,
+                ..regex_options()
+            },
+        )
+        .await?;
+        assert_eq!(unscoped.hits[0].path, *unrelated);
+        assert_eq!(unscoped.document_scope, None);
+        assert_eq!(
+            (
+                unscoped.coverage.indexed_files,
+                unscoped.coverage.scoped_files
+            ),
+            (2, 2)
+        );
+        for mode in ["regex", "lexical"] {
+            let report = search(
+                directory.path(),
+                "needle",
+                &SearchOptions {
+                    mode: mode.into(),
+                    document: Some(selected.clone()),
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            assert_eq!(report.hits.len(), 1);
+            assert_eq!(report.hits[0].path, *selected);
+            assert_eq!(report.document_scope.as_deref(), Some(selected.as_str()));
+            assert_eq!(
+                (report.coverage.indexed_files, report.coverage.scoped_files),
+                (2, 1)
+            );
+            assert_eq!(
+                (
+                    report.coverage.candidate_files,
+                    report.coverage.verified_files
+                ),
+                (1, 1)
+            );
+            assert!(!report.coverage.truncated);
+            assert_eq!(report.metrics.jev_calls_attempted, 0);
+        }
+        let first_in_index = search(
+            directory.path(),
+            "needle",
+            &SearchOptions {
+                document: Some(unrelated.clone()),
+                limit: 1,
+                ..regex_options()
+            },
+        )
+        .await?;
+        assert_eq!(first_in_index.hits[0].path, *unrelated);
+        assert_eq!(first_in_index.coverage.scoped_files, 1);
+        assert_eq!(first_in_index.coverage.candidate_files, 1);
+        assert!(first_in_index.coverage.truncated);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_candidates_cannot_consume_fresh_regex_or_lexical_match_budgets() -> Result<()> {
+        for (query, old_text, fresh_text) in [
+            ("needle", "needle old evidence\n", "needle fresh evidence\n"),
+            ("中国", "中国 旧证据\n", "中国 新证据\n"),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let mut names: Vec<_> = (0..20)
+                .map(|index| format!("admission-{index}.txt"))
+                .collect();
+            names.sort_by_key(|name| digest(name.as_bytes()));
+            let stale = &names[0];
+            let unrelated = &names[names.len() / 2];
+            let fresh = &names[names.len() - 1];
+            fs::write(directory.path().join(stale), old_text.repeat(12000))?;
+            fs::write(directory.path().join(fresh), fresh_text)?;
+            fs::write(directory.path().join(unrelated), "zzzzzz\n")?;
+            index(directory.path(), 10).await?;
+            fs::write(directory.path().join(stale), "changed original")?;
+            fs::remove_file(directory.path().join(unrelated))?;
+            for mode in ["regex", "lexical"] {
+                let report = search(
+                    directory.path(),
+                    query,
+                    &SearchOptions {
+                        mode: mode.into(),
+                        limit: 1,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                assert_eq!(report.hits.len(), 1, "{query}/{mode}");
+                assert_eq!(report.hits[0].path, *fresh);
+                assert_eq!(report.hits[0].text, fresh_text.trim_end_matches('\n'));
+                assert!(report.hits[0].source_fresh);
+                assert!(report.coverage.stale_files.contains(stale));
+                assert_eq!(
+                    (report.coverage.indexed_files, report.coverage.scoped_files),
+                    (3, 3)
+                );
+                assert_eq!(report.coverage.verified_files, 1);
+                assert_eq!(
+                    report.coverage.stale_files.len() + 1,
+                    report.coverage.candidate_files
+                );
+                assert!(!report.coverage.truncated);
+                if mode == "regex" && query == "needle" {
+                    // The selective ASCII plan excludes this deleted file.
+                    // There is no eager full-corpus freshness pass. Conservative
+                    // Unicode/case-fold plans may legitimately admit all files.
+                    assert_eq!(report.coverage.candidate_files, 2);
+                    assert!(!report.coverage.stale_files.contains(unrelated));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn leaf_precomputation_handles_large_flat_trees_in_source_order() {
+        let mut nodes: Vec<_> = (0..20000)
+            .map(|index| TreeNode {
+                id: format!("node-{index}"),
+                parent_id: None,
+                title: format!("Heading {index}"),
+                level: 1,
+                page_start: 1,
+                page_end: 1,
+                line_start: 1,
+                line_end: 1,
+                key_items: Vec::new(),
+            })
+            .collect();
+        let flat = leaf_nodes(&nodes);
+        assert_eq!(flat.len(), nodes.len());
+        assert!(
+            flat.iter()
+                .zip(&nodes)
+                .all(|(leaf, node)| std::ptr::eq(*leaf, node))
+        );
+        nodes[500].parent_id = Some(nodes[1].id.clone());
+        nodes[500].level = 2;
+        nodes[501].parent_id = Some(nodes[500].id.clone());
+        nodes[501].level = 3;
+        let nested = leaf_nodes(&nodes);
+        let expected: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| ![1, 500].contains(index))
+            .map(|(_, node)| node.id.as_str())
+            .collect();
+        assert_eq!(
+            nested
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_leaf_candidates_keep_ranked_document_round_robin_order() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let text =
+            "# Section Zero\nsource zero\n# Section One\nsource one\n# Section Two\nsource two\n";
+        for name in ["synthetic-a.md", "synthetic-b.md"] {
+            fs::write(directory.path().join(name), text)?;
+        }
+        index(directory.path(), 10).await?;
+        let snapshot = Snapshot::open(directory.path())?;
+        let mut ranked: Vec<_> = snapshot.manifest.documents.iter().collect();
+        ranked.sort_by(|left, right| left.id.cmp(&right.id));
+        let (client, server) = mock_jev(vec![200, 200]).await?;
+        let report = search_with_client(
+            directory.path(),
+            "unrelated-query",
+            &SearchOptions {
+                mode: "semantic".into(),
+                limit: 4,
+                max_candidates: 4,
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        let requests = server.await?;
+        let questions = requests[1]["questions"].as_object().unwrap();
+        assert_eq!(questions.len(), 4);
+        for (candidate, section) in ["Section Zero", "Section One"].iter().enumerate() {
+            for (document, expected) in ranked.iter().enumerate() {
+                let id = format!("candidate_{}", candidate * ranked.len() + document);
+                let content = questions[&id]["instructions"]["candidate"]["text"]
+                    .as_str()
+                    .unwrap();
+                assert!(content.starts_with(&format!(
+                    "Document: {}\nSection: {section}\n",
+                    expected.path
+                )));
+            }
+        }
+        assert_eq!(report.hits.len(), 4);
+        assert_eq!(report.coverage.reranked_candidates, 4);
+        assert!(report.coverage.truncated);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scope_validates_exact_paths_and_preserves_unicode_regex_and_freshness() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("目录"))?;
+        let selected = "目录/研究.txt";
+        fs::write(directory.path().join(selected), "中国文档\r\nKEY\r\n")?;
+        fs::write(directory.path().join("other.txt"), "中国文档\nKEY\n")?;
+        index(directory.path(), 10).await?;
+        let options = SearchOptions {
+            document: Some(selected.into()),
+            case_insensitive: true,
+            ..regex_options()
+        };
+        let report = search(directory.path(), "中国|key", &options).await?;
+        assert_eq!(report.hits.len(), 2);
+        assert!(report.hits.iter().all(|hit| hit.path == selected));
+        assert_eq!(report.hits[1].text, "KEY");
+        for requested in [
+            "",
+            "unknown.txt",
+            "../other.txt",
+            "/other.txt",
+            "./other.txt",
+            "目录//研究.txt",
+            "目录/./研究.txt",
+            "other.txt/",
+        ] {
+            assert!(
+                search(
+                    directory.path(),
+                    "needle",
+                    &SearchOptions {
+                        document: Some(requested.into()),
+                        ..regex_options()
+                    }
+                )
+                .await
+                .is_err(),
+                "{requested}"
+            );
+        }
+        fs::remove_file(directory.path().join(selected))?;
+        let stale = search(directory.path(), "中国", &options).await?;
+        assert!(stale.hits.is_empty());
+        assert_eq!(stale.coverage.stale_files, [selected]);
+        assert_eq!(stale.coverage.scoped_files, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_scope_precedes_routing_budget_and_emits_real_mock_receipts() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let unrelated_count = SearchOptions::default().routing_docs + 3;
+        for index in 0..unrelated_count {
+            fs::write(
+                directory.path().join(format!("unrelated-{index:02}.txt")),
+                "background text",
+            )?;
+        }
+        let selected = "zz-selected.md";
+        fs::write(
+            directory.path().join(selected),
+            "# Scope\nDistinct source evidence.\n",
+        )?;
+        let indexed = index(directory.path(), unrelated_count + 1).await?;
+        let (client, server) = mock_jev(vec![200, 200]).await?;
+        let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let observer = move |progress: &JevSearchProgress| {
+            recorded.lock().unwrap().push(progress.clone());
+            Ok(())
+        };
+        let report = search_with_client_and_observer(
+            directory.path(),
+            "requested-topic",
+            &SearchOptions {
+                document: Some(selected.into()),
+                ..Default::default()
+            },
+            &client,
+            &observer,
+        )
+        .await?;
+        let requests = server.await?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 1);
+        let route = requests[0]["questions"]["candidate_0"]["instructions"]["candidate"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(route.contains(selected));
+        assert!(!route.contains("unrelated-"));
+        assert!(report.hits.iter().all(|hit| hit.path == selected));
+        assert_eq!(report.hits.len(), 1);
+        assert_eq!(report.coverage.indexed_files, unrelated_count + 1);
+        assert_eq!(report.coverage.scoped_files, 1);
+        assert_eq!(report.coverage.routed_documents, 1);
+        assert!(report.coverage.semantic_scope_complete);
+        assert_eq!(report.document_scope.as_deref(), Some(selected));
+        assert_eq!(
+            (
+                report.metrics.jev_calls_attempted,
+                report.metrics.jev_requests
+            ),
+            (2, 2)
+        );
+        assert_eq!(
+            report.metrics.jev_models,
+            ["typesafe/jev-fixture-0", "typesafe/jev-fixture-1"]
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 4);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.stage.as_str(), event.event.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("document_routing", "before_call"),
+                ("document_routing", "after_reply"),
+                ("evidence_reranking", "before_call"),
+                ("evidence_reranking", "after_reply")
+            ]
+        );
+        assert_eq!(
+            (
+                events[2].metrics.jev_calls_attempted,
+                events[2].metrics.jev_requests
+            ),
+            (2, 1)
+        );
+        assert_eq!(events[2].metrics.jev_usage[0]["cost"], json!(0.001));
+        assert!(events.iter().all(|event| event.generation.as_deref()
+            == Some(indexed.generation.as_str())
+            && !event.accounting_complete));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_rerank_keeps_routing_usage_in_typed_error() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("subject.txt"),
+            "needle source evidence",
+        )?;
+        let indexed = index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![200, 503]).await?;
+        let error = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions {
+                document: Some("subject.txt".into()),
+                ..Default::default()
+            },
+            &client,
+        )
+        .await
+        .unwrap_err();
+        let requests = server.await?;
+        assert_eq!(requests.len(), 2);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (2, 1)
+        );
+        assert_eq!(failure.metrics.jev_models, ["typesafe/jev-fixture-0"]);
+        assert_eq!(failure.metrics.jev_usage[0]["cost"], json!(0.001));
+        assert_eq!(failure.coverage.scoped_files, 1);
+        assert_eq!(failure.document_scope.as_deref(), Some("subject.txt"));
+        assert_eq!(
+            failure.generation.as_deref(),
+            Some(indexed.generation.as_str())
+        );
+        assert!(!failure.accounting_complete);
+        assert!(failure.cause.contains("HTTP 503"));
+        let serialized = serde_json::to_string(failure)?;
+        assert!(!serialized.contains("secret-provider-body-sentinel"));
+        assert!(!serialized.contains("synthetic-core-test-key"));
+        let roundtrip: JevSearchError = serde_json::from_str(&serialized)?;
+        assert_eq!(roundtrip.metrics.jev_usage, failure.metrics.jev_usage);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_first_stage_has_an_attempt_and_unknown_accounting() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![503]).await?;
+        let error = search_with_client(
+            directory.path(),
+            "query",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await
+        .unwrap_err();
+        server.await?;
+        let failure = error.downcast_ref::<JevSearchError>().unwrap();
+        assert_eq!(failure.stage, "document_routing");
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (1, 0)
+        );
+        assert!(failure.metrics.jev_usage.is_empty());
+        assert!(!failure.accounting_complete);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observer_failure_after_routing_stops_before_next_provider_call() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![200]).await?;
+        let observer = |progress: &JevSearchProgress| {
+            if progress.event == "after_reply" {
+                bail!("secret-collector-sentinel");
+            }
+            Ok(())
+        };
+        let error = search_with_client_and_observer(
+            directory.path(),
+            "query",
+            &SearchOptions::default(),
+            &client,
+            &observer,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(server.await?.len(), 1);
+        let failure = error.downcast_ref::<JevSearchError>().unwrap();
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (1, 1)
+        );
+        assert_eq!(failure.metrics.jev_usage[0]["cost"], json!(0.001));
+        assert!(
+            failure
+                .cause
+                .contains("observer failed after a validated reply")
+        );
+        assert!(!failure.cause.contains("secret-collector-sentinel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_retains_prior_reply_in_progress_receipts() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![200, 0]).await?;
+        let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let sender = Mutex::new(Some(sender));
+        let observer = move |progress: &JevSearchProgress| {
+            recorded.lock().unwrap().push(progress.clone());
+            if progress.stage == "evidence_reranking"
+                && progress.event == "before_call"
+                && let Some(sender) = sender.lock().unwrap().take()
+            {
+                let _ = sender.send(());
+            }
+            Ok(())
+        };
+        let root = directory.path().to_owned();
+        let task = tokio::spawn(async move {
+            search_with_client_and_observer(
+                &root,
+                "query",
+                &SearchOptions::default(),
+                &client,
+                &observer,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), receiver).await??;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        server.abort();
+        let _ = server.await;
+        let events = events.lock().unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.event, "before_call");
+        assert_eq!(
+            (last.metrics.jev_calls_attempted, last.metrics.jev_requests),
+            (2, 1)
+        );
+        assert_eq!(last.metrics.jev_usage[0]["cost"], json!(0.001));
+        assert!(!last.accounting_complete);
+        Ok(())
+    }
     #[test]
     fn unicode_boundaries() {
         assert_eq!(truncate("文档abc", 4), ("文", true));
@@ -1322,12 +2307,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         fs::write(dir.path().join("guide.md"), "# Guide\nalpha searchable\n")?;
         let initial = index(dir.path(), 10).await?;
-        let found = search(dir.path(), "alpha", &SearchOptions::default()).await?;
+        let found = search(dir.path(), "alpha", &regex_options()).await?;
         assert_eq!(found.hits.len(), 1);
         assert_eq!(found.hits[0].line_start, 2);
         assert_eq!(found.hits[0].coordinate_system, "source_lines");
         fs::write(dir.path().join("guide.md"), "# Changed\nbeta\n")?;
-        let stale = search(dir.path(), "alpha", &SearchOptions::default()).await?;
+        let stale = search(dir.path(), "alpha", &regex_options()).await?;
         assert!(stale.hits.is_empty());
         assert_eq!(stale.coverage.stale_files, vec!["guide.md"]);
         fs::write(dir.path().join("another.txt"), "other")?;
@@ -1366,7 +2351,7 @@ mod tests {
             "needle",
             &SearchOptions {
                 context: 2,
-                ..Default::default()
+                ..regex_options()
             },
         )
         .await?;
@@ -1377,7 +2362,7 @@ mod tests {
         let long_line = format!("{}needle{}\n", "文".repeat(5000), "后".repeat(1000));
         fs::write(dir.path().join("long.txt"), &long_line)?;
         index(dir.path(), 10).await?;
-        let result = search(dir.path(), "needle", &SearchOptions::default()).await?;
+        let result = search(dir.path(), "needle", &regex_options()).await?;
         let h = &result.hits[0];
         assert!(h.text.contains("needle"));
         assert!(h.column_start > 1 && h.text_truncated);
@@ -1385,7 +2370,7 @@ mod tests {
         let carriage_returns = "\r".repeat(5000);
         fs::write(dir.path().join("long.txt"), &carriage_returns)?;
         index(dir.path(), 10).await?;
-        let result = search(dir.path(), "\r{3}$", &SearchOptions::default()).await?;
+        let result = search(dir.path(), "\r{3}$", &regex_options()).await?;
         let h = &result.hits[0];
         assert!(!h.text.is_empty());
         assert_eq!(&carriage_returns[h.byte_start..h.byte_end], h.text);
@@ -1573,7 +2558,7 @@ mod tests {
             "needle",
             &SearchOptions {
                 context: 3,
-                ..Default::default()
+                ..regex_options()
             },
         )
         .await?;
@@ -1582,7 +2567,7 @@ mod tests {
         assert_eq!(context.text, source.trim_end_matches('\n'));
         assert_eq!(context.node_offset, None);
         assert_eq!(context.next_offset, None);
-        let direct = search(directory.path(), "needle", &SearchOptions::default()).await?;
+        let direct = search(directory.path(), "needle", &regex_options()).await?;
         let hit = &direct.hits[0];
         let node_start = source.find("## Nested").unwrap();
         assert_eq!(hit.node_offset, Some(hit.byte_start - node_start));
@@ -1712,7 +2697,7 @@ mod tests {
         fs::write(dir.path().join("empty.txt"), "")?;
         assert_eq!(index(dir.path(), 10).await?.indexed_files, 1);
         assert!(
-            search(dir.path(), "needle", &SearchOptions::default())
+            search(dir.path(), "needle", &regex_options())
                 .await?
                 .hits
                 .is_empty()
@@ -1729,10 +2714,7 @@ mod tests {
         fs::write(root.join(".env"), "not admitted")?;
         assert_eq!(index(&root, 10).await?.indexed_files, 1);
         assert_eq!(
-            search(&root, "needle", &SearchOptions::default())
-                .await?
-                .hits
-                .len(),
+            search(&root, "needle", &regex_options()).await?.hits.len(),
             1
         );
         Ok(())

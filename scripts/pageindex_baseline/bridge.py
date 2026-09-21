@@ -77,10 +77,41 @@ class LocalCodex:
         self.ledger = run_dir / "host-calls.jsonl"
         if self.ledger.exists():
             self.calls = [json.loads(line) for line in self.ledger.read_text().splitlines() if line.strip()]
+        ordinals = [call.get("ordinal") for call in self.calls]
+        if ordinals != list(range(1, len(self.calls) + 1)):
+            raise ValueError("Host ledger ordinals are not contiguous")
+        # A hard interruption can occur after invocation starts but before its final
+        # receipt. Retain that uncertain attempt in the cap; never silently replay it.
+        for request_path in sorted((run_dir / "calls").glob("*.request.json")):
+            ordinal = int(request_path.name.split(".", 1)[0])
+            if ordinal <= len(self.calls):
+                continue
+            if ordinal != len(self.calls) + 1:
+                raise ValueError("Interrupted host request ordinals are not contiguous")
+            pending = request_path.with_name(f"{ordinal:05d}.attempt.json")
+            receipt = json.loads(pending.read_text()) if pending.exists() else {
+                "ordinal": ordinal, "phase": "interrupted_unknown", "host_invoked": None,
+                "request_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
+            }
+            response_path = request_path.with_name(f"{ordinal:05d}.response.json")
+            if response_path.exists():
+                receipt["response_sha256"] = hashlib.sha256(response_path.read_bytes()).hexdigest()
+            self._append({**receipt, "status": "interrupted", "error_code": "interrupted_before_receipt",
+                          "usage": None, "accounting_complete": False,
+                          "invocation_or_transmission_confirmed": False})
+
+    def start_attempt(self, receipt: dict) -> None:
+        path = self.run_dir / "calls" / f"{receipt['ordinal']:05d}.attempt.json"
+        with path.open("xb") as output:
+            output.write(json_bytes(receipt))
+            output.flush()
+            os.fsync(output.fileno())
 
     def _append(self, receipt: dict) -> None:
         with self.ledger.open("a", encoding="utf-8") as output:
             output.write(json.dumps(receipt, ensure_ascii=False, allow_nan=False) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
         self.calls.append(receipt)
 
     def complete(self, instructions: str, state, schema: dict) -> tuple[dict, dict]:
@@ -104,6 +135,7 @@ class LocalCodex:
                        "instructions_sha256": hashlib.sha256(instructions.encode()).hexdigest(),
                        "state_sha256": sha(state), "schema_sha256": sha(schema), "input_bytes": len(payload),
                        "requested_model": self.model, "requested_effort": self.effort, "host_invoked": True}
+            self.start_attempt(receipt)
             started = time.perf_counter()
             try:
                 process = owned_process(

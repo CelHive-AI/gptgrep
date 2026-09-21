@@ -31,6 +31,10 @@ def materialize_subset(questions: list[dict[str, Any]], subset: list[dict[str, A
     """Gold text is loaded from the verified upstream file, never public metadata."""
     result = []
     for metadata in subset:
+        allowed = {"row_index_zero_based", "row_sha256", "question_sha256", "doc_id",
+                   "document_sha256", "document_pages_metadata"}
+        if set(metadata) - allowed:
+            raise ValueError("Reference metadata must contain provenance only, not task text or gold labels")
         index = metadata["row_index_zero_based"]
         if type(index) is not int or not 0 <= index < len(questions):
             raise ValueError("Invalid source question index")
@@ -40,10 +44,8 @@ def materialize_subset(questions: list[dict[str, Any]], subset: list[dict[str, A
             raise ValueError(f"Question row digest mismatch at row {index}")
         if hashlib.sha256(row["question"].encode()).hexdigest() != metadata["question_sha256"]:
             raise ValueError(f"Question text digest mismatch at row {index}")
-        if any(metadata[key] != row[key] for key in ("doc_id", "evidence_pages", "answer_format", "task_type", "doc_type")):
+        if metadata["doc_id"] != row["doc_id"]:
             raise ValueError(f"Question metadata mismatch at row {index}")
-        if "question" in metadata or "answer" in metadata:
-            raise ValueError("Public reference manifest must not copy question or answer text")
         result.append({**row, **metadata})
     return result
 

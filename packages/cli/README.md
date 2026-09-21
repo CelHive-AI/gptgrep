@@ -4,8 +4,11 @@
 
 Install this package's locked dependencies with `pnpm install --frozen-lockfile`, then run `node src/cli.js`. Put the native binary on PATH or set `GPTGREP_BIN` to its executable path. The wrapper does not install or download the native binary.
 
+Jev routing and reranking are a required core GPTgrep capability. Search defaults to `hybrid`, which invokes the native Jev Decisions path and requires `OPENROUTER_API_KEY` in the process environment. `regex` and `lexical` are explicit deterministic primitives; select one of those modes when that operation is intended. Schema discovery does not invoke a model.
+
 ```sh
 GPTGREP_BIN=/path/to/gptgrep node src/cli.js index --request '{"root":"./docs"}' --json
+GPTGREP_BIN=/path/to/gptgrep node src/cli.js search --request '{"query":"How does snapshot recovery work?","root":"./docs","document":"manual.pdf"}' --json
 GPTGREP_BIN=/path/to/gptgrep node src/cli.js search --request '{"query":"--mcp","root":"./docs","mode":"lexical","limit":10}' --json
 node src/cli.js search --schema --json
 node src/cli.js request-schema search --json
@@ -17,23 +20,27 @@ All forwarding commands accept `--request` with one JSON object. `request-schema
 | Command | JSON request fields | Native operation |
 |---|---|---|
 | `index` | `root` (default `.`), `optimizeMerge` (default false; native paginated documents only) | `gptgrep index ROOT [--optimize-merge] --json` |
-| `search` | `query`, `root`, `mode` (`regex`, `lexical`, `hybrid`, `semantic`; default `regex`), `limit` (1–1000; default 20), `context` (0–100; default 0), `minScore` (0–1; default 0.5), `ignoreCase`, `fixedStrings` | `gptgrep search QUERY ROOT --mode MODE --limit N --context C --min-score S --json` |
+| `search` | `query`, `root`, `mode` (`regex`, `lexical`, `hybrid`, `semantic`; default `hybrid`), optional `document` and Jev `model`, `limit` (1–1000; default 20), `context` (0–100; default 0), `minScore` (0–1; default 0.5), `ignoreCase`, `fixedStrings` | `gptgrep search QUERY ROOT --mode MODE [--document PATH] [--model JEV_MODEL] --limit N --context C --min-score S --json` |
 | `tree` | `file`, `root` | `gptgrep tree FILE --root ROOT --json` |
 | `status` | `root` | `gptgrep status ROOT --json` |
 | `doctor` | none | `gptgrep doctor --json` |
-| `ask` | `question`, `root`, optional host settings below | `gptgrep ask QUESTION ROOT --json` |
-| `summarize` | `nodeId`, `root`, optional host settings below | `gptgrep summarize DOCUMENT_ID:NODE_ID --root ROOT --json` |
+| `ask` | `question`, `root`, optional `document`, `jevModel` and host settings below | `gptgrep ask QUESTION ROOT [--document PATH] [--jev-model JEV_MODEL] --json` |
+| `summarize` | `nodeId`, `root`, optional `document`, `jevModel` and host settings below | `gptgrep summarize DOCUMENT_ID:NODE_ID --root ROOT [--document PATH] [--jev-model JEV_MODEL] --json` |
 
-Search defaults to offline regex with zero context. `hybrid` and `semantic` explicitly use the native Jev provider path. `minScore` is a relevance-rubric floor, not calibrated confidence. `ask` and `summarize` explicitly invoke the native local Codex host, using the existing account environment. Their host settings are `codexBin` (default `codex`), optional `codexHome`, `model` (default `gpt-5.6-luna`), `reasoningEffort` (default `max`), `timeout` (1–900 seconds; default 180), and `maxToolCalls` (1–64; default 12). The wrapper forwards these settings and does not replace the model. Native citation verification and host receipts are preserved in its structured response.
+Search defaults to hybrid with zero context. `minScore` is a relevance-rubric floor, not calibrated confidence. A search request's `model` selects the Jev Decisions model; omitting it preserves the native default. `document` restricts retrieval to one exact indexed source-relative path, including paths containing spaces.
+
+`ask` and `summarize` invoke the native local Codex host, using the existing account environment. Their host settings are `codexBin` (default `codex`), optional `codexHome`, `model` (the Codex model, default `gpt-5.6-luna`), `reasoningEffort` (default `max`), `timeout` (1–900 seconds; default 180), and `maxToolCalls` (1–64; default 12). Their separate `jevModel` field forwards `--jev-model`; omitting it preserves the native Jev default. The optional `document` scope forwards `--document`. For `summarize`, that path must match the selected node's source document; the native host rejects a conflict. The wrapper preserves the distinction between Codex and Jev model settings. Native citation verification and host receipts are preserved in its structured response.
 
 ```sh
-node src/cli.js ask --request '{"question":"How is recovery verified?","root":"./docs"}' --json
-node src/cli.js summarize --request '{"nodeId":"DOCUMENT_ID:NODE_ID","root":"./docs"}' --json
+node src/cli.js ask --request '{"question":"How is recovery verified?","root":"./docs","document":"manual.pdf","jevModel":"typesafe/jev-1.13"}' --json
+node src/cli.js summarize --request '{"nodeId":"DOCUMENT_ID:NODE_ID","root":"./docs","document":"manual.pdf","model":"gpt-5.6-luna","jevModel":"typesafe/jev-1.13"}' --json
 ```
 
 Use `--format json`, `--format jsonl`, `--format toon`, `--format yaml`, or `--format md` for incur presentation. `--full-output` requests its envelope. The native response is preserved as structured data; the wrapper does not infer an answer, alter rankings, or claim that a fallback used an index.
 
 Native invocations use argument arrays, never a shell. Standard error is preserved and output capture is bounded at 8 MiB. Ordinary invocations time out after five minutes; host commands allow their requested native timeout plus ten seconds for child cleanup. Use the native CLI for larger outputs or longer indexing runs. Interrupt and termination signals are forwarded to the child. Exit 1 is treated as a no-match success only for search with a recognizable empty `hits` or `results` array and no error marker.
+
+Recognized `gptgrep.error.v1` failures retain their native structured report, including partial Jev request/usage accounting and ledger paths, with a nonzero process exit status. Exit-2 search reports with nonempty `coverage.stale_files` are also preserved. `--full-output` marks these envelopes `ok: false` and includes the native report under `data`; output filtering does not discard failure accounting. Invalid or unrecognized native failures remain actionable `NATIVE_ERROR` responses. Known provider-key values are redacted from forwarded diagnostics and failure reports.
 
 MCP entry points are rejected before incur handles argv. The wrapper does not expose `fetch`, register MCP, sync generated skills, or perform wrapper updates. Incur's standalone binary builder embeds Bun; it does not build or bundle the native Rust executable. Native release packaging is managed by the repository's Rust workflow.
 

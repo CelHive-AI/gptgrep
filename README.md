@@ -3,15 +3,19 @@
 English | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 Local document retrieval for agents: **Rust parsing and document trees, embedded
-trigram grep, optional Jev routing/reranking, and a local Codex reasoning host**.
+trigram grep, core Jev routing/reranking, and a local Codex reasoning host**.
 No vector database, no search daemon, and no MCP server.
 
-GPTgrep returns inspectable source evidence. Exact retrieval stays local; remote
-inference occurs only when the caller selects `hybrid`, `semantic`, `judge`, `ask`
-or `summarize`. The reasoning agent can compose searches, inspect trees and read
-bounded nodes before answering.
+GPTgrep returns inspectable source evidence. Default `search` uses `hybrid` and
+requires Jev routing/reranking. `ask` and `summarize` also execute this stage before
+local Codex reasoning; missing credentials or provider failures are explicit
+errors. `semantic` and `judge` also use remote Jev inference. Explicit `regex` and
+`lexical` commands are local retrieval primitives. The reasoning agent can compose
+searches, inspect trees and read bounded nodes before answering.
 
-This is an initial development release. See [architecture](docs/architecture.md)
+This is development source. The first experimental release requires a verified
+minimum live advantage over PageIndex Flash plus GPT-5.6 on PageIndex-OSS-Benchmark.
+See [architecture](docs/architecture.md)
 and the explicit
 [Flash stage coverage](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md).
 Maintainer research notes under `docs/research/` are local-only and untracked.
@@ -22,7 +26,7 @@ Maintainer research notes under `docs/research/` are local-only and untracked.
 cargo build --release --locked
 ./target/release/gptgrep doctor --json
 ./target/release/gptgrep index ./documents --json
-./target/release/gptgrep search 'retention|expiry' ./documents --json
+./target/release/gptgrep search 'retention|expiry' ./documents --mode regex --json
 ./target/release/gptgrep search 'signed snapshot recovery' ./documents --mode lexical --json
 ```
 
@@ -41,8 +45,8 @@ the previous generation. Old generations are retained until explicitly managed.
 
 ```sh
 # Exact grep: no model or API key.
-gptgrep search 'SNAP-[0-9]+' ./documents -C 2 --json
-gptgrep search --fixed-strings --ignore-case --json -- '--flag-like text' ./documents
+gptgrep search 'SNAP-[0-9]+' ./documents --mode regex -C 2 --json
+gptgrep search --mode regex --fixed-strings --ignore-case --json -- '--flag-like text' ./documents
 
 # Optional PageIndex scan-cost merge stage for native paginated documents.
 gptgrep index ./documents --optimize-merge --json
@@ -63,7 +67,13 @@ Node reads return `next_offset`; pass that value to `read --offset` to continue.
 Offsets count UTF-8 bytes within the node, and each window retains exact source
 coordinates. This lets agents inspect large sections without an unbounded reply.
 
-## Jev helper
+## Core Jev retrieval
+
+Jev is a required part of the GPTgrep search system. Default search performs
+document routing and evidence reranking; there is no automatic local-only
+fallback. Parsing and index publication are deterministic local preparation.
+Use `--document manual.pdf` to constrain retrieval to one exact indexed path
+before candidate budgets apply. Results expose `document_scope` and `coverage`.
 
 Provide `OPENROUTER_API_KEY` in the process environment using your existing secret
 manager. GPTgrep does not automatically load credential files. The optional
@@ -72,7 +82,7 @@ entry and does not source shell code, copy an env file, or echo its value.
 
 ```sh
 gptgrep search 'how can a damaged journal be recovered?' ./documents \
-  --mode hybrid --model typesafe/jev-1.13 --min-score 0.5 --json
+  --model typesafe/jev-1.13 --min-score 0.5 --json
 
 gptgrep judge --input evals/requests/decision-smoke.json \
   --model '~typesafe/jev-latest' --json
@@ -121,12 +131,23 @@ gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
   --model gpt-5.6-luna --reasoning-effort max --json
 ```
 
+Before starting Codex, the host executes required Jev hybrid retrieval and
+supplies the bounded evidence to the reasoning model. `--jev-model` selects its
+Decisions model independently of the Codex `--model`. `--document` scopes an ask;
+a summary is scoped to its selected node's document. Follow-up searches default
+to hybrid; tree reads and explicit exact refinements build on the initial result.
+Reports retain Jev coverage, actual model and usage alongside Codex usage.
+
 The host creates an ephemeral stdio app-server thread with an empty execution
 environment and bounded GPTgrep catalog/tree/search/read tools. It verifies the
 effective sandbox/approval settings, bounds time and tool calls, denies unexpected
 server requests, and kills/reaps its owned child. Model-written citations must
 refer to evidence actually issued in the run and still match the current source.
 The report separates answer, evidence, tool receipts, actual model/effort and usage.
+The host also writes a private, bounded metadata ledger under
+`.gptgrep/host-attempts/` so completed Jev calls remain observable if a later stage
+fails or is interrupted. Source documents stay unchanged; the Codex child has no
+access to the Jev credential.
 Citation identity checks do not independently prove semantic entailment.
 
 `host-complete --input FILE_OR_DASH` supplies the same isolated local model as a

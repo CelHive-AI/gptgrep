@@ -61,6 +61,15 @@ No local dependency-cache paths, private session identities or credentials are w
 
 ## CI and publication
 
+The first experimental release is gated on a real paired PageIndex-OSS-Benchmark
+result showing a minimum verified advantage over PageIndex Flash plus GPT-5.6.
+The complete GPTgrep system must use its required Jev retrieval and local Codex
+workflow. Source delivery, CI, transport smokes and tree-only controls do not
+satisfy this gate. Preserve task denominators, actual profiles, build/search costs,
+failures, citation checks and the matching source revisions. The comparison rule
+is defined in [SPEC.md](../SPEC.md) and the project goal contract. Do not create or
+push the first release tag while G5 remains unaccepted.
+
 CI runs native Rust formatting, workspace tests, Clippy with denied warnings, the offline retrieval evaluation, its oracle tests, packaging self-tests, and complete license collection on both targets. A separate job tests the locked optional incur package. The PDFium archive is checksum-verified before use. The official runner table lists `macos-14` as ARM64 and `ubuntu-latest` as x86_64; jobs still verify native target artifacts. [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 
 The release workflow runs on an existing `vVERSION` tag or a manual dispatch naming that tag. It binds the tag to the Cargo workspace version and exact source revision, runs CI against that revision, builds each native artifact, collects licenses, packages and runs relocation tests, then publishes only after both targets succeed. Only the final publish job has `contents: write`. Checkout credentials are not persisted. The workflow does not publish to crates.io or npm, create a source tag, replace existing release assets, sign binaries or notarize macOS executables. Prerelease version tags produce GitHub prereleases.

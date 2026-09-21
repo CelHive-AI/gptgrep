@@ -20,7 +20,7 @@ class PageIndexMetricTests(unittest.TestCase):
     def test_reference_materializes_gold_only_after_row_digest_check(self):
         row = {"doc_id": "original.pdf", "question": "Original fixture question?", "answer": "fixture answer",
                "evidence_pages": "[1]", "answer_format": "Str", "task_type": "lookup", "doc_type": "fixture"}
-        metadata = {key: row[key] for key in ("doc_id", "evidence_pages", "answer_format", "task_type", "doc_type")}
+        metadata = {"doc_id": row["doc_id"]}
         metadata.update(row_index_zero_based=0,
                         row_sha256=hashlib.sha256(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                         question_sha256=hashlib.sha256(row["question"].encode()).hexdigest())
@@ -28,6 +28,9 @@ class PageIndexMetricTests(unittest.TestCase):
         self.assertEqual(external.materialize_subset([row], [metadata])[0]["answer"], row["answer"])
         with self.assertRaisesRegex(ValueError, "digest mismatch"):
             external.materialize_subset([{**row, "answer": "changed"}], [metadata])
+        for field in ("question", "answer", "evidence_pages", "answer_format", "task_type", "doc_type"):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "provenance only"):
+                external.materialize_subset([row], [{**metadata, field: row[field]}])
 
     def test_same_page_in_wrong_document_does_not_count(self):
         result = external.page_quality([{"path": "wrong.pdf", "page_start": 2, "page_end": 2}], "right.pdf", {2})

@@ -168,6 +168,47 @@ pub fn search(
     literal: bool,
     limit: usize,
 ) -> Result<SearchResult> {
+    search_with_document(index_dir, pattern, case_insensitive, literal, limit, None)
+}
+
+/// Search an optional exact normalized-text document path before verification
+/// and result limits. This path is relative to the immutable text root; GPTgrep
+/// core maps a source document to its internal `<document-id>.txt` filename.
+/// Unknown or non-normalized paths fail instead of silently producing no hits.
+pub fn search_with_document(
+    index_dir: &Path,
+    pattern: &str,
+    case_insensitive: bool,
+    literal: bool,
+    limit: usize,
+    document: Option<&Path>,
+) -> Result<SearchResult> {
+    search_with_document_and_predicate(
+        index_dir,
+        pattern,
+        case_insensitive,
+        literal,
+        limit,
+        document,
+        |_| Ok(true),
+    )
+}
+
+/// Admit candidates before opening their snapshot text or consuming a match
+/// budget. The predicate runs once per visited, deduplicated candidate after
+/// trigram and document-scope filtering. Returning false skips that candidate;
+/// errors propagate. It does not eagerly visit the entire indexed corpus.
+/// `candidate_files` counts scoped trigram candidates; `verified_files` counts
+/// admitted files actually verified against their snapshot digest.
+pub fn search_with_document_and_predicate(
+    index_dir: &Path,
+    pattern: &str,
+    case_insensitive: bool,
+    literal: bool,
+    limit: usize,
+    document: Option<&Path>,
+    mut accept: impl FnMut(&Path) -> Result<bool>,
+) -> Result<SearchResult> {
     ensure!(limit > 0, "search limit must be greater than zero");
     let index_dir = index_dir
         .canonicalize()
@@ -193,6 +234,13 @@ pub fn search(
                 .all(|rel| manifest.files.contains_key(rel)),
         "GPTgrep manifest does not match the index file table"
     );
+    let document = document.map(normalized_document_path).transpose()?;
+    if let Some(document) = document {
+        ensure!(
+            manifest.files.contains_key(document),
+            "unknown indexed document: {document}"
+        );
+    }
 
     let escaped = if literal {
         regex::escape(pattern)
@@ -233,6 +281,11 @@ pub fn search(
     );
     paths.sort_unstable();
     paths.dedup();
+    if let Some(document) = document {
+        // Filter before opening/verifying candidate files or counting matches.
+        // Unrelated matches must not consume this document's result budget.
+        paths.retain(|relative| *relative == document);
+    }
     let mut result = SearchResult {
         hits: Vec::new(),
         candidate_files: paths.len(),
@@ -240,6 +293,9 @@ pub fn search(
         truncated: false,
     };
     for rel in paths {
+        if !accept(Path::new(rel))? {
+            continue;
+        }
         let version = manifest
             .files
             .get(rel)
@@ -267,6 +323,22 @@ pub fn search(
         }
     }
     Ok(result)
+}
+
+fn normalized_document_path(document: &Path) -> Result<&str> {
+    let relative = document.to_str().context("document scope must be UTF-8")?;
+    let normalized: PathBuf = document.components().collect();
+    ensure!(
+        !relative.is_empty()
+            && relative.len() <= 4096
+            && !relative.contains('\0')
+            && document
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+            && normalized.as_os_str() == document.as_os_str(),
+        "document scope must be a normalized relative indexed path"
+    );
+    Ok(relative)
 }
 
 fn open_complete_index(index_dir: &Path) -> Result<IndexReader> {

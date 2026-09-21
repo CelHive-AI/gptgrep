@@ -11,8 +11,16 @@ Do not treat a checkpoint, successful process or generated artifact as acceptanc
 The project mandate authorizes routine development, tests, CI, releases and delivery.
 Reserve major requirement, product/domain and research changes for Human discussion.
 Use the smallest useful team; independent review is required before release.
+The first experimental release additionally requires the accepted live PageIndex
+comparison gate in SPEC.md; source delivery and CI alone do not authorize its tag.
 Read docs/architecture.md for module boundaries and SPEC.md for acceptance.
 Never modify the upstream reference checkouts. Pin reused source and retain licenses.
+Never hardcode benchmark questions, answers, document IDs, evidence pages or
+task-specific routing rules in product code or adapters. Load evaluation tasks at
+runtime; gold answers and evidence annotations belong only to judging/scoring.
+Do not encode benchmark-specific document/question patterns, answer-location
+priors or few-shot task examples in prompts, indexes, caches or selection rules.
+Build indexes from raw documents alone; keep judge state out of reader sessions.
 Keep credentials in the process environment; never commit credentials or private corpora.
 Public artifacts must not contain private session identities or machine paths.
 Private evidence and exact native provenance belong under .local/ or workspace/handoff/.

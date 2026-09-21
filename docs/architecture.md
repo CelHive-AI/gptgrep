@@ -5,6 +5,8 @@ English | [简体中文](architecture.zh-CN.md) | [日本語](architecture.ja.md
 GPTgrep gives a reasoning agent fast, inspectable access to local documents. It
 keeps exact retrieval, probabilistic judgments, and model-written synthesis as
 separate operations with separate receipts.
+Jev routing and reranking are mandatory in default search and in the local
+reasoning host. Exact primitives remain separately callable for inspection.
 
 ```mermaid
 flowchart TD
@@ -16,8 +18,8 @@ flowchart TD
   E --> F
   Q --> G[Jev typed document routing and evidence reranking]
   E --> G
-  F --> H[Fresh source evidence with exact locators]
-  G --> H
+  F --> G
+  G --> H[Fresh source evidence with exact locators]
   I[Local Codex host: Luna, max] --> F
   I --> G
   I --> J[Tree, catalog and bounded node reads]
@@ -35,7 +37,7 @@ flowchart TD
 | `gptgrep-parse` | UTF-8 source preservation and source-pinned LiteParse translation | PDFium for native documents; LibreOffice for Office conversion |
 | `gptgrep-index` | Embedded tgrep-core, conservative trigram candidates, exact Rust-regex verification | None; no daemon |
 | `gptgrep-jev` | Choice/Noul/Score Decisions transport, schema validation, bounded inference | Explicit OpenRouter request |
-| `gptgrep-core` | Snapshot publication, source freshness, retrieval composition and evidence contract | Optional Jev only for selected modes |
+| `gptgrep-core` | Snapshot publication, source freshness, retrieval composition and evidence contract | Required Jev for default hybrid and semantic retrieval |
 | `gptgrep-host` | Bounded local Codex stdio app-server workflow, tool dispatch and final citation validation | Caller-selected Codex installation/account |
 | `gptgrep-cli` | Native argv, JSON, schema and grep presentation | None for local commands |
 | `packages/cli` | Optional incur presentation and discovery wrapper | Node and published incur 0.5.1 |
@@ -77,6 +79,17 @@ files and establishes a new corpus snapshot. Negative searches refer to that
 snapshot and must be interpreted with coverage/stale warnings.
 
 ## Retrieval modes
+
+**Hybrid is the default.** The default workflow requires Jev routing and
+reranking and rejects missing credentials or inference errors. The explicit regex
+and lexical modes are local primitives, including for controlled ablations.
+They are not a fallback after Jev failure. Parsing and snapshot publication are
+deterministic local stages; this release does not claim model-assisted indexing.
+
+An optional exact document path scopes both trigram candidates and Jev routing
+before any candidate limit. The report binds `document_scope`; `indexed_files`
+counts the corpus while `scoped_files` counts the requested search scope.
+Unknown or non-normalized paths are errors, rather than a silent whole-corpus search.
 
 **Regex** uses tgrep's conservative trigram plan followed by matching the same
 regex against original canonical UTF-8 lines. MatchAll plans scan candidates;
@@ -142,6 +155,12 @@ skill-sync entry points are rejected before incur dispatch. `--schema` and
 The local host uses Codex's stdio app-server, not a PageIndex cloud account and
 not an MCP server. It exposes a bounded set of GPTgrep evidence operations to the
 model. The caller owns question, root, timeout, tool-call budget and account home.
+The host performs initial Jev hybrid retrieval before starting the model, then
+supplies the bounded issued evidence in the first prompt. This stage cannot be
+skipped by choosing a tree or read tool. Summaries constrain it to the selected
+node's document. Subsequent searches default to hybrid. The host retains per-search
+Jev coverage and usage alongside Codex usage, and the overall deadline includes
+initial retrieval. Empty or stale scopes do not establish successful reranking.
 Summary and retrieval use actual source evidence; model-produced citations must
 resolve to evidence issued during that run and remain fresh at completion.
 

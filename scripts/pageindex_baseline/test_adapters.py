@@ -159,6 +159,15 @@ class AdapterUnitTests(unittest.TestCase):
         self.assertEqual(returned_pages(envelope, "manual.pdf", 4), {1, 2})
         self.assertEqual(returned_pages(envelope, "different.pdf", 4), set())
 
+    def test_sdk_page_text_integrity_is_checked_against_stored_source(self):
+        envelope = {"items": [
+            {"type": "function_call", "call_id": "x", "name": "get_page_content", "arguments": '{"doc_name":"sample.pdf","pages":"1"}'},
+            {"type": "function_call_output", "call_id": "x", "output": json.dumps({
+                "success": True, "doc_name": "sample.pdf", "returned_pages": "1", "content": [{"page": 1, "text": "forged"}]})},
+        ]}
+        with self.assertRaisesRegex(ValueError, "source-bound stored extraction"):
+            returned_pages(envelope, "sample.pdf", 1, {1: "actual source"})
+
     def test_tree_control_preserves_pages_and_rejects_unreachable_nodes(self):
         parsed = {"pages": [{}, {}], "nodes": [
             {"id": "root", "parent_id": None, "title": "Root", "page_start": 1, "page_end": 2},

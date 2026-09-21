@@ -18,7 +18,11 @@ import time
 import types
 
 import locks
-from capability import answer_evidence, runtime_binding, scoring_summary, verify_receipt
+import profiles
+import cohorts
+import qualification
+from role_hosts import RoleHost
+from capability import answer_evidence, scoring_summary
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -33,6 +37,46 @@ def write_json(path: Path, value) -> None:
 
 def fingerprint(value) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def checkpoint_attempt(path: Path, value: dict) -> None:
+    """Append immutable attempt evidence and update only its current projection."""
+    attempts = path.parent / "attempts" / path.stem
+    attempts.mkdir(parents=True, exist_ok=True)
+    ordinal = len(list(attempts.glob("*.json"))) + 1
+    value["attempt_record_count"] = ordinal
+    target = attempts / f"{ordinal:04d}.json"
+    with target.open("x", encoding="utf-8") as output:
+        json.dump(value, output, ensure_ascii=False, indent=2, allow_nan=False)
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    write_json(path, value)
+
+
+def may_attempt(status: str, retry_failed: bool) -> bool:
+    return status in ("not_indexed", "not_answered", "budget_blocked", "index_unavailable") or (retry_failed and status != "completed")
+
+
+def benchmark_qualification(answer, index, stored_pages, page_count, run_dir, host, plan):
+    envelope = answer.get("sdk_envelope", {})
+    expected_texts = {page["page_index"]: page["markdown"] for page in stored_pages}
+    verified_calls = {}
+    for call in envelope.get("items", []):
+        if call.get("type") != "function_call" or call.get("name") != "get_page_content":
+            continue
+        outputs = [item for item in envelope.get("items", [])
+                   if item.get("type") == "function_call_output" and item.get("call_id") == call.get("call_id")]
+        pages = returned_pages({"items": [call, *outputs]}, index["name"], page_count, expected_texts)
+        if pages:
+            verified_calls[call["call_id"]] = pages
+    return qualification.qualify(envelope, index["name"], verified_calls, run_dir,
+                                 answer.get("host_call_ordinals", []), host.calls,
+                                 plan["profile"]["roles"]["chat"],
+                                 {"host_binary_sha256": plan["host_binary_sha256"],
+                                  "adapter_files": plan["adapter_files"], "chat_profile": plan["profile"]["roles"]["chat"],
+                                  "source_sha256": index["source_sha256"], "stored_pages_sha256": index["stored_pages_sha256"],
+                                  "sdk_envelope_sha256": fingerprint(envelope)})
 
 
 def private_directory(path: Path) -> None:
@@ -59,7 +103,7 @@ def parse_pages(spec: str, page_count: int) -> set[int]:
     return pages
 
 
-def returned_pages(envelope: dict, source_name: str, page_count: int) -> set[int]:
+def returned_pages(envelope: dict, source_name: str, page_count: int, expected_texts: dict | None = None) -> set[int]:
     """Only successful SDK tool results count; requested pages do not prove access."""
     calls = {item["call_id"]: item for item in envelope.get("items", [])
              if item.get("type") == "function_call" and item.get("name") == "get_page_content"}
@@ -90,7 +134,12 @@ def returned_pages(envelope: dict, source_name: str, page_count: int) -> set[int
             continue
         for obj in objects(item.get("output")):
             if obj.get("success") is True and obj.get("doc_name") == source_name and obj.get("returned_pages"):
-                accessed.update(parse_pages(obj["returned_pages"], page_count))
+                included = parse_pages(obj["returned_pages"], page_count)
+                if expected_texts is not None:
+                    delivered = {item.get("page"): item.get("text") for item in obj.get("content", []) if isinstance(item, dict)}
+                    if any(page not in delivered or delivered[page] != expected_texts.get(page) for page in included):
+                        raise ValueError("SDK returned-page text differs from its source-bound stored extraction")
+                accessed.update(included)
     return accessed
 
 
@@ -166,31 +215,39 @@ def judge_constants(source: Path) -> dict:
     return constants
 
 
+def reader_request(row: dict, document_id: str, effort: str, max_turns: int) -> tuple[str, dict]:
+    return row["question"], {"protocol": "responses", "doc_id": document_id,
+                             "reasoning_effort": effort, "max_turns": max_turns}
+
+
 def execute(args) -> dict:
     from bridge import LocalCodex
+    profile = profiles.resolve(args)
     roots = {name: getattr(args, name).expanduser().resolve() for name in ("upstream", "benchmark", "run_dir")}
     upstream, benchmark, run_dir = roots["upstream"], roots["benchmark"], roots["run_dir"]
     judge_source = args.judge_source.expanduser().resolve() if args.judge_source else None
     verified = locks.verify(upstream, benchmark, judge_source)
     questions = locks.read_json(benchmark / "questions.json")
     metadata = {row["doc_id"]: row for row in locks.read_json(benchmark / "documents.json")}
-    selected = list(range(len(questions))) if args.rows == "all" else sorted(set(int(x) for x in args.rows.split(",")))
+    groups, cohort_sha = cohorts.load(len(questions), locks.digest(benchmark / "questions.json"))
+    selected = cohorts.select(args.rows, len(questions), groups)
     if not selected or any(not 0 <= row < len(questions) for row in selected):
         raise ValueError("Invalid selected question rows")
     rows = [{"source_row": index, **questions[index]} for index in selected]
     filenames = list(dict.fromkeys(row["doc_id"] for row in rows))
     variants = ["raw", "full"] if args.variant == "both" else [args.variant]
-    adapter_files = {name: locks.digest(HERE / name) for name in ("locks.py", "bridge.py", "transports.py", "run.py", "capability.py")}
+    adapter_files = {name: locks.digest(HERE / name) for name in ("locks.py", "bridge.py", "transports.py", "run.py", "capability.py", "profiles.py", "role_hosts.py", "cohorts.py", "qualification.py")}
     binary = args.binary.expanduser().resolve()
-    admission = None
-    if args.stage in ("answer", "run") and args.capability_receipt is None:
-        raise ValueError("Answer stages require a verified live --capability-receipt; run the synthetic capability probe first")
+    historical_capability = None
     if args.capability_receipt is not None:
-        admission = verify_receipt(args.capability_receipt.expanduser().resolve(), runtime_binding(
-            binary, args.model, args.reasoning_effort, args.codex_home.expanduser().resolve(), args.max_input_bytes))
-    dev_rows = {5, 7, 10, 11, 19, 20, 21, 44}
+        historical_capability = {"receipt_sha256": locks.digest(args.capability_receipt.expanduser().resolve()),
+                                 "admission_effect": "none; historical supporting evidence only"}
+    dev_rows = groups["development8"]
     plan = {
-        "schema_version": "gptgrep.pageindex.pair.v3", "stage": args.stage, "variants": variants,
+        "schema_version": "gptgrep.pageindex.pair.v5", "stage": args.stage, "variants": variants,
+        "profile": profile,
+        "known_document_scope": True,
+        "cohort_manifest_sha256": cohort_sha,
         "source_rows": selected, "question_count": len(rows), "document_count": len(filenames),
         "physical_pages": sum(metadata[name]["pages"] for name in filenames),
         "full_62_task_scope": len(rows) == len(questions) == 62,
@@ -200,12 +257,18 @@ def execute(args) -> dict:
         "host_input_cap": args.max_input_bytes, "host_output_cap": 131072,
         "max_host_invocations": args.max_model_calls, "host_timeout_secs": args.timeout,
         "sdk_max_turns": args.max_turns, "host_concurrency": 1,
+        "upstream_defaults": {"benchmark_max_turns_argument": None, "pinned_sdk_effective_max_turns": 10,
+                              "benchmark_concurrency": 5},
+        "concurrency_adaptation": "Serial model invocations for controlled per-query measurement",
+        "turn_budget_unit": "Original Agents SDK model-loop turns; not native tool-call count",
         "source_hashes": {name: locks.digest(benchmark / "documents" / name) for name in filenames},
         "question_sha256": fingerprint(rows), "adapter_files": adapter_files,
         "adapter_mode": "original SDK tools and executor; Codex schema-JSON decisions via injected Responses transport",
         "source_and_dependencies": verified, "python": platform.python_version(),
         "host_binary_sha256": locks.digest(binary) if binary.is_file() else None,
-        "capability_admission": admission,
+        "qualification_policy": "actual original SDK page roundtrip within this live benchmark; no synthetic prerequisite",
+        "historical_capability_support": historical_capability,
+        "retry_failed": args.retry_failed,
         "historical_upstream_results_reproduced": False,
     }
     private_directory(run_dir)
@@ -214,7 +277,7 @@ def execute(args) -> dict:
         initial_plan = run_dir / "plan.json"
         if initial_plan.exists():
             prior = locks.read_json(initial_plan)
-            for key in ("variants", "source_rows", "source_hashes", "adapter_files", "model", "reasoning_effort", "host_input_cap", "host_binary_sha256"):
+            for key in ("variants", "source_rows", "source_hashes", "question_sha256", "cohort_manifest_sha256", "source_and_dependencies", "adapter_files", "model", "reasoning_effort", "profile", "host_input_cap", "host_binary_sha256", "sdk_max_turns", "host_timeout_secs"):
                 if prior.get(key) != plan.get(key):
                     raise ValueError("Run identity changed; use a new private directory without rewriting prior evidence")
         else:
@@ -230,21 +293,25 @@ def execute(args) -> dict:
             raise ValueError("Judge stages require the locked private judge source")
         host = LocalCodex(binary, args.codex_bin, args.codex_home.expanduser().resolve(), run_dir,
                           args.max_model_calls, args.timeout, args.model, args.reasoning_effort, args.max_input_bytes)
+        index_host = RoleHost(host, "index", profile["roles"]["index"])
+        chat_host = RoleHost(host, "chat", profile["roles"]["chat"])
+        judge_host = RoleHost(host, "judge", profile["roles"]["judge"])
         before_cwd = Path.cwd()
         os.chdir(run_dir)
         try:
             locks.import_upstream(upstream)
             from transports import PROVIDER, INDEX_ALIAS, ResponsesTransport, chat_backend, register_index_provider
             from pageindex import PageIndexClient
-            register_index_provider(host)
-            index_records, answer_records, wire = [], [], []
+            register_index_provider(index_host)
+            index_records, answer_records = [], []
+            wire = locks.read_json(run_dir / "wire-receipts.json") if (run_dir / "wire-receipts.json").exists() else []
             # Save upstream progress privately. It is not a public report channel.
             with (run_dir / "upstream.stdout.log").open("a") as stdout_log, (run_dir / "upstream.stderr.log").open("a") as stderr_log:
                 with contextlib.redirect_stdout(stdout_log), contextlib.redirect_stderr(stderr_log):
                     for variant in variants:
                         variant_dir = run_dir / variant
                         variant_dir.mkdir(exist_ok=True)
-                        transport = ResponsesTransport(host)
+                        transport = ResponsesTransport(chat_host)
                         backend = chat_backend(transport)
                         client = PageIndexClient(
                             mode="local", storage_path=variant_dir / "store",
@@ -261,6 +328,7 @@ def execute(args) -> dict:
                                                      "upstream": verified["pageindex_revision"], "model": args.model,
                                                      "effort": args.reasoning_effort, "input_cap": args.max_input_bytes,
                                                      "adapter": adapter_files, "dependencies": verified["dependencies"],
+                                                     "all_role_profiles": profile,
                                                      "host_binary_sha256": plan["host_binary_sha256"]})
                             if cache_path.exists():
                                 record = locks.read_json(cache_path)
@@ -269,12 +337,19 @@ def execute(args) -> dict:
                             else:
                                 record = {"variant": variant, "source": name, "source_sha256": plan["source_hashes"][name],
                                           "cache_key": cache_key, "status": "not_indexed"}
-                            if args.stage in ("index", "run") and record["status"] != "completed":
-                                if cache_path.exists():
-                                    raise ValueError("An incomplete index attempt is preserved; retry in a new run directory")
-                                host.phase = f"index:{variant}:{name}"
+                            if args.stage in ("index", "run") and may_attempt(record["status"], args.retry_failed):
+                                if variant == "full" and len(host.calls) >= host.max_calls:
+                                    if not cache_path.exists():
+                                        record.update(status="budget_blocked", host_invocations=0)
+                                        checkpoint_attempt(cache_path, record)
+                                    index_records.append({key: value for key, value in record.items() if key != "tree"})
+                                    continue
+                                index_host.phase = f"index:{variant}:{name}"
                                 before_calls, before_rejections = len(host.calls), len(host.rejections)
                                 started = time.perf_counter()
+                                record.pop("error", None)
+                                record.update(status="started", host_call_start=before_calls + 1)
+                                checkpoint_attempt(cache_path, record)
                                 try:
                                     doc = client.submit_document(str(benchmark / "documents" / name), mode="flash", wait=True)
                                     tree = client.get_document_structure(doc["doc_id"])
@@ -283,6 +358,8 @@ def execute(args) -> dict:
                                         raise ValueError("SDK stored-page coverage differs from source metadata")
                                     if len(host.rejections) != before_rejections:
                                         raise ValueError("Adapter rejected indexing prompts; full index is incomplete")
+                                    if any(call.get("status") != "completed" for call in host.calls[before_calls:]):
+                                        raise ValueError("An indexing model invocation failed; preserve its partial work without claiming a complete full index")
                                     record.update(status="completed", doc_id=doc["doc_id"], name=doc["name"],
                                                   tree_sha256=fingerprint(tree), stored_page_count=len(pages),
                                                   stored_pages_sha256=fingerprint(pages),
@@ -291,8 +368,9 @@ def execute(args) -> dict:
                                     record.update(status="failed", error=str(error))
                                 record.update(elapsed_ms=(time.perf_counter() - started) * 1000,
                                               host_invocations=len(host.calls) - before_calls,
+                                              host_call_ordinals=[call["ordinal"] for call in host.calls[before_calls:]],
                                               rejections=host.rejections[before_rejections:])
-                                write_json(cache_path, record)
+                                checkpoint_attempt(cache_path, record)
                             index_records.append({key: value for key, value in record.items() if key != "tree"})
                             if record["status"] == "completed":
                                 if fingerprint(client.get_document_structure(record["doc_id"])) != record["tree_sha256"]:
@@ -305,7 +383,11 @@ def execute(args) -> dict:
                                 answer_path = variant_dir / f"question-{row['source_row']:03d}.json"
                                 index = indexes[row["doc_id"]]
                                 if index["status"] != "completed":
-                                    answer_records.append({"variant": variant, "source_row": row["source_row"], "status": "index_unavailable"})
+                                    unavailable = {"variant": variant, "source_row": row["source_row"], "status": "index_unavailable",
+                                                   "index_status": index["status"], "question_denominator_retained": True}
+                                    answer_records.append(unavailable)
+                                    # Preserve one outcome for every selected row, including build failures.
+                                    checkpoint_attempt(variant_dir / f"question-{row['source_row']:03d}.unavailable.json", unavailable)
                                     continue
                                 identity = fingerprint({"row": row, "index": index["cache_key"], "max_turns": args.max_turns,
                                                         "transport": plan["adapter_mode"]})
@@ -315,76 +397,115 @@ def execute(args) -> dict:
                                         raise ValueError("Answer cache identity changed; use a new run directory")
                                 else:
                                     answer = {**row, "variant": variant, "identity": identity, "status": "not_answered"}
-                                if args.stage in ("answer", "run") and answer["status"] != "completed":
-                                    if answer_path.exists():
-                                        raise ValueError("An incomplete answer attempt is preserved; retry in a new run directory")
-                                    host.phase = f"answer:{variant}:row-{row['source_row']}"
+                                if args.stage in ("answer", "run") and may_attempt(answer["status"], args.retry_failed):
+                                    if len(host.calls) >= host.max_calls:
+                                        if not answer_path.exists():
+                                            answer.update(status="budget_blocked", host_invocations=0)
+                                            checkpoint_attempt(answer_path, answer)
+                                        answer_records.append({key: value for key, value in answer.items()
+                                                               if key not in ("sdk_envelope", "response", "question", "answer")})
+                                        continue
+                                    chat_host.phase = f"answer:{variant}:row-{row['source_row']}"
                                     started, before_calls = time.perf_counter(), len(host.calls)
                                     before_wire = len(transport.wire_receipts)
+                                    answer.pop("judge", None)
+                                    answer.pop("error", None)
+                                    answer.update(status="started", host_call_start=before_calls + 1)
+                                    checkpoint_attempt(answer_path, answer)
                                     try:
-                                        envelope = client.chat(row["question"], protocol="responses", doc_id=index["doc_id"],
-                                                               reasoning_effort=args.reasoning_effort, max_turns=args.max_turns)
+                                        question, request_options = reader_request(row, index["doc_id"], args.reasoning_effort, args.max_turns)
+                                        envelope = client.chat(question, **request_options)
+                                        if locks.digest(benchmark / "documents" / row["doc_id"]) != plan["source_hashes"][row["doc_id"]]:
+                                            raise ValueError("Reference source changed during SDK retrieval")
                                         text = "\n".join(part["text"] for item in envelope["output"] if item.get("type") == "message"
                                                          for part in item.get("content", []) if part.get("type") == "output_text")
                                         if not text.strip():
                                             raise ValueError("SDK returned no answer text")
-                                        pages = returned_pages(envelope, index["name"], metadata[row["doc_id"]]["pages"])
+                                        stored_pages = client.get_ocr(index["doc_id"], format="page")["result"]
+                                        expected_texts = {page["page_index"]: page["markdown"] for page in stored_pages}
+                                        pages = returned_pages(envelope, index["name"], metadata[row["doc_id"]]["pages"], expected_texts)
                                         gold = set(json.loads(row["evidence_pages"]))
                                         contexts = [wire["index_context"] for wire in transport.wire_receipts[before_wire:]
                                                     if wire.get("status") == "completed" and "index_context" in wire]
                                         answer.update(status="completed", response=text, sdk_envelope=envelope,
-                                                      accessed_physical_pages=sorted(pages), page_access_recall=len(pages & gold) / len(gold),
+                                                      accessed_physical_pages=sorted(pages), page_access_recall=len(pages & gold) / len(gold) if gold else None,
                                                       index_metadata_supplied=any(context["index_metadata_supplied"] for context in contexts),
                                                       index_summary_supplied=any(context["index_summary_supplied"] for context in contexts),
                                                       index_context_observations=contexts,
+                                                      raw_page_output_integrity_verified=True if pages else None,
+                                                      source_digest_verified=True,
                                                       sdk_usage_authoritative=False)
                                         answer.update(answer_evidence(answer))
                                     except Exception as error:
                                         answer.update(status="failed", error=str(error))
-                                    answer.update(elapsed_ms=(time.perf_counter() - started) * 1000, host_invocations=len(host.calls) - before_calls)
+                                    answer.update(elapsed_ms=(time.perf_counter() - started) * 1000, host_invocations=len(host.calls) - before_calls,
+                                                  host_call_ordinals=[call["ordinal"] for call in host.calls[before_calls:]],
+                                                  wire_receipts=transport.wire_receipts[before_wire:])
+                                    checkpoint_attempt(answer_path, answer)
+                                if answer["status"] == "completed":
+                                    answer["transport_qualification"] = benchmark_qualification(
+                                        answer, index, client.get_ocr(index["doc_id"], format="page")["result"],
+                                        metadata[row["doc_id"]]["pages"], run_dir, host, plan)
                                     write_json(answer_path, answer)
-                                if args.stage in ("judge", "run") and answer["status"] == "completed" and "judge" not in answer:
+                                if args.stage in ("judge", "run") and answer["status"] == "completed" and (
+                                        "judge" not in answer or (args.retry_failed and answer["judge"].get("status") != "completed")):
                                     constants = judge_constants(judge_source)
                                     response = str(answer["response"])
                                     prompt = constants["PROMPT"].format(
                                         question=" ".join(row["question"].split()), answer=row["answer"],
                                         answer_format=row["answer_format"], response=response[:constants["MAX_RESPONSE_CHARS"]])
-                                    host.phase = f"judge:{variant}:row-{row['source_row']}"
+                                    judge_host.phase = f"judge:{variant}:row-{row['source_row']}"
                                     try:
-                                        value, _ = host.complete(prompt, {}, constants["SCHEMA"])
+                                        value, _ = judge_host.complete(prompt, {}, constants["SCHEMA"])
                                         answer["judge"] = {"status": "completed", **value, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                                                            "response_truncated": len(response) > constants["MAX_RESPONSE_CHARS"],
-                                                           "upstream_effort": constants["EFFORT"], "actual_requested_effort": args.reasoning_effort}
+                                                           "upstream_effort": constants["EFFORT"], "actual_requested_effort": judge_host.effort,
+                                                           "model": judge_host.model, "rubric_sha256": fingerprint(constants["PROMPT"]),
+                                                           "schema_sha256": fingerprint(constants["SCHEMA"])}
                                     except Exception as error:
                                         answer["judge"] = {"status": "unavailable", "error": str(error)}
-                                    write_json(answer_path, answer)
+                                    checkpoint_attempt(answer_path, answer)
                                 answer.update(answer_evidence(answer))
                                 answer_records.append({key: value for key, value in answer.items()
                                                        if key not in ("sdk_envelope", "response", "question", "answer")})
                         wire.extend(transport.wire_receipts)
+                        write_json(run_dir / "wire-receipts.json", wire)
                         asyncio.run(backend["http_client"].aclose())
             write_json(run_dir / "wire-receipts.json", wire)
             write_json(run_dir / "adapter-rejections.json", host.rejections)
             summary = {}
+            qualifications = {}
             for variant in variants:
                 answered = [row for row in answer_records if row["variant"] == variant]
-                summary[variant] = scoring_summary(answered, len(rows), adapter_verified=admission is not None)
-                for cohort, included in (("development8", dev_rows), ("heldout54", set(range(len(questions))) - dev_rows)):
+                proofs = [row["transport_qualification"] for row in answered if row.get("transport_qualification", {}).get("verified") is True]
+                qualifications[variant] = {"verified": bool(proofs), "successful_roundtrips": len(proofs), "proofs": proofs,
+                                           "all_selected_rows_retained": True}
+                summary[variant] = scoring_summary(answered, len(rows), adapter_verified=bool(proofs))
+                for cohort, included in groups.items():
                     cohort_rows = [row for row in answered if row["source_row"] in included]
                     denominator = len(set(selected).intersection(included))
-                    summary[variant][cohort] = scoring_summary(cohort_rows, denominator, adapter_verified=admission is not None)
+                    summary[variant][cohort] = scoring_summary(cohort_rows, denominator, adapter_verified=bool(proofs))
+            adapter_verified = all(item["verified"] for item in qualifications.values())
             index_complete = all(row["status"] == "completed" for row in index_records)
             baseline_eligible = all(row["baseline_eligible"] for row in summary.values())
             paired_complete = set(variants) == {"raw", "full"} and baseline_eligible
             stage_complete = index_complete and (
-                args.stage == "index" or (args.stage == "answer" and admission is not None and all(row["completed_responses"] == len(rows) for row in summary.values()))
+                args.stage == "index" or (args.stage == "answer" and adapter_verified and all(row["completed_responses"] == len(rows) for row in summary.values()))
                 or (args.stage in ("judge", "run") and baseline_eligible)
             )
-            status = "adapter_capability_unavailable" if args.stage != "index" and admission is None else ("completed" if stage_complete else "incomplete")
-            result = {**plan, "status": status, "adapter_capability_verified": admission is not None,
+            status = "adapter_capability_unavailable" if args.stage != "index" and not adapter_verified else ("completed" if stage_complete else "incomplete")
+            result = {**plan, "status": status, "adapter_capability_verified": adapter_verified,
+                      "benchmark_qualification": qualifications,
                       "baseline_eligible": baseline_eligible, "indexes": index_records,
                       "answers": answer_records, "summary": summary, "host_invocations": len(host.calls),
                       "completed_host_turns": sum(call["status"] == "completed" for call in host.calls),
+                      "host_calls_by_role": {
+                          role: {"attempts": len(items), "completed": sum(item.get("status") == "completed" for item in items),
+                                 "failed_or_interrupted": sum(item.get("status") != "completed" for item in items),
+                                 "wall_ms": sum(item.get("elapsed_ms", 0) for item in items),
+                                 "usage_missing": sum(item.get("usage") is None for item in items)}
+                          for role, items in ((name, [call for call in host.calls if call.get("phase", "").split(":", 1)[0] == name])
+                                              for name in ("index", "answer", "judge", "interrupted_unknown"))},
                       "adapter_rejections": len(host.rejections), "paired_baseline_complete": paired_complete,
                       "host_process_wall_ms": sum(call.get("elapsed_ms", 0) for call in host.calls),
                       "reported_host_wall_ms": sum(call["reported_host_elapsed_ms"] for call in host.calls
@@ -405,7 +526,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=["plan", "index", "answer", "judge", "run"], default="plan")
     parser.add_argument("--variant", choices=["raw", "full", "both", "gptgrep-tree"], default="both")
-    parser.add_argument("--rows", default="all")
+    parser.add_argument("--rows", default="all", help="all, explicit dev8, or comma-separated zero-based rows")
     parser.add_argument("--upstream", type=Path, required=True)
     parser.add_argument("--benchmark", type=Path, required=True)
     parser.add_argument("--judge-source", type=Path)
@@ -413,20 +534,22 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, default=REPO / "target/debug/gptgrep")
     parser.add_argument("--codex-bin", default="codex")
     parser.add_argument("--codex-home", type=Path, required=True)
-    parser.add_argument("--model", default="gpt-5.6-luna")
-    parser.add_argument("--reasoning-effort", default="max")
+    parser.add_argument("--model")
+    parser.add_argument("--reasoning-effort")
+    profiles.add_arguments(parser)
     parser.add_argument("--max-model-calls", type=int, default=0, help="Cap total local host invocations for this run;0 forbids model calls")
     parser.add_argument("--max-input-bytes", type=int, default=262144)
     parser.add_argument("--timeout", type=int, default=180)
-    parser.add_argument("--max-turns", type=int, default=12)
-    parser.add_argument("--capability-receipt", type=Path, help="Passed synthetic live tool-capability receipt matching this host/adapter/profile")
+    parser.add_argument("--max-turns", type=int, default=10, help="Original SDK model-loop turns (source default10); distinct from native tool-call count")
+    parser.add_argument("--capability-receipt", type=Path, help="Optional historical supporting receipt; does not qualify this benchmark")
+    parser.add_argument("--retry-failed", action="store_true", help="Retry failed/interrupted stages while retaining immutable prior attempts and all billed calls")
     args = parser.parse_args()
     if args.max_model_calls < 0 or not 1 <= args.max_input_bytes <= 1048576 or args.timeout <= 0 or args.max_turns <= 0:
         parser.error("Invalid call, input, time or turn bounds")
     try:
         report = execute(args)
     except Exception as error:
-        report = {"schema_version": "gptgrep.pageindex.pair.v3", "stage": args.stage, "status": "failed",
+        report = {"schema_version": "gptgrep.pageindex.pair.v5", "stage": args.stage, "status": "failed",
                   "error": str(error), "paired_baseline_complete": False}
     # Full private content lives at run-dir; terminal output contains only status.
     print(json.dumps({key: report.get(key) for key in (

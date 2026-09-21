@@ -4,7 +4,10 @@
   "status": "active",
   "objective": "Build and iteratively optimize a Rust-first GPTgrep system with measured live advantages over the PageIndex Flash baseline",
   "authority": "User project ownership mandate; routine implementation, harness, CI and releases authorized within the agreed direction",
-  "host_defaults": {"model": "gpt-5.6-luna", "model_reasoning_effort": "max"},
+  "host_defaults": {
+    "model": "gpt-5.6-luna",
+    "model_reasoning_effort": "max"
+  },
   "benchmark": {
     "repository": "https://github.com/VectifyAI/PageIndex-OSS-Benchmark",
     "revision": "ad4c0b92970a6f4801f09ff2e647389e8f5874fa",
@@ -16,13 +19,41 @@
     "gptgrep_only_subset_run_is_baseline": false
   },
   "gates": [
-    {"id": "G0", "name": "Source, interface and license evidence", "required": true},
-    {"id": "G1", "name": "Offline correctness, source freshness, bounded execution and independent review", "required": true},
-    {"id": "G2", "name": "Real Jev and local Codex useful outcomes, not transport-only success", "required": true},
-    {"id": "G3", "name": "Live paired upstream PageIndex and GPTgrep smoke with preserved same-run evidence", "required": true},
-    {"id": "G4", "name": "Full cohort paired benchmark and ablations under declared comparable conditions", "required": true},
-    {"id": "G5", "name": "Demonstrated advantage with no hidden quality, citation or ingestion regression", "required": true},
-    {"id": "G6", "name": "Verified source/release artifacts, PoUW, backup and continuation", "required": true}
+    {
+      "id": "G0",
+      "name": "Source, interface and license evidence",
+      "required": true
+    },
+    {
+      "id": "G1",
+      "name": "Offline correctness, source freshness, bounded execution and independent review",
+      "required": true
+    },
+    {
+      "id": "G2",
+      "name": "Real Jev and local Codex useful outcomes, not transport-only success",
+      "required": true
+    },
+    {
+      "id": "G3",
+      "name": "Actual full-system and upstream SDK execution with qualified tools in the live benchmark",
+      "required": true
+    },
+    {
+      "id": "G4",
+      "name": "Full cohort paired benchmark and ablations under declared comparable conditions",
+      "required": true
+    },
+    {
+      "id": "G5",
+      "name": "Demonstrated advantage with no hidden quality, citation or ingestion regression",
+      "required": true
+    },
+    {
+      "id": "G6",
+      "name": "Verified source/release artifacts, PoUW, backup and continuation",
+      "required": true
+    }
   ],
   "advantage_rule": {
     "quality": "Answer correctness at least the paired baseline with matching judge and denominator; retain per-task disagreements",
@@ -31,6 +62,73 @@
     "uncertainty": "Report repetitions/sample count and paired uncertainty; a small smoke suite cannot establish the complete goal",
     "missing_metrics": "Unavailable, never zero or success"
   },
-  "release_policy": "Research previews may record partial goal progress and known limitations; preview publication never advances G3-G5 by itself",
-  "rsi_policy": "Use failures to propose and test scoped changes; keep raw receipts, learned findings and executable policy distinct; no unreviewed global ingestion"
+  "release_policy": "The first experimental/research-preview publication requires accepted G3-G5: full-system live paired PageIndex-OSS-Benchmark evidence of a minimum verified advantage. Source commits and CI may proceed; no first release tag/publication from partial progress or smoke-only evidence.",
+  "rsi_policy": "Use failures to propose and test scoped changes; keep raw receipts, learned findings and executable policy distinct; no unreviewed global ingestion",
+  "system_contract": {
+    "core": "Jev routing and evidence reranking are mandatory for default search, ask and summarize",
+    "failure_policy": "Missing credentials or provider/schema failures are explicit; no silent local-only downgrade",
+    "primitives": "Explicit regex and lexical operations remain available for exact inspection and controlled ablations",
+    "indexing": "Current parsing and index publication are deterministic local preparation; Jev indexing assistance is not yet implemented",
+    "scope": "Exact source-relative document filtering is applied before lexical/semantic candidate budgets"
+  },
+  "diagnostic_signals": [
+    "answer equivalence",
+    "evidence page recall",
+    "issued citation validity",
+    "tool failures and invalid arguments",
+    "ingestion coverage and time",
+    "end-to-end and stage latency",
+    "model usage",
+    "observed provider cost and missing accounting"
+  ],
+  "embedding_rag_comparator": {
+    "status": "profile_under_research",
+    "required_comparison": true,
+    "runtime_scope": "evaluation only; GPTgrep remains vectorless",
+    "requirements": [
+      "pin encoder revision and license",
+      "declare chunking, overlap, cosine/top-k and context budget",
+      "same documents and task scope",
+      "matched reader and judge",
+      "record parser/runtime differences",
+      "retain failures and cost unknowns"
+    ]
+  },
+  "first_release_gate": {
+    "required": "G5",
+    "baseline": "PageIndex Flash + GPT-5.6, exact role profiles recorded",
+    "system": "RAW documents -> LiteParse/Rust PageIndex/tgrep build -> required Jev routing/reranking -> local Codex Luna/max reasoning",
+    "method": "General improvements from clean development signals; complete62-task live A/B, report historical8/54 split separately, no smoke substitution",
+    "partial_source_delivery_is_release": false
+  },
+  "benchmark_integrity": {
+    "hardcoded_task_logic": "forbidden",
+    "forbidden_product_inputs": [
+      "reference answers",
+      "annotated evidence pages",
+      "task identifiers used as answer or route selectors"
+    ],
+    "dataset_loading": "runtime from pinned source, no vendored task question/answer literals",
+    "reader_inputs": "question, protocol-permitted document scope, retrieved source evidence",
+    "scoring_inputs": "gold answers and evidence annotations are isolated to judge/scorer",
+    "regression_tests": "synthetic corpus variations; no benchmark task special cases",
+    "split_policy": "preserve preregistered development/heldout membership; no post-result split redefinition",
+    "pattern_specialization": "Forbidden: benchmark-specific document types/question templates/answer formats/location priors/few-shot task examples",
+    "index_inputs": "Raw documents only; no evaluation questions or annotations",
+    "cross_question_state": "No judge state/gold/previous verdicts in subsequent reader sessions or indexes",
+    "metamorphic_checks": [
+      "renamed files",
+      "moved pages",
+      "reordered sections",
+      "rephrased queries",
+      "changed source facts"
+    ]
+  },
+  "live_execution_rule": {
+    "scope": "complete62-task/34-document live A/B",
+    "smoke_substitution": "forbidden",
+    "offline_tests": "implementation correctness only, not benchmark results",
+    "failures": "all selected tasks remain in denominator",
+    "adapter_qualification": "actual successful source-bound SDK tool roundtrip retained from live benchmark, not process-only acceptance"
+  }
 }

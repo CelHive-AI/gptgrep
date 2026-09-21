@@ -1,4 +1,6 @@
 use super::*;
+#[path = "mandatory_tests.rs"]
+mod mandatory;
 use crate::{protocol, retrieval::Evidence};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
 
@@ -86,7 +88,6 @@ async fn unexpected_execution_item_aborts_the_workflow() {
 #[tokio::test]
 async fn timeout_kills_and_reaps_only_the_owned_mock_process() {
     use std::os::unix::fs::PermissionsExt;
-    let root = fixture().await;
     let home = tempfile::tempdir().unwrap();
     let executable = home.path().join("mock-codex");
     let pid_file = home.path().join("child.pid");
@@ -107,7 +108,9 @@ exec sleep 60
         timeout_secs: 1,
         ..HostConfig::default()
     };
-    let error = ask(root.path(), "retention", &config).await.unwrap_err();
+    let error = complete_json("Return an empty object.", json!({}), json!({}), &config)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("time limit"), "{error}");
     let pid = std::fs::read_to_string(pid_file).unwrap();
     let status = std::process::Command::new("/bin/kill")
@@ -420,7 +423,6 @@ async fn oversized_tool_output_is_recoverable_and_does_not_issue_hidden_evidence
 #[tokio::test]
 async fn timeout_terminates_launcher_descendants() {
     use std::os::unix::fs::PermissionsExt;
-    let root = fixture().await;
     let home = tempfile::tempdir().unwrap();
     let executable = home.path().join("launcher");
     std::fs::write(
@@ -441,7 +443,9 @@ wait "$descendant"
         timeout_secs: 1,
         ..HostConfig::default()
     };
-    let error = ask(root.path(), "query", &config).await.unwrap_err();
+    let error = complete_json("Return an empty object.", json!({}), json!({}), &config)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("time limit"), "{error}");
     let pid = std::fs::read_to_string(home.path().join("descendant.pid")).unwrap();
     let status = std::process::Command::new("/bin/kill")

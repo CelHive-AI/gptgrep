@@ -6,8 +6,10 @@ pub use completion::{
     CompletionError, CompletionReport, MAX_COMPLETION_INPUT_BYTES, MAX_COMPLETION_OUTPUT_BYTES,
     complete_json,
 };
+mod jev_accounting;
 mod retrieval;
 mod trace;
+pub use jev_accounting::{HostRetrievalError, JevReport, ReceiptSummary, SearchTelemetry};
 
 use anyhow::{Result, anyhow, ensure};
 pub use retrieval::{Citation, ToolReceipt};
@@ -45,6 +47,8 @@ pub struct HostConfig {
     pub max_tool_calls: usize,
     pub max_input_bytes: usize,
     pub trace_path: Option<PathBuf>,
+    pub jev_model: Option<String>,
+    pub document: Option<String>,
 }
 
 impl Default for HostConfig {
@@ -62,6 +66,8 @@ impl Default for HostConfig {
             max_tool_calls: 12,
             max_input_bytes: 256 * 1024,
             trace_path: None,
+            jev_model: None,
+            document: None,
         }
     }
 }
@@ -89,6 +95,8 @@ pub struct HostReport {
     pub stderr_bytes: Option<u64>,
     pub stderr_truncated: Option<bool>,
     pub warnings: Vec<String>,
+    pub jev: JevReport,
+    pub ledger_path: PathBuf,
 }
 
 pub async fn ask(root: &Path, question: &str, config: &HostConfig) -> Result<HostReport> {
@@ -109,31 +117,55 @@ async fn execute(
     node_id: Option<&str>,
     config: &HostConfig,
 ) -> Result<HostReport> {
+    execute_with_client(root, question, node_id, config, None).await
+}
+
+async fn execute_with_client(
+    root: &Path,
+    question: &str,
+    node_id: Option<&str>,
+    config: &HostConfig,
+    client: Option<gptgrep_jev::JevClient>,
+) -> Result<HostReport> {
     validate_config(config, question)?;
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
     let root = root
         .canonicalize()
         .map_err(|_| anyhow!("Document root is unavailable"))?;
     let mut evidence = retrieval::Evidence::open(&root, node_id)?;
-    let completed = run_process(
+    let accounting = jev_accounting::Accounting::create(&root, &evidence.generation)?;
+    let _guard = jev_accounting::AttemptGuard(accounting.clone());
+    let mut stage = "scope";
+    let outcome:Result<HostReport>=async {
+    evidence.configure(config,accounting.clone(),client)?;
+    stage="initial_search";
+    tokio::time::timeout_at(deadline,evidence.bootstrap(question)).await
+        .map_err(|_|anyhow!("host_jev_initial_timeout"))??;
+    ensure!(evidence.initial_payload.is_some(),"host_jev_initial_required");
+    stage="codex";
+    let completed = run_process_until(
         config,
         protocol::Workflow::Retrieval {
             question,
             node_id,
             evidence: &mut evidence,
         },
+        Some(deadline),
     )
     .await?;
     let ProcessOutcome {
         result,
         home,
-        elapsed_ms,
+        elapsed_ms:_,
         stderr_bytes,
         stderr_truncated,
     } = completed;
+    stage="citation_validation";
     let (answer, citations, insufficient) = evidence.finish(&result.answer)?;
     let mut warnings = result.warnings;
     warnings.push("Citation validation checks issued snapshot identity and current source freshness; it does not prove semantic entailment.".into());
-    Ok(HostReport {
+    let report=HostReport {
         schema_version: "gptgrep.host.v1".into(),
         status: if insufficient {
             "insufficient_evidence"
@@ -159,13 +191,53 @@ async fn execute(
         effective_reasoning_effort: result.effort,
         answer,
         citations,
-        tool_calls: evidence.receipts,
+        tool_calls: evidence.receipts.clone(),
         usage: result.usage,
-        elapsed_ms,
+        elapsed_ms:started.elapsed().as_millis(),
         stderr_bytes,
         stderr_truncated,
         warnings,
-    })
+        jev:accounting.summary(),ledger_path:accounting.path(),
+    };
+    stage="ledger_closeout";
+    accounting.finish("completed")?;
+    Ok(report)
+    }.await;
+    match outcome {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let _ = accounting.finish("failed");
+            let code = if error
+                .downcast_ref::<gptgrep_core::JevSearchError>()
+                .is_some()
+            {
+                "host_jev_search_failed".to_owned()
+            } else if error.to_string().starts_with("host_") {
+                error.to_string()
+            } else {
+                format!("host_{stage}_failed")
+            };
+            let cause = error
+                .downcast_ref::<gptgrep_core::JevSearchError>()
+                .and_then(|error| serde_json::to_value(error).ok())
+                .or_else(|| {
+                    error
+                        .downcast_ref::<jev_accounting::InitializationError>()
+                        .map(|error| json!({"stage":"initialization","cause":error.cause}))
+                });
+            Err(HostRetrievalError {
+                code,
+                stage: stage.into(),
+                generation: evidence.generation.clone(),
+                ledger_path: accounting.path(),
+                jev: accounting.summary(),
+                receipts: evidence.receipts.iter().map(ReceiptSummary::from).collect(),
+                cause,
+                elapsed_ms: started.elapsed().as_millis(),
+            }
+            .into())
+        }
+    }
 }
 
 struct ProcessOutcome {
@@ -180,6 +252,20 @@ async fn run_process(
     config: &HostConfig,
     workflow: protocol::Workflow<'_>,
 ) -> Result<ProcessOutcome> {
+    run_process_until(config, workflow, None).await
+}
+
+async fn run_process_until(
+    config: &HostConfig,
+    workflow: protocol::Workflow<'_>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<ProcessOutcome> {
+    if let Some(deadline) = deadline {
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "host_deadline_exceeded"
+        );
+    }
     let trace = trace::Trace::open(config.trace_path.as_deref())?;
     let home = config
         .codex_home
@@ -236,7 +322,9 @@ async fn run_process(
         workflow,
         trace,
     );
-    let outcome = tokio::time::timeout(Duration::from_secs(config.timeout_secs), session).await;
+    let deadline = deadline
+        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs));
+    let outcome = tokio::time::timeout_at(deadline, session).await;
     // All exits kill and reap the owned app-server. kill_on_drop also covers caller cancellation.
     if let Err(error) = process_group.stop(&mut child).await {
         stderr_task.abort();

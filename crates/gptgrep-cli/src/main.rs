@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[command(
     name = "gptgrep",
     version,
-    about = "Local document grep, structural trees and optional Jev semantic retrieval",
+    about = "Jev-powered document routing and reranking, structural trees and exact grep",
     after_help = "Exit codes: 0 success/matches, 1 no matches, 2 error or excluded stale evidence.\nNo network is used by regex/lexical search. hybrid/semantic explicitly sends bounded evidence to Jev."
 )]
 struct Cli {
@@ -73,6 +73,8 @@ impl HostArgs {
                 .codex_home
                 .unwrap_or_else(|| gptgrep_host::HostConfig::default().codex_home),
             model: self.model,
+            jev_model: None,
+            document: None,
             reasoning_effort: self.reasoning_effort,
             timeout_secs: self.timeout,
             max_tool_calls: self.max_tool_calls,
@@ -97,13 +99,18 @@ enum Command {
         )]
         optimize_merge: bool,
     },
-    /// Find evidence; grep-style regex is the default mode.
+    /// Find evidence with Jev hybrid routing/reranking; explicit regex is local.
     Search {
         query: String,
         #[arg(default_value = ".")]
         root: PathBuf,
-        #[arg(long, value_enum, default_value = "regex")]
+        #[arg(long, value_enum, default_value = "hybrid")]
         mode: Mode,
+        #[arg(
+            long,
+            help = "Restrict retrieval to one exact indexed source-relative path"
+        )]
+        document: Option<String>,
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
         #[arg(short = 'C', long, default_value_t = 0)]
@@ -169,6 +176,13 @@ enum Command {
         question: String,
         #[arg(default_value = ".")]
         root: PathBuf,
+        #[arg(long, help = "Jev Decisions model; default typesafe/jev-1.13")]
+        jev_model: Option<String>,
+        #[arg(
+            long,
+            help = "Restrict retrieval to one exact indexed source-relative path"
+        )]
+        document: Option<String>,
         #[command(flatten)]
         host: HostArgs,
     },
@@ -177,6 +191,13 @@ enum Command {
         node_id: String,
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        #[arg(long, help = "Jev Decisions model; default typesafe/jev-1.13")]
+        jev_model: Option<String>,
+        #[arg(
+            long,
+            help = "Must match the selected node's indexed source-relative path"
+        )]
+        document: Option<String>,
         #[command(flatten)]
         host: HostArgs,
     },
@@ -200,26 +221,26 @@ fn contract() -> Value {
         "exit_codes":{"0":"success or matches","1":"no matches","2":"error or stale evidence excluded"},
         "commands":{
             "index":{"usage":"gptgrep index ROOT [--max-files 100000] [--optimize-merge] --json","effect":"write owned .gptgrep immutable generation","network":false},
-            "search":{"usage":"gptgrep search QUERY ROOT --mode regex|lexical|hybrid|semantic --json","options":{"limit":{"type":"integer","default":20,"minimum":1,"maximum":1000},"context":{"type":"integer","default":0,"maximum":100},"max-candidates":{"type":"integer","default":24,"maximum":24},"routing-docs":{"type":"integer","default":32,"maximum":32},"ignore-case":{"type":"boolean"},"fixed-strings":{"type":"boolean"},"model":{"type":"string","default":"typesafe/jev-1.13"},"min-score":{"type":"number","minimum":0,"maximum":1,"default":0.5}},"network":"only explicit hybrid/semantic","credentials":"OPENROUTER_API_KEY environment only","output_schema":"gptgrep.v1"},
+            "search":{"usage":"gptgrep search QUERY ROOT --mode regex|lexical|hybrid|semantic --json","options":{"mode":{"type":"string","default":"hybrid","enum":["hybrid","semantic","regex","lexical"]},"document":{"type":"string","description":"Exact indexed source-relative path; scope applies before candidate limits"},"limit":{"type":"integer","default":20,"minimum":1,"maximum":1000},"context":{"type":"integer","default":0,"maximum":100},"max-candidates":{"type":"integer","default":24,"maximum":24},"routing-docs":{"type":"integer","default":32,"maximum":32},"ignore-case":{"type":"boolean"},"fixed-strings":{"type":"boolean"},"model":{"type":"string","default":"typesafe/jev-1.13"},"min-score":{"type":"number","minimum":0,"maximum":1,"default":0.5}},"network":"required Jev for default hybrid and semantic; explicit regex/lexical primitives are local","credentials":"OPENROUTER_API_KEY environment only","output_schema":"gptgrep.v1"},
             "tree":{"usage":"gptgrep tree FILE --root ROOT --json","effect":"read"},
             "read":{"usage":"gptgrep read DOCUMENT_ID:NODE_ID --root ROOT --max-bytes 8192 --offset BYTES --json","effect":"read"},
             "files":{"usage":"gptgrep files ROOT --json","effect":"read"},
             "status":{"usage":"gptgrep status ROOT --json","scope":"existing indexed files; index discovers new files"},
             "parse":{"usage":"gptgrep parse FILE --json","effect":"local parser"},
             "judge":{"usage":"gptgrep judge --input FILE [--model MODEL] --json","input":{"state":"JSON","questions":"Choice/Noul/Score map"},"effect":"explicit remote Decisions call"},
-            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] --json","effect":"bounded local Codex agent with hosted inference","defaults":{"model":"gpt-5.6-luna","reasoning_effort":"max","timeout_seconds":180,"max_tool_calls":12}},
-            "summarize":{"usage":"gptgrep summarize DOCUMENT_ID:NODE_ID --root ROOT [host options] --json","effect":"model-written summary with issued evidence citations"},
+            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"jev-model":{"type":"string","default":"typesafe/jev-1.13"},"document":{"type":"string"}},"defaults":{"model":"gpt-5.6-luna","reasoning_effort":"max","timeout_seconds":180,"max_tool_calls":12}},
+            "summarize":{"usage":"gptgrep summarize DOCUMENT_ID:NODE_ID --root ROOT [host options] --json","effect":"required Jev retrieval in the selected document, then model-written summary with issued evidence citations"},
             "host-complete":{"usage":"gptgrep host-complete --input FILE_OR_DASH [host options] --json","input":{"instructions":"string","state":"JSON","schema":"JSON Schema object"},"effect":"explicit schema-validated local Codex completion; no citation assertion","defaults":{"max_input_bytes":262144},"hard_max_input_bytes":1048576},
             "doctor":{"usage":"gptgrep doctor --json","effect":"local capability probe"}
         },
-        "search_output":{"fields":["schema_version","query","mode","root","generation","index_used","source_fresh","minimum_relevance_score","hits","coverage","metrics","warnings"],"hit_fields":["path","node_id","title","line_start","line_end","page_start","page_end","match_line","match_column","byte_start","byte_end","column_start","node_offset","next_offset","coordinate_system","text","text_truncated","score","confidence","literal_anchor","source_sha256","source_fresh","citation"]},
+        "search_output":{"fields":["schema_version","query","mode","document_scope","root","generation","index_used","source_fresh","minimum_relevance_score","hits","coverage","metrics","warnings"],"hit_fields":["path","node_id","title","line_start","line_end","page_start","page_end","match_line","match_column","byte_start","byte_end","column_start","node_offset","next_offset","coordinate_system","text","text_truncated","score","confidence","literal_anchor","source_sha256","source_fresh","citation"]},
         "bounds":{"source_file_bytes":67108864,"jev_candidates":24,"semantic_routing_documents":32},
         "limitations":["No full PageIndex Flash parity claim", "No OCR in the initial native build", "Office conversion requires LibreOffice", "Semantic routing and evidence snippets have explicit budgets", "Generative synthesis requires explicit local Codex host mode", "Relevance floor is operational policy, not calibrated confidence; hybrid exact-token anchors are retained"]
     })
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n2. gptgrep search 'pattern' ./docs --json\n3. gptgrep search 'concept in natural language' ./docs --mode hybrid --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n\nRegex/lexical are offline. Hybrid/semantic and judge send bounded data to OpenRouter Jev, using OPENROUTER_API_KEY. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied; failures never silently downgrade to local retrieval. Explicit regex/lexical remain offline primitives. Use --document RELATIVE_PATH to scope before candidate budgets. Hybrid/semantic and judge send bounded data to OpenRouter Jev. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -267,6 +288,7 @@ async fn run(cli: Cli) -> Result<i32> {
             query,
             root,
             mode,
+            document,
             limit,
             context,
             ignore_case,
@@ -276,8 +298,12 @@ async fn run(cli: Cli) -> Result<i32> {
             model,
             min_score,
         } => {
+            if (fixed_strings || context > 0 || ignore_case) && !matches!(mode, Mode::Regex) {
+                bail!("--fixed-strings, --ignore-case and --context require --mode regex");
+            }
             let options = SearchOptions {
                 mode: format!("{mode:?}").to_lowercase(),
+                document,
                 limit,
                 context,
                 case_insensitive: ignore_case,
@@ -365,7 +391,7 @@ async fn run(cli: Cli) -> Result<i32> {
             emit(
                 &json!({"schema_version":"gptgrep.doctor.v1","version":env!("CARGO_PKG_VERSION"),
                 "native_index":"embedded tgrep-core","vector_database":false,"mcp":false,
-                "jev":{"configured":std::env::var_os("OPENROUTER_API_KEY").is_some(),"default_model":"typesafe/jev-1.13","endpoint":"https://openrouter.ai/api/alpha/decisions","network_checked":false},
+                "jev":{"required_for":["default search","ask","summarize"],"configured":std::env::var_os("OPENROUTER_API_KEY").is_some(),"default_model":"typesafe/jev-1.13","endpoint":"https://openrouter.ai/api/alpha/decisions","network_checked":false},
                 "parsing":{"plaintext":true,"liteparse":"embedded Rust library; PDFium required at runtime","ocr":false,"libreoffice_available":program_available("libreoffice") || program_available("soffice")},
                 "full_pageindex_flash_parity":false}),
             )?;
@@ -374,18 +400,28 @@ async fn run(cli: Cli) -> Result<i32> {
             question,
             root,
             host,
+            jev_model,
+            document,
         } => {
+            let mut config = host.config();
+            config.jev_model = jev_model;
+            config.document = document;
             emit(&serde_json::to_value(
-                gptgrep_host::ask(&root, &question, &host.config()).await?,
+                gptgrep_host::ask(&root, &question, &config).await?,
             )?)?;
         }
         Command::Summarize {
             node_id,
             root,
             host,
+            jev_model,
+            document,
         } => {
+            let mut config = host.config();
+            config.jev_model = jev_model;
+            config.document = document;
             emit(&serde_json::to_value(
-                gptgrep_host::summarize(&root, &node_id, &host.config()).await?,
+                gptgrep_host::summarize(&root, &node_id, &config).await?,
             )?)?;
         }
         Command::HostComplete { input, host } => {
@@ -467,15 +503,26 @@ async fn main() {
                     .downcast_ref::<gptgrep_host::CompletionError>()
                     .map(|e| e.code())
                     .unwrap_or_else(|| {
-                        if error.is::<gptgrep_host::HostCapabilityError>() {
+                        if let Some(partial) =
+                            error.downcast_ref::<gptgrep_host::HostRetrievalError>()
+                        {
+                            partial.code.as_str()
+                        } else if error.is::<gptgrep_core::JevSearchError>() {
+                            "jev_search_failed"
+                        } else if error.is::<gptgrep_host::HostCapabilityError>() {
                             "host_no_evidence_tools"
                         } else {
                             "gptgrep_error"
                         }
                     });
-                let _ = emit(
-                    &json!({"schema_version":"gptgrep.error.v1","ok":false,"code":code,"error":format!("{error:#}")}),
-                );
+                let mut report = json!({"schema_version":"gptgrep.error.v1","ok":false,"code":code,"error":format!("{error:#}")});
+                if let Some(partial) = error.downcast_ref::<gptgrep_core::JevSearchError>() {
+                    report["retrieval"] = serde_json::to_value(partial).unwrap_or(Value::Null);
+                }
+                if let Some(partial) = error.downcast_ref::<gptgrep_host::HostRetrievalError>() {
+                    report["host_retrieval"] = serde_json::to_value(partial).unwrap_or(Value::Null);
+                }
+                let _ = emit(&report);
             } else {
                 eprintln!("gptgrep: {error:#}");
             }

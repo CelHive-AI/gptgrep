@@ -4,6 +4,7 @@
 
 GPTgrep 为推理智能体提供快速、可核查的本地文档访问能力。
 精确检索、概率性判断和模型生成的综合结果是彼此独立的操作，各自保留独立回执。
+默认搜索和本地推理宿主必须使用 Jev 路由与重排。精确检索原语仍可单独调用，用于检查。
 
 ```mermaid
 flowchart TD
@@ -15,8 +16,8 @@ flowchart TD
   E --> F
   Q --> G[Jev 强类型文档路由与证据重排]
   E --> G
-  F --> H[具备精确定位信息的新鲜源文档证据]
-  G --> H
+  F --> G
+  G --> H[具备精确定位信息的新鲜源文档证据]
   I[本地 Codex 宿主：Luna，max] --> F
   I --> G
   I --> J[文档树、目录与有大小限制的节点读取]
@@ -34,7 +35,7 @@ flowchart TD
 | `gptgrep-parse` | 保留 UTF-8 源文本，并通过固定源码版本的 LiteParse 进行转换 | 原生文档需要 PDFium；Office 转换需要 LibreOffice |
 | `gptgrep-index` | 内嵌 tgrep-core、保守的 trigram 候选生成、精确的 Rust-regex 验证 | 无；不使用守护进程 |
 | `gptgrep-jev` | Choice/Noul/Score Decisions 传输、schema 校验、受预算约束的推理 | 显式发起的 OpenRouter 请求 |
-| `gptgrep-core` | 快照发布、源文件新鲜度、检索组合与证据契约 | 仅在选定模式下可选使用 Jev |
+| `gptgrep-core` | 快照发布、源文件新鲜度、检索组合与证据契约 | 默认 hybrid 与 semantic 检索必须使用 Jev |
 | `gptgrep-host` | 受限的本地 Codex stdio app-server 工作流、工具分发与最终引用验证 | 由调用方选择的 Codex 安装与账户 |
 | `gptgrep-cli` | 原生命令行参数、JSON、schema 与 grep 结果展示 | 本地命令无需额外运行时 |
 | `packages/cli` | 可选的 incur 展示与接口发现包装层 | Node 和已发布的 incur 0.5.1 |
@@ -68,6 +69,14 @@ flowchart TD
 没有匹配的搜索结果仅针对该快照成立，必须结合覆盖范围和过期警告来解读。
 
 ## 检索模式
+
+**Hybrid 是默认模式。** 默认工作流必须执行 Jev 路由和重排，缺少凭据或推理失败会明确报错。
+显式的 regex 和 lexical 模式是本地检索原语，也可用于受控消融实验；它们不会成为 Jev 失败后的回退路径。
+解析和快照发布是确定性的本地阶段；本版本不声称已经实现模型辅助索引。
+
+可以用一个精确的文档路径，在任何候选上限生效前同时约束 trigram 候选与 Jev 路由。
+报告绑定 `document_scope`；`indexed_files` 统计整个文档集合，`scoped_files` 统计本次指定的检索范围。
+未知或未规范化的路径会报错，不会静默扩大到整个文档集合。
 
 **Regex** 先使用 tgrep 的保守 trigram 计划，再以同一个正则表达式逐行匹配原始规范化 UTF-8 文本。
 MatchAll 计划表示需要扫描候选项，绝不表示没有命中。
@@ -125,6 +134,10 @@ Jev 使用 `/api/alpha/decisions`，请求时限为 20 秒；不自动重试、�
 本地宿主使用 Codex 的 stdio app-server，不依赖 PageIndex 云账户，也不是 MCP 服务器。
 它向模型提供一组数量和范围受限的 GPTgrep 证据操作。
 问题、根目录、超时时间、工具调用预算和账户主目录均由调用方指定。
+宿主在启动模型之前先执行初始 Jev 混合检索，再将有大小限制且已登记的证据放入首条提示。
+模型无法通过选择树或读取工具跳过这一阶段。摘要会将该阶段限制到所选节点所属的文档。
+后续搜索默认使用 hybrid。宿主在 Codex 用量之外，保留每次 Jev 搜索的覆盖范围与用量，
+总时限也包括初始检索。空范围或仅包含过期源的范围不能证明重排成功。
 摘要与检索使用真实的源文档证据；模型生成的引用必须能够解析到本次运行实际返回过的证据，
 且在完成时仍保持新鲜。
 

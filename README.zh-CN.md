@@ -2,14 +2,16 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-面向智能体的本地文档检索工具：**Rust 文档解析与文档树、内嵌 trigram grep、可选的 Jev 路由与重排，以及本地 Codex 推理宿主**。
+面向智能体的本地文档检索工具：**Rust 文档解析与文档树、内嵌 trigram grep、作为核心的 Jev 路由与重排，以及本地 Codex 推理宿主**。
 无需向量数据库、搜索守护进程或 MCP 服务器。
 
-GPTgrep 返回可核查的源文档证据。精确检索在本地执行；只有调用方选择
-`hybrid`、`semantic`、`judge`、`ask` 或 `summarize` 时才会进行远程推理。
+GPTgrep 返回可核查的源文档证据。默认 `search` 使用 `hybrid`，必须执行 Jev 路由与重排。
+`ask` 和 `summarize` 也会在本地 Codex 推理之前执行这一阶段；缺少凭据或提供方调用失败会明确报错。
+`semantic` 和 `judge` 同样使用远程 Jev 推理。显式的 `regex` 与 `lexical` 命令是本地检索原语。
 推理智能体可以组合搜索、查看文档树，并在回答前分次读取有大小限制的节点内容。
 
-这是初始开发版本。请参阅[架构说明](docs/architecture.zh-CN.md)和明确列出的
+这是开发中的源码。第一个实验版发布前，必须在 PageIndex-OSS-Benchmark 的真实运行中，
+证明相对 PageIndex Flash 加 GPT-5.6 的最小优势。请参阅[架构说明](docs/architecture.zh-CN.md)和明确列出的
 [Flash 阶段覆盖情况](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md)。
 维护者的研究记录保存在 `docs/research/` 下，仅供本地使用，不纳入版本控制。
 
@@ -19,7 +21,7 @@ GPTgrep 返回可核查的源文档证据。精确检索在本地执行；只有
 cargo build --release --locked
 ./target/release/gptgrep doctor --json
 ./target/release/gptgrep index ./documents --json
-./target/release/gptgrep search 'retention|expiry' ./documents --json
+./target/release/gptgrep search 'retention|expiry' ./documents --mode regex --json
 ./target/release/gptgrep search 'signed snapshot recovery' ./documents --mode lexical --json
 ```
 
@@ -35,8 +37,8 @@ Office 格式转换还需要 LibreOffice。初始构建关闭了 OCR：没有文
 
 ```sh
 # Exact grep: no model or API key.
-gptgrep search 'SNAP-[0-9]+' ./documents -C 2 --json
-gptgrep search --fixed-strings --ignore-case --json -- '--flag-like text' ./documents
+gptgrep search 'SNAP-[0-9]+' ./documents --mode regex -C 2 --json
+gptgrep search --mode regex --fixed-strings --ignore-case --json -- '--flag-like text' ./documents
 
 # Optional PageIndex scan-cost merge stage for native paginated documents.
 gptgrep index ./documents --optimize-merge --json
@@ -57,7 +59,12 @@ gptgrep --llms
 偏移量按节点内的 UTF-8 字节计数，每个读取窗口都保留精确的源文件坐标。
 这样，智能体便能分次检查较大的章节，而无需返回大小不受限制的响应。
 
-## Jev 辅助模型
+## Jev 核心检索
+
+Jev 是 GPTgrep 搜索系统的必需组成部分。默认搜索执行文档路由和证据重排；
+不会自动降级到纯本地检索。解析和索引发布是确定性的本地准备步骤。
+使用 `--document manual.pdf` 可在候选预算生效之前，将检索限制到一个精确的已索引路径。
+结果会报告 `document_scope` 和 `coverage`。
 
 请通过现有的密钥管理工具，在进程环境中提供 `OPENROUTER_API_KEY`。
 GPTgrep 不会自动加载凭据文件。可选的开发辅助脚本 `scripts/with_dev_key.py`
@@ -65,7 +72,7 @@ GPTgrep 不会自动加载凭据文件。可选的开发辅助脚本 `scripts/wi
 
 ```sh
 gptgrep search 'how can a damaged journal be recovered?' ./documents \
-  --mode hybrid --model typesafe/jev-1.13 --min-score 0.5 --json
+  --model typesafe/jev-1.13 --min-score 0.5 --json
 
 gptgrep judge --input evals/requests/decision-smoke.json \
   --model '~typesafe/jev-latest' --json
@@ -108,10 +115,19 @@ gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
   --model gpt-5.6-luna --reasoning-effort max --json
 ```
 
+启动 Codex 之前，宿主会执行必需的 Jev 混合检索，并将有大小限制的证据交给推理模型。
+`--jev-model` 选择 Decisions 模型，与 Codex 的 `--model` 分开配置。
+`--document` 可限制问答范围；摘要则限制到所选节点所属的文档。
+后续搜索默认使用 hybrid；树节点读取和显式精确检索可在初始结果基础上继续补充证据。
+报告同时保留 Jev 的覆盖范围、实际模型和用量，以及 Codex 用量。
+
 宿主会通过 stdio 创建临时 app-server 线程，其执行环境为空，并提供受限的 GPTgrep
 目录、树、搜索和读取工具。它会验证实际生效的沙箱与审批设置，限制运行时间和工具调用次数，
 拒绝意外的服务器请求，并终止、回收自己创建的子进程。模型生成的引用必须对应本次运行中实际返回过的证据，
 且仍与当前源文件一致。报告分别记录答案、证据、工具回执、实际模型与推理强度，以及用量。
+宿主还会在 `.gptgrep/host-attempts/` 下写入私有且有大小限制的元数据记录，
+使后续阶段失败或被中断时，已完成的 Jev 调用仍可核查。源文档保持不变；
+Codex 子进程无法访问 Jev 凭据。
 引用身份检查本身不能独立证明证据在语义上支持答案。
 
 `host-complete --input FILE_OR_DASH` 将同一个隔离的本地模型提供为强类型工作流基础操作。

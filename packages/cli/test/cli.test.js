@@ -22,6 +22,21 @@ if (args.includes('empty-result')) {
 } else if (args.includes('native-error')) {
   process.stdout.write(JSON.stringify({error: 'failed', hits: []}));
   process.stderr.write('fixture diagnostic'); process.exitCode = 1;
+} else if (args.includes('partial-accounting')) {
+  const secret = process.env.OPENROUTER_API_KEY || '';
+  process.stdout.write(JSON.stringify({schema_version: 'gptgrep.error.v1', ok: false,
+    code: 'host_retrieval_failed', error: 'fixture rejected ' + secret,
+    host_retrieval: {stage: 'evidence_reranking', ledger_path: '.gptgrep/receipts/jev-ledger.jsonl',
+      jev: {requests: 1, calls_attempted: 2, usage: [{input_tokens: 321, output_tokens: 17, cost_usd: 0.0003}], accounting_complete: false},
+      cause: {message: 'provider echoed ' + secret}}}));
+  process.stderr.write('fixture stderr ' + secret); process.exitCode = 2;
+} else if (args.includes('stale-result')) {
+  process.stdout.write(JSON.stringify({schema_version: 'gptgrep.v1', query: 'stale-result', mode: 'regex',
+    hits: [], coverage: {stale_files: ['old.md']}, metrics: {jev_calls_attempted: 0, jev_requests: 0}}));
+  process.exitCode = 2;
+} else if (args.includes('invalid-typed-failure')) {
+  process.stdout.write(JSON.stringify({schema_version: 'gptgrep.error.v1', ok: true, code: 'wrong', error: {unrecognized: true}}));
+  process.exitCode = 2;
 } else process.stdout.write(JSON.stringify({args}));
 `)
   await chmod(binary, 0o755)
@@ -31,9 +46,9 @@ after(async () => {
   await rm(temporary, { recursive: true, force: true })
 })
 
-function run(args, executable = binary) {
+function run(args, executable = binary, environment = {}) {
   return exec(process.execPath, [entry, ...args], {
-    env: { ...process.env, GPTGREP_BIN: executable, NO_UPDATE_NOTIFIER: '1' },
+    env: { ...process.env, GPTGREP_BIN: executable, NO_UPDATE_NOTIFIER: '1', ...environment },
   })
 }
 
@@ -58,9 +73,13 @@ test('all supported operations forward explicit native arguments', async () => {
   }
 })
 
-test('default search selects offline regex with native limits and rubric defaults', async () => {
+test('default search selects hybrid while deterministic modes remain explicit', async () => {
   const result = JSON.parse((await run(['search', '--request', '{"query":"hello"}', '--json'])).stdout)
-  assert.deepEqual(result.args, ['search', '--mode', 'regex', '--limit', '20', '--context', '0', '--min-score', '0.5', '--json', '--', 'hello', '.'])
+  assert.deepEqual(result.args, ['search', '--mode', 'hybrid', '--limit', '20', '--context', '0', '--min-score', '0.5', '--json', '--', 'hello', '.'])
+  for (const mode of ['regex', 'lexical']) {
+    const explicit = JSON.parse((await run(['search', '--request', JSON.stringify({ query: 'hello', mode }), '--json'])).stdout)
+    assert.equal(explicit.args[explicit.args.indexOf('--mode') + 1], mode)
+  }
   const semantic = JSON.parse((await run(['search', '--request', '{"query":"hello","mode":"semantic","minScore":0.75}', '--json'])).stdout)
   assert.equal(semantic.args[semantic.args.indexOf('--min-score') + 1], '0.75')
   for (const request of [{ query: 'hello', limit: 1001 }, { query: 'hello', minScore: 1.01 }]) {
@@ -75,8 +94,10 @@ test('schema discovery is local and exposes the JSON request contract', async ()
   assert.equal(schema.type, 'object')
   assert.equal(schema.properties.query.type, 'string')
   assert.deepEqual(schema.properties.mode.enum, ['regex', 'lexical', 'hybrid', 'semantic'])
-  assert.equal(schema.properties.mode.default, 'regex')
+  assert.equal(schema.properties.mode.default, 'hybrid')
   assert.equal(schema.properties.context.default, 0)
+  assert.equal(schema.properties.model.type, 'string')
+  assert.equal(schema.properties.document.type, 'string')
   const outer = JSON.parse((await run(['search', '--schema', '--json'], '/missing/native')).stdout)
   assert.equal(outer.options.properties.request.type, 'string')
   assert.equal(outer.env.properties.GPTGREP_BIN.type, 'string')
@@ -93,6 +114,28 @@ test('explicit Codex host commands preserve model settings and flag-like data', 
   const schema = JSON.parse((await run(['request-schema', 'ask', '--json'])).stdout)
   assert.equal(schema.properties.model.default, 'gpt-5.6-luna')
   assert.equal(schema.properties.reasoningEffort.default, 'max')
+  assert.equal(schema.properties.jevModel.type, 'string')
+  assert.equal(schema.properties.document.type, 'string')
+})
+
+test('Jev models and document scopes remain literal arguments and separate from Codex models', async () => {
+  const document = 'notes/$(printf not-executed) --schema.md'
+  const search = JSON.parse((await run(['search', '--request', JSON.stringify({ query: '--mcp', document, model: '~typesafe/jev-latest' }), '--json'])).stdout)
+  assert.deepEqual(search.args, ['search', '--mode', 'hybrid', '--limit', '20', '--context', '0', '--min-score', '0.5', '--model=~typesafe/jev-latest', `--document=${document}`, '--json', '--', '--mcp', '.'])
+  const host = ['--codex-bin=codex', '--model=gpt-6-astra', '--reasoning-effort=max', '--timeout', '180', '--max-tool-calls', '12', '--jev-model=typesafe/jev-1.13', `--document=${document}`]
+  const common = { model: 'gpt-6-astra', jevModel: 'typesafe/jev-1.13', document }
+  const ask = JSON.parse((await run(['ask', '--request', JSON.stringify({ question: '--json', ...common }), '--json'])).stdout)
+  assert.deepEqual(ask.args, ['ask', ...host, '--json', '--', '--json', '.'])
+  const summarize = JSON.parse((await run(['summarize', '--request', JSON.stringify({ nodeId: 'document:node', ...common }), '--json'])).stdout)
+  assert.deepEqual(summarize.args, ['summarize', '--root=.', ...host, '--json', '--', 'document:node'])
+  for (const [command, request] of [
+    ['search', { query: 'hello', document: '' }],
+    ['search', { query: 'hello', model: '' }],
+    ['ask', { question: 'hello', jevModel: '' }],
+  ]) {
+    await assert.rejects(run([command, '--request', JSON.stringify(request), '--json']),
+      (error) => /INVALID_REQUEST/.test(error.stdout))
+  }
 })
 
 test('MCP and update routes are rejected before framework dispatch', async () => {
@@ -119,4 +162,45 @@ test('no-match exit is successful while native errors stay failures', async () =
   assert.deepEqual(JSON.parse(empty.stdout), { hits: [] })
   await assert.rejects(run(['search', '--request', '{"query":"native-error"}', '--json']),
     (error) => /NATIVE_ERROR/.test(error.stdout) && /fixture diagnostic/.test(error.stderr))
+})
+
+test('typed exit-2 failure retains partial accounting and ledger with a nonzero status', async () => {
+  const marker = 'fixture-only-sensitive-key-marker'
+  for (const options of [[], ['--full-output'], ['--filter-output', 'schema_version']]) {
+    const full = options.includes('--full-output')
+    const args = ['ask', '--request', '{"question":"partial-accounting"}', '--json', ...options]
+    await assert.rejects(run(args, binary, { OPENROUTER_API_KEY: marker }), (error) => {
+      assert.equal(error.code, 2)
+      assert.ok(!error.stdout.includes(marker) && !error.stderr.includes(marker))
+      // Parsing the entire stdout also rejects any second emitted JSON object.
+      const output = JSON.parse(error.stdout)
+      if (full) {
+        assert.equal(output.ok, false)
+        assert.equal(output.meta.exitCode, 2)
+      }
+      const report = full ? output.data : output
+      assert.equal(report.schema_version, 'gptgrep.error.v1')
+      assert.equal(report.ok, false)
+      assert.equal(report.host_retrieval.ledger_path, '.gptgrep/receipts/jev-ledger.jsonl')
+      assert.deepEqual(report.host_retrieval.jev, {
+        requests: 1, calls_attempted: 2,
+        usage: [{ input_tokens: 321, output_tokens: 17, cost_usd: 0.0003 }], accounting_complete: false,
+      })
+      assert.match(report.error, /\[REDACTED\]/)
+      return true
+    })
+  }
+})
+
+test('stale exit-2 search keeps its report while invalid typed failures remain generic', async () => {
+  await assert.rejects(run(['search', '--request', '{"query":"stale-result","mode":"regex"}', '--json']), (error) => {
+    assert.equal(error.code, 2)
+    const report = JSON.parse(error.stdout)
+    assert.equal(report.schema_version, 'gptgrep.v1')
+    assert.deepEqual(report.coverage.stale_files, ['old.md'])
+    assert.equal(report.metrics.jev_requests, 0)
+    return true
+  })
+  await assert.rejects(run(['search', '--request', '{"query":"invalid-typed-failure"}', '--json']),
+    (error) => error.code !== 0 && /NATIVE_ERROR/.test(error.stdout))
 })

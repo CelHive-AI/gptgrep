@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use gptgrep_index::{build, search};
+use gptgrep_index::{build, search, search_with_document, search_with_document_and_predicate};
 use tempfile::TempDir;
 
 fn fixture(files: &[(&str, &str)]) -> (TempDir, PathBuf, PathBuf) {
@@ -177,4 +177,143 @@ fn utf8_bom_is_preserved_for_anchors_and_literal_queries() {
                 .is_match(&result.hits[0].line)
         );
     }
+}
+
+#[test]
+fn document_filter_precedes_matching_verification_and_result_limits() {
+    let unrelated = "needle unrelated\n".repeat(10050);
+    let (_temp, root, index) = fixture(&[("a.txt", &unrelated), ("z.txt", "needle target\n")]);
+    let unscoped = search(&index, "needle", false, true, 2).unwrap();
+    assert!(unscoped.truncated);
+    assert!(
+        unscoped
+            .hits
+            .iter()
+            .all(|hit| hit.path == Path::new("a.txt"))
+    );
+    let scoped =
+        search_with_document(&index, "needle", false, true, 1, Some(Path::new("z.txt"))).unwrap();
+    assert_eq!(scoped.hits.len(), 1);
+    assert_eq!(scoped.hits[0].path, Path::new("z.txt"));
+    assert_eq!((scoped.candidate_files, scoped.verified_files), (1, 1));
+    assert!(!scoped.truncated);
+    // An unrelated corrupted candidate is not opened during a scoped search.
+    fs::write(root.join("a.txt"), "changed unrelated snapshot").unwrap();
+    assert!(
+        search_with_document(&index, "needle", false, true, 1, Some(Path::new("z.txt"))).is_ok()
+    );
+}
+
+#[test]
+fn scoped_unicode_casefold_bom_and_match_all_are_verified() {
+    let (_temp, _root, index) = fixture(&[
+        ("a.txt", "中国\nKEY\n"),
+        ("目录/研究.txt", "中国文档\nKEY\n"),
+        ("目录/bom.txt", "\u{feff}# Alpha\n"),
+    ]);
+    for (pattern, insensitive, expected) in [("中国", false, "中国文档"), ("key", true, "KEY")]
+    {
+        let result = search_with_document(
+            &index,
+            pattern,
+            insensitive,
+            true,
+            2,
+            Some(Path::new("目录/研究.txt")),
+        )
+        .unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].line, expected);
+        assert_eq!((result.candidate_files, result.verified_files), (1, 1));
+    }
+    let bom = search_with_document(
+        &index,
+        r"^\x{FEFF}# Alpha$",
+        false,
+        false,
+        2,
+        Some(Path::new("目录/bom.txt")),
+    )
+    .unwrap();
+    assert_eq!(bom.hits.len(), 1);
+    assert_eq!(bom.hits[0].line, "\u{feff}# Alpha");
+    assert_eq!(bom.candidate_files, 1);
+}
+
+#[test]
+fn document_scope_rejects_unknown_and_non_normalized_paths() {
+    let (_temp, _root, index) = fixture(&[("nested/a.txt", "needle\n")]);
+    for document in [
+        "missing.txt",
+        "",
+        "../a.txt",
+        "/a.txt",
+        "./nested/a.txt",
+        "nested//a.txt",
+        "nested/./a.txt",
+        "nested/a.txt/",
+    ] {
+        assert!(
+            search_with_document(&index, "needle", false, true, 2, Some(Path::new(document)))
+                .is_err(),
+            "{document}"
+        );
+    }
+    let absent = search_with_document(
+        &index,
+        "unfindable-token",
+        false,
+        true,
+        2,
+        Some(Path::new("nested/a.txt")),
+    )
+    .unwrap();
+    assert!(absent.hits.is_empty());
+    assert_eq!(absent.candidate_files, 0);
+}
+
+#[test]
+fn candidate_predicate_runs_after_filtering_and_before_verification_and_caps() {
+    let stale_matches = "needle old\n".repeat(10050);
+    let (_temp, root, index) = fixture(&[
+        ("a.txt", &stale_matches),
+        ("m.txt", "zzzzzz\n"),
+        ("z.txt", "needle fresh\n"),
+    ]);
+    // The rejected candidate would fail snapshot verification if opened.
+    fs::write(root.join("a.txt"), "changed snapshot").unwrap();
+    let mut visited = Vec::new();
+    let result =
+        search_with_document_and_predicate(&index, "needle", false, true, 1, None, |path| {
+            visited.push(path.to_owned());
+            Ok(path != Path::new("a.txt"))
+        })
+        .unwrap();
+    assert_eq!(visited, [PathBuf::from("a.txt"), PathBuf::from("z.txt")]);
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].path, Path::new("z.txt"));
+    assert_eq!((result.candidate_files, result.verified_files), (2, 1));
+    assert!(!result.truncated);
+
+    visited.clear();
+    search_with_document_and_predicate(
+        &index,
+        "needle",
+        false,
+        true,
+        1,
+        Some(Path::new("z.txt")),
+        |path| {
+            visited.push(path.to_owned());
+            Ok(true)
+        },
+    )
+    .unwrap();
+    assert_eq!(visited, [PathBuf::from("z.txt")]);
+
+    let error = search_with_document_and_predicate(&index, "needle", false, true, 1, None, |_| {
+        Err(anyhow::anyhow!("candidate admission failed"))
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("candidate admission failed"));
 }

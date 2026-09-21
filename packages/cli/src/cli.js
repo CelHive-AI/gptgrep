@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { Cli, z } from 'incur'
+import { Cli, Formatter, z } from 'incur'
 
-import { runNative } from './native.js'
+import { NativeFailure, runNative } from './native.js'
 
 const argv = process.argv.slice(2)
+let nativeFailureOutput
 // incur has built-in MCP/update routes; guard them at our executable boundary.
 // Reject those entry points before invoking it; never export a fetch handler.
 if (argv.some((value) => ['--mcp', 'mcp', 'skills', '--update', '--incur-update-check'].includes(value))) {
@@ -12,19 +13,24 @@ if (argv.some((value) => ['--mcp', 'mcp', 'skills', '--update', '--incur-update-
 }
 
 const root = z.string().min(1).default('.').describe('Document corpus root')
+const document = z.string().min(1).optional().describe('Exact indexed source-relative document path')
 const host = {
   codexBin: z.string().min(1).default('codex'),
   codexHome: z.string().min(1).optional().describe('Existing account home; native CODEX_HOME default applies when omitted'),
-  model: z.string().min(1).max(128).default('gpt-5.6-luna'),
+  model: z.string().min(1).max(128).default('gpt-5.6-luna').describe('Codex reasoning model; separate from the Jev Decisions model'),
+  jevModel: z.string().min(1).max(128).optional().describe('Jev Decisions model; native default applies when omitted'),
+  document,
   reasoningEffort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']).default('max'),
   timeout: z.number().int().min(1).max(900).default(180),
   maxToolCalls: z.number().int().min(1).max(64).default(12),
 }
 const requests = {
   search: z.object({
-    query: z.string().describe('Literal or regex query; JSON preserves flag-like text'),
+    query: z.string().describe('Retrieval query; JSON preserves flag-like text'),
     root,
-    mode: z.enum(['regex', 'lexical', 'hybrid', 'semantic']).default('regex'),
+    mode: z.enum(['regex', 'lexical', 'hybrid', 'semantic']).default('hybrid'),
+    model: z.string().min(1).max(128).optional().describe('Jev Decisions model; native default applies when omitted'),
+    document,
     limit: z.number().int().min(1).max(1000).default(20),
     context: z.number().int().min(0).max(100).default(0),
     minScore: z.number().min(0).max(1).default(0.5).describe('Jev relevance rubric floor; not calibrated confidence'),
@@ -51,7 +57,7 @@ const requests = {
 }
 
 const descriptions = {
-  search: 'Search the current document generation using the native Rust engine.',
+  search: 'Search with Jev hybrid retrieval by default; select regex or lexical for deterministic primitives.',
   index: 'Parse and index a document corpus with the native Rust pipeline.',
   tree: 'Read the indexed section tree for one source document.',
   status: 'Inspect the current document generation.',
@@ -64,10 +70,14 @@ const hostArguments = (r) => [
   `--codex-bin=${r.codexBin}`, `--model=${r.model}`, `--reasoning-effort=${r.reasoningEffort}`,
   '--timeout', String(r.timeout), '--max-tool-calls', String(r.maxToolCalls),
   ...(r.codexHome === undefined ? [] : [`--codex-home=${r.codexHome}`]),
+  ...(r.jevModel === undefined ? [] : [`--jev-model=${r.jevModel}`]),
+  ...(r.document === undefined ? [] : [`--document=${r.document}`]),
 ]
 const argumentsFor = {
   search: (r) => ['search', '--mode', r.mode, '--limit', String(r.limit), '--context', String(r.context), '--min-score', String(r.minScore),
     ...(r.ignoreCase ? ['--ignore-case'] : []), ...(r.fixedStrings ? ['--fixed-strings'] : []),
+    ...(r.model === undefined ? [] : [`--model=${r.model}`]),
+    ...(r.document === undefined ? [] : [`--document=${r.document}`]),
     '--json', '--', r.query, r.root],
   index: (r) => ['index', ...(r.optimizeMerge ? ['--optimize-merge'] : []), '--json', '--', r.root],
   tree: (r) => ['tree', `--root=${r.root}`, '--json', '--', r.file],
@@ -108,6 +118,11 @@ for (const [name, schema] of Object.entries(requests)) {
         const timeout = name === 'ask' || name === 'summarize' ? (request.timeout + 10) * 1000 : undefined
         return await runNative(argumentsFor[name](request), c.env.GPTGREP_BIN, timeout)
       } catch (error) {
+        if (error instanceof NativeFailure) {
+          process.exitCode = error.exitCode
+          nativeFailureOutput = { report: error.report, exitCode: error.exitCode, format: c.format, command: name, written: false }
+          return error.report
+        }
         return c.error({ code: 'NATIVE_ERROR', message: error.message })
       }
     },
@@ -125,10 +140,29 @@ cli.command('request-schema', {
 })
 
 const help = argv.length === 0 || argv.includes('--help') || argv.includes('-h')
+function writeNativeFailure() {
+  if (!nativeFailureOutput || nativeFailureOutput.written) return
+  nativeFailureOutput.written = true
+  const { report, exitCode, format, command } = nativeFailureOutput
+  const output = argv.includes('--full-output')
+    ? { ok: false, data: report, meta: { command, exitCode } }
+    : report
+  process.stdout.write(`${Formatter.format(output, format)}\n`)
+}
 await cli.serve(argv, {
   // Published incur 0.5.1 still advertises disabled integration routes. Keep its
   // generated help accurate for this guarded wrapper, without changing JSON.
-  stdout: (value) => process.stdout.write(help
-    ? value.split('\n').filter((line) => !/^  (?:mcp|skills|--mcp|--update)(?:\s|$)/.test(line)).join('\n')
-    : value),
+  stdout: (value) => {
+    // incur's successful return-value path wraps data in ok:true. A recognized
+    // native failure keeps its full report and cannot acquire that success flag.
+    if (nativeFailureOutput) {
+      writeNativeFailure()
+      return
+    }
+    process.stdout.write(help
+      ? value.split('\n').filter((line) => !/^  (?:mcp|skills|--mcp|--update)(?:\s|$)/.test(line)).join('\n')
+      : value)
+  },
 })
+// Preserve failure evidence even if an output filter suppressed normal rendering.
+writeNativeFailure()

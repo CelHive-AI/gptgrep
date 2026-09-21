@@ -1,5 +1,7 @@
+use crate::jev_accounting::Accounting;
 use anyhow::{Result, anyhow, ensure};
 use gptgrep_core::{Hit, SearchOptions};
+use gptgrep_jev::JevClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -49,7 +51,7 @@ pub struct Citation {
     pub text_truncated: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolReceipt {
     pub call_id: String,
     pub tool: String,
@@ -58,6 +60,10 @@ pub struct ToolReceipt {
     pub success: bool,
     pub output_sha256: String,
     pub evidence: Vec<Citation>,
+    #[serde(default)]
+    pub required_initial: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<crate::SearchTelemetry>,
 }
 
 pub(crate) struct Evidence {
@@ -67,6 +73,16 @@ pub(crate) struct Evidence {
     known_nodes: BTreeSet<String>,
     issued: BTreeMap<String, Vec<Citation>>,
     pub receipts: Vec<ToolReceipt>,
+    selected_document: Option<(String, String)>,
+    document: Option<String>,
+    jev_model: Option<String>,
+    client: Option<JevClient>,
+    accounting: Option<Accounting>,
+    pub initial_payload: Option<Value>,
+    initial_in_progress: bool,
+    last_search: Option<crate::SearchTelemetry>,
+    last_search_fatal: bool,
+    current_call_id: String,
 }
 
 impl Evidence {
@@ -77,8 +93,10 @@ impl Evidence {
             .ok_or_else(|| anyhow!("Index generation unavailable"))?
             .to_owned();
         let mut known_nodes = BTreeSet::new();
+        let mut selected_document = None;
         if let Some(id) = node_id {
-            gptgrep_core::read_node(root, id, 4)?;
+            let selected = gptgrep_core::read_node(root, id, 4)?;
+            selected_document = Some((selected.path, selected.title));
             known_nodes.insert(id.to_owned());
         }
         Ok(Self {
@@ -88,7 +106,90 @@ impl Evidence {
             known_nodes,
             issued: BTreeMap::new(),
             receipts: vec![],
+            selected_document,
+            document: None,
+            jev_model: None,
+            client: None,
+            accounting: None,
+            initial_payload: None,
+            initial_in_progress: false,
+            last_search: None,
+            last_search_fatal: false,
+            current_call_id: String::new(),
         })
+    }
+
+    pub fn configure(
+        &mut self,
+        config: &crate::HostConfig,
+        accounting: Accounting,
+        client: Option<JevClient>,
+    ) -> Result<()> {
+        self.accounting = Some(accounting);
+        self.client = client;
+        self.jev_model = config.jev_model.clone();
+        let document = match (&self.selected_document, &config.document) {
+            (Some((selected, _)), Some(requested)) if selected != requested => {
+                return Err(anyhow!("host_document_conflict"));
+            }
+            (Some((selected, _)), _) => Some(selected.clone()),
+            (None, document) => document.clone(),
+        };
+        if let Some(document) = &document {
+            let docs = self.catalog["documents"]
+                .as_array_mut()
+                .ok_or_else(|| anyhow!("Invalid catalog"))?;
+            docs.retain(|doc| doc["path"] == *document);
+            ensure!(!docs.is_empty(), "host_document_scope_unavailable");
+        }
+        self.document = document;
+        self.ensure_generation()
+    }
+
+    pub async fn bootstrap(&mut self, question: &str) -> Result<()> {
+        ensure!(
+            self.initial_payload.is_none(),
+            "host_jev_initial_already_completed"
+        );
+        let query = match &self.selected_document {
+            Some((path, title)) => format!(
+                "Summarize the selected document {path}, section {}. {question}",
+                short(title, 256)
+            ),
+            None => question.to_owned(),
+        };
+        self.initial_in_progress = true;
+        let result = self
+            .call(
+                "host-initial-jev",
+                "gptgrep_search",
+                json!({"query":query,"mode":"hybrid","limit":SEARCH_MAX}),
+            )
+            .await;
+        self.initial_in_progress = false;
+        let payload = result?;
+        ensure!(payload["success"] == true, "host_jev_seed_delivery_failed");
+        let search = self
+            .last_search
+            .as_ref()
+            .ok_or_else(|| anyhow!("host_jev_initial_missing"))?;
+        let coverage = search
+            .coverage
+            .as_ref()
+            .ok_or_else(|| anyhow!("host_jev_initial_coverage_missing"))?;
+        if coverage.indexed_files == 0 {
+            return Err(anyhow!("host_jev_empty_corpus"));
+        }
+        ensure!(
+            coverage.reranked_candidates > 0 && search.metrics.jev_requests > 0,
+            "host_jev_no_candidates"
+        );
+        self.initial_payload = Some(serde_json::from_str(
+            payload["contentItems"][0]["text"]
+                .as_str()
+                .ok_or_else(|| anyhow!("host_jev_seed_invalid"))?,
+        )?);
+        Ok(())
     }
 
     fn ensure_generation(&self) -> Result<()> {
@@ -98,14 +199,21 @@ impl Evidence {
         );
         Ok(())
     }
+    pub fn document_scope(&self) -> Option<&str> {
+        self.document.as_deref()
+    }
 
     pub async fn call(&mut self, call_id: &str, tool: &str, args: Value) -> Result<Value> {
         self.ensure_generation()?;
         let prior_nodes = self.known_nodes.clone();
         let prior_issued = self.issued.clone();
         let mut evidence = vec![];
+        self.last_search = None;
+        self.last_search_fatal = false;
+        self.current_call_id = call_id.to_owned();
         let output = self.run(tool, &args, &mut evidence).await;
         self.ensure_generation()?;
+        let mut fatal = None;
         let (value, mut success) = match output {
             Ok(value) => (value, true),
             Err(error) => {
@@ -117,7 +225,11 @@ impl Evidence {
                         "The requested evidence is unavailable or stale. Use the current catalog/tree IDs; source changes require reindexing outside this read-only workflow.",
                     )
                 };
-                (json!({"error":code,"message":message}), false)
+                let value = json!({"error":code,"message":message});
+                if self.last_search_fatal {
+                    fatal = Some(error);
+                }
+                (value, false)
             }
         };
         let text = serde_json::to_string(&value)?;
@@ -133,6 +245,13 @@ impl Evidence {
             self.issued = prior_issued;
             evidence.clear();
         }
+        if let Some(search) = &mut self.last_search {
+            search.delivered_hits = evidence.len();
+            search.output_truncated |= !success;
+        }
+        if let (Some(accounting), Some(search)) = (&self.accounting, &self.last_search) {
+            accounting.delivery(search)?;
+        }
         self.receipts.push(ToolReceipt {
             call_id: call_id.to_owned(),
             tool: tool.to_owned(),
@@ -141,7 +260,15 @@ impl Evidence {
             success,
             output_sha256: hash(&serde_json::to_vec(&payload)?),
             evidence,
+            required_initial: self.initial_in_progress,
+            search: self.last_search.clone(),
         });
+        if let Some(accounting) = &self.accounting {
+            accounting.receipt(self.receipts.last().expect("just pushed"))?;
+        }
+        if let Some(error) = fatal {
+            return Err(error);
+        }
         Ok(payload)
     }
 
@@ -166,7 +293,7 @@ impl Evidence {
                     "pages":doc["pages"],"nodes":doc["nodes"],"source_sha256":doc["source_sha256"]
                 })).collect();
                 Ok(
-                    json!({"generation":self.generation,"documents":rows,"total":docs.len(),"next_offset":next(offset,limit,docs.len())}),
+                    json!({"generation":self.generation,"document_scope":self.document,"documents":rows,"total":docs.len(),"next_offset":next(offset,limit,docs.len())}),
                 )
             }
             "gptgrep_tree" => {
@@ -230,7 +357,7 @@ impl Evidence {
                 }
                 let returned = rows.len();
                 Ok(
-                    json!({"generation":self.generation,"path":path,"source_sha256":doc["source_sha256"],"nodes":rows,"total":nodes.len(),"next_offset":next(offset,returned,nodes.len())}),
+                    json!({"generation":self.generation,"document_scope":self.document,"path":path,"source_sha256":doc["source_sha256"],"nodes":rows,"total":nodes.len(),"next_offset":next(offset,returned,nodes.len())}),
                 )
             }
             "gptgrep_read" => {
@@ -255,50 +382,178 @@ impl Evidence {
                 let hit = gptgrep_core::read_node_window(&self.root, id, max_bytes, offset_bytes)?;
                 self.issue(&hit, evidence)?;
                 Ok(
-                    json!({"generation":self.generation,"node_offset":hit.node_offset,"next_offset":hit.next_offset,"evidence":hit}),
+                    json!({"generation":self.generation,"document_scope":self.document,"node_offset":hit.node_offset,"next_offset":hit.next_offset,"evidence":hit}),
                 )
             }
-            "gptgrep_search" => {
-                fields(object, &["query", "mode", "limit"])?;
-                let query = args["query"].as_str().ok_or_else(|| {
-                    argument_error("query is required and must be a string of 1..2048 UTF-8 bytes.")
-                })?;
-                if query.is_empty() || query.len() > 2048 {
-                    return Err(argument_error("query must contain 1..2048 UTF-8 bytes."));
-                }
-                let mode = match args.get("mode") {
-                    Some(value) => value.as_str().ok_or_else(|| {
-                        argument_error("mode must be lexical or regex; default lexical.")
-                    })?,
-                    None => "lexical",
-                };
-                if !matches!(mode, "lexical" | "regex") {
-                    return Err(argument_error(
-                        "mode must be lexical or regex; default lexical.",
-                    ));
-                }
-                let limit = integer(args, "limit", SEARCH_MAX)?;
-                if !(1..=SEARCH_MAX).contains(&limit) {
-                    return Err(argument_error(format!(
-                        "limit must be an integer in 1..{SEARCH_MAX}; omit it for default {SEARCH_MAX}. Reformulate the query or inspect the tree for more evidence."
-                    )));
-                }
-                let options = SearchOptions {
-                    mode: mode.into(),
-                    limit,
-                    context: 0,
-                    ..Default::default()
-                };
-                let found = gptgrep_core::search(&self.root, query, &options).await?;
-                ensure!(found.generation == self.generation, "Changed generation");
-                for hit in &found.hits {
-                    self.known_nodes.insert(hit.node_id.clone());
-                    self.issue(hit, evidence)?;
-                }
-                Ok(serde_json::to_value(found)?)
-            }
+            "gptgrep_search" => self.run_search(args, evidence).await,
             _ => Err(anyhow!("Tool is not allowed")),
         }
+    }
+
+    async fn run_search(&mut self, args: &Value, evidence: &mut Vec<Citation>) -> Result<Value> {
+        let object = args
+            .as_object()
+            .ok_or_else(|| argument_error("Arguments must be a JSON object."))?;
+        fields(object, &["query", "mode", "limit", "document"])?;
+        let query = args["query"]
+            .as_str()
+            .ok_or_else(|| argument_error("query must be a string of 1..8192 UTF-8 bytes."))?;
+        let query_limit = if self.initial_in_progress { 8192 } else { 2048 };
+        if query.is_empty() || query.len() > query_limit {
+            return Err(argument_error(format!(
+                "query must contain 1..{query_limit} UTF-8 bytes."
+            )));
+        }
+        let mode = match args.get("mode") {
+            Some(value) => value.as_str().ok_or_else(|| {
+                argument_error("mode must be hybrid, semantic, regex or lexical; default hybrid.")
+            })?,
+            None => "hybrid",
+        };
+        if !matches!(mode, "hybrid" | "semantic" | "regex" | "lexical") {
+            return Err(argument_error(
+                "mode must be hybrid, semantic, regex or lexical; default hybrid.",
+            ));
+        }
+        let limit = integer(args, "limit", SEARCH_MAX)?;
+        if !(1..=SEARCH_MAX).contains(&limit) {
+            return Err(argument_error(format!(
+                "limit must be an integer in 1..{SEARCH_MAX}; omit it for default {SEARCH_MAX}."
+            )));
+        }
+        if self.accounting.is_some() && !self.initial_in_progress && self.initial_payload.is_none()
+        {
+            return Err(anyhow!("host_jev_initial_required"));
+        }
+        let requested = args
+            .get("document")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| argument_error("document must be a catalog-issued path."))
+            })
+            .transpose()?;
+        if let (Some(scope), Some(requested)) = (&self.document, requested)
+            && scope != requested
+        {
+            return Err(argument_error(
+                "document cannot widen or replace the caller's document scope.",
+            ));
+        }
+        let document = self
+            .document
+            .clone()
+            .or_else(|| requested.map(str::to_owned));
+        if let Some(document) = &document
+            && !self.catalog["documents"]
+                .as_array()
+                .is_some_and(|docs| docs.iter().any(|doc| doc["path"] == *document))
+        {
+            return Err(argument_error(
+                "document must be a path returned by the current catalog.",
+            ));
+        }
+        let options = SearchOptions {
+            mode: mode.into(),
+            limit,
+            context: 0,
+            model: self.jev_model.clone(),
+            document: document.clone(),
+            ..Default::default()
+        };
+        let index = if let Some(accounting) = &self.accounting {
+            Some(accounting.start_search(
+                &self.current_call_id,
+                query,
+                mode,
+                document.as_deref(),
+                self.initial_in_progress,
+            )?)
+        } else {
+            None
+        };
+        let assisted = matches!(mode, "hybrid" | "semantic");
+        let result = if assisted {
+            self.last_search_fatal = true;
+            if self.client.is_none() {
+                match JevClient::from_env(self.jev_model.as_deref()) {
+                    Ok(client) => self.client = Some(client),
+                    Err(error) => {
+                        // JevClient constructors return redacted messages; never wrap provider bodies here.
+                        let error = anyhow!(crate::jev_accounting::InitializationError {
+                            cause: error.to_string()
+                        });
+                        if let (Some(accounting), Some(index)) = (&self.accounting, index) {
+                            self.last_search = Some(accounting.failure(index, &error)?);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            let client = self.client.as_ref().expect("initialized client");
+            if let (Some(accounting), Some(index)) = (&self.accounting, index) {
+                let observer = |progress: &gptgrep_core::JevSearchProgress| {
+                    accounting.progress(index, progress)
+                };
+                gptgrep_core::search_with_client_and_observer(
+                    &self.root, query, &options, client, &observer,
+                )
+                .await
+            } else {
+                gptgrep_core::search_with_client(&self.root, query, &options, client).await
+            }
+        } else {
+            gptgrep_core::search(&self.root, query, &options).await
+        };
+        let mut found = match result {
+            Ok(found) => found,
+            Err(error) => {
+                if let (Some(accounting), Some(index)) = (&self.accounting, index) {
+                    self.last_search = Some(accounting.failure(index, &error)?);
+                }
+                return Err(error);
+            }
+        };
+        if let (Some(accounting), Some(index)) = (&self.accounting, index) {
+            self.last_search = Some(accounting.success(index, &found, 0, false)?);
+        }
+        ensure!(
+            found.generation == self.generation,
+            "host_generation_changed"
+        );
+        ensure!(
+            found.document_scope == document,
+            "host_document_scope_changed"
+        );
+        let original_hits = found.hits.len();
+        if self.initial_in_progress {
+            loop {
+                let value = serde_json::to_value(&found)?;
+                let payload = json!({"contentItems":[{"type":"inputText","text":value.to_string()}],"success":true});
+                if serde_json::to_vec(&payload)?.len() <= MAX_TOOL_BYTES - 256 {
+                    break;
+                }
+                ensure!(!found.hits.is_empty(), "host_jev_seed_delivery_failed");
+                found.hits.pop();
+            }
+            ensure!(
+                original_hits == 0 || !found.hits.is_empty(),
+                "host_jev_seed_delivery_failed"
+            );
+        }
+        for hit in &found.hits {
+            self.known_nodes.insert(hit.node_id.clone());
+            self.issue(hit, evidence)?;
+        }
+        if let Some(search) = &mut self.last_search {
+            search.delivered_hits = evidence.len();
+            search.output_truncated = found.hits.len() < original_hits;
+        }
+        self.last_search_fatal = false;
+        let mut value = serde_json::to_value(found)?;
+        value["host_delivery"] = json!({"omitted_hits":original_hits-evidence.len()});
+        Ok(value)
     }
 
     fn issue(&mut self, hit: &Hit, evidence: &mut Vec<Citation>) -> Result<()> {
@@ -485,9 +740,9 @@ pub(crate) fn tools() -> Value {
         (
             "gptgrep_search",
             format!(
-                "Search the local snapshot. Default mode=lexical and limit={SEARCH_MAX}; limit must be 1..{SEARCH_MAX}. For more evidence, reformulate the query or inspect/read the document tree; do not request limits such as 20 or 50."
+                "Search with Jev document routing and evidence reranking. Default mode=hybrid; semantic omits the lexical lane. Regex/lexical are explicit local refinements after the host's mandatory initial Jev pass. limit must be 1..{SEARCH_MAX}, default {SEARCH_MAX}. For more evidence, reformulate the query or inspect/read the document tree."
             ),
-            json!({"query":{"type":"string","minLength":1,"maxLength":2048,"description":"Search words or a regex, 1..2048 UTF-8 bytes."},"mode":{"type":"string","enum":["lexical","regex"],"default":"lexical","description":"lexical (default) for words, or regex for a regular expression."},"limit":{"type":"integer","minimum":1,"maximum":SEARCH_MAX,"default":SEARCH_MAX,"description":format!("Result count: 1..{SEARCH_MAX}, default {SEARCH_MAX}. This bounded evidence tool does not accept larger result counts.")}}),
+            json!({"query":{"type":"string","minLength":1,"maxLength":2048,"description":"Runtime search question, words or regex, 1..2048 UTF-8 bytes."},"mode":{"type":"string","enum":["hybrid","semantic","regex","lexical"],"default":"hybrid","description":"hybrid (default): lexical candidates plus Jev routing/reranking. semantic: Jev semantic lane. regex or lexical: explicit local refinement after required initial Jev work."},"document":{"type":"string","description":"Optional exact relative document path from the current catalog. Omission keeps the caller's scope. This cannot widen or replace a caller-supplied document scope."},"limit":{"type":"integer","minimum":1,"maximum":SEARCH_MAX,"default":SEARCH_MAX,"description":format!("Result count: 1..{SEARCH_MAX}, default {SEARCH_MAX}. This bounded evidence tool does not accept larger result counts.")}}),
             vec!["query"],
         ),
     ];
