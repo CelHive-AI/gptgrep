@@ -182,12 +182,16 @@ GPTGREP_BIN=/absolute/path/to/gptgrep node src/cli.js search \
 
 ## 検証と根拠
 
+Python の検証には 3.12 以上を使い、下記のローカル仮想環境へ固定バージョンの依存関係をインストールします。
+
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-python3 -B -m unittest discover -s evals -p 'test_*.py'
-python3 -B scripts/eval.py --binary target/release/gptgrep --output /tmp/gptgrep-eval.json
+python3 -m venv .local/eval-venv
+.local/eval-venv/bin/python -m pip install --only-binary=:all: -r evals/requirements.lock
+.local/eval-venv/bin/python -B -m unittest discover -s evals -p 'test_*.py'
+.local/eval-venv/bin/python -B scripts/eval.py --binary target/release/gptgrep --output /tmp/gptgrep-eval.json
 ```
 
 フィクスチャによるテストは、正規表現の正しさ、語句検索、Unicode、ソースの正確なダイジェストと

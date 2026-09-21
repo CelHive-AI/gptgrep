@@ -158,12 +158,16 @@ GPTGREP_BIN=/absolute/path/to/gptgrep node src/cli.js search \
 
 ## 验证与证据
 
+Python 验证需要 3.12 或更新版本；下面的命令会在本地隔离环境中安装固定版本的依赖。
+
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-python3 -B -m unittest discover -s evals -p 'test_*.py'
-python3 -B scripts/eval.py --binary target/release/gptgrep --output /tmp/gptgrep-eval.json
+python3 -m venv .local/eval-venv
+.local/eval-venv/bin/python -m pip install --only-binary=:all: -r evals/requirements.lock
+.local/eval-venv/bin/python -B -m unittest discover -s evals -p 'test_*.py'
+.local/eval-venv/bin/python -B scripts/eval.py --binary target/release/gptgrep --output /tmp/gptgrep-eval.json
 ```
 
 测试样例覆盖正则匹配正确性、词法检索、Unicode、精确的源文件摘要值与字节区间、

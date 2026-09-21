@@ -182,12 +182,16 @@ published registry version during this investigation.
 
 ## Verification and evidence
 
+Python checks use Python 3.12 or newer and a local environment with locked dependencies.
+
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-python3 -B -m unittest discover -s evals -p 'test_*.py'
-python3 -B scripts/eval.py --binary target/release/gptgrep --output /tmp/gptgrep-eval.json
+python3 -m venv .local/eval-venv
+.local/eval-venv/bin/python -m pip install --only-binary=:all: -r evals/requirements.lock
+.local/eval-venv/bin/python -B -m unittest discover -s evals -p 'test_*.py'
+.local/eval-venv/bin/python -B scripts/eval.py --binary target/release/gptgrep --output /tmp/gptgrep-eval.json
 ```
 
 The fixture suite covers regex correctness, lexical retrieval, Unicode, exact
