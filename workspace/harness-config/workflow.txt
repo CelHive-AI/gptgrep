@@ -1,0 +1,14 @@
+{"schema_version":"aicatlog.text.v1","id":"workflow","kind":"workflow","when":"Project execution and continuation"}
+
+BEGIN_TOPIC execute
+State the useful outcome and allowed effects. Inspect current authority and worktree.
+Implement the smallest coherent change and run the checks affected by it.
+Keep optional research, independent review and release approval tied to their actual scope.
+END_TOPIC execute
+
+BEGIN_TOPIC deliver
+Record source revision, actual validation, artifacts, unresolved issues and next action.
+Commit intended changes, attach machine-readable PoUW and verify Git state.
+Use workspace/tasks/artifacts for evidence and workspace/handoff for continuation.
+Keep session identity, process success, task success and required acceptance distinct.
+END_TOPIC deliver

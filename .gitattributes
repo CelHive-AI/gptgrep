@@ -1,0 +1,4 @@
+# Retain upstream notice bytes and reproducible fixture digests exactly.
+licenses/** -text -whitespace
+crates/gptgrep-parse/licenses/** -text -whitespace
+evals/fixtures/** -text -whitespace

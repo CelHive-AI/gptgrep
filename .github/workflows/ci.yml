@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact source ref to validate for a release
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native checks (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # verified stable action revision
+        with:
+          toolchain: '1.96.0'
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - name: Native build prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev pkg-config
+      - name: Fetch and verify pinned PDFium
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, io, os, pathlib, sys, tarfile, urllib.request
+          sys.path.insert(0, 'scripts')
+          from package_release import PDFIUM_TAG, TARGETS, verify_pdfium
+          target = os.environ['TARGET']
+          expected = TARGETS[target]
+          url = f"https://github.com/run-llama/pdfium-binaries/releases/download/{PDFIUM_TAG}/{expected['asset']}"
+          data = urllib.request.urlopen(url, timeout=60).read()
+          if hashlib.sha256(data).hexdigest() != expected['archive_sha256']:
+              raise SystemExit('PDFium release asset checksum mismatch')
+          destination = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gptgrep-pdfium'
+          destination.mkdir()
+          with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+              archive.extractall(destination, filter='data')
+          verify_pdfium(destination, target)
+          with open(os.environ['GITHUB_ENV'], 'a') as environment:
+              environment.write(f'PDFIUM_LIB_PATH={destination / "lib"}\n')
+              environment.write(f'PDFIUM_INCLUDE_PATH={destination / "include"}\n')
+          PY
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Rust tests
+        run: cargo test --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build native CLI
+        run: cargo build --locked -p gptgrep-cli
+      - name: Offline evaluation and oracle
+        shell: bash
+        run: |
+          unset OPENROUTER_API_KEY TYPESAFE_API_KEY OPENAI_API_KEY
+          python -m unittest discover -s evals -p 'test_*.py' -v
+          python scripts/eval.py --binary target/debug/gptgrep --output .local/ci-eval.json
+          python scripts/package_release.py --self-test
+      - name: Actual Rust license files
+        run: python scripts/collect_licenses.py --target '${{ matrix.target }}' --output .local/ci-licenses --require-complete
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-evaluation-${{ matrix.target }}
+          path: .local/ci-eval.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  wrapper:
+    name: Optional incur wrapper
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.20.0'
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0 (annotated tag dereferenced)
+        with:
+          version: '11.24.0'
+          package_json_file: packages/cli/package.json
+          run_install: false
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+        working-directory: packages/cli
+      - run: pnpm test
+        working-directory: packages/cli

@@ -1,0 +1,24 @@
+[package]
+name = "gptgrep-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Immutable document snapshots and evidence-grounded hybrid retrieval for GPTgrep"
+
+[dependencies]
+anyhow = "1"
+fs2 = "0.4"
+gptgrep-index = { path = "../gptgrep-index" }
+gptgrep-jev = { path = "../gptgrep-jev" }
+gptgrep-pageindex = { path = "../gptgrep-pageindex" }
+gptgrep-parse = { path = "../gptgrep-parse" }
+ignore = "0.4"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

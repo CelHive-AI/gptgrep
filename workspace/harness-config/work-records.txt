@@ -1,0 +1,16 @@
+{"schema_version":"aicatlog.text.v1","id":"work-records","kind":"document","when":"Create and continue project work records"}
+
+BEGIN_TOPIC records
+Use stable IDs, owner, state, objective, acceptance criteria, source references and next action.
+State is planned, active, blocked, done or cancelled. A done record needs actual acceptance evidence.
+Create task records only when ownership or continuation benefits from them.
+Use workspace/issues, workspace/tasks and workspace/exec-plans for the corresponding records.
+Keep runtime evidence under workspace/tasks/artifacts and handoffs under workspace/handoff.
+These are created when work needs them; an empty project does not need placeholder tasks.
+END_TOPIC records
+
+BEGIN_TOPIC continuation
+A checkpoint binds the task, repository revision, completed outcomes, evidence and next action.
+Record native identities only when observed. An old checkpoint does not authorize another Goal.
+Separate work completion from any explicitly required review or release acceptance.
+END_TOPIC continuation

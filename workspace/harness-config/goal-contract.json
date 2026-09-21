@@ -1,0 +1,36 @@
+{
+  "schema_version": "gptgrep.goal.v1",
+  "id": "GPTGREP-RESEARCH-PREVIEW",
+  "status": "active",
+  "objective": "Build and iteratively optimize a Rust-first GPTgrep system with measured live advantages over the PageIndex Flash baseline",
+  "authority": "User project ownership mandate; routine implementation, harness, CI and releases authorized within the agreed direction",
+  "host_defaults": {"model": "gpt-5.6-luna", "model_reasoning_effort": "max"},
+  "benchmark": {
+    "repository": "https://github.com/VectifyAI/PageIndex-OSS-Benchmark",
+    "revision": "ad4c0b92970a6f4801f09ff2e647389e8f5874fa",
+    "questions_sha256": "f0cc046c0e3bdd4c8c4a4dc977e08e107d21d6a2d22fb8237914111d0f6e256e",
+    "task_count": 62,
+    "document_count": 34,
+    "baseline": "Actual pinned PageIndex Flash/local SDK execution; local Codex backend substitution explicitly identified",
+    "historical_readme_scores_are_acceptance": false,
+    "gptgrep_only_subset_run_is_baseline": false
+  },
+  "gates": [
+    {"id": "G0", "name": "Source, interface and license evidence", "required": true},
+    {"id": "G1", "name": "Offline correctness, source freshness, bounded execution and independent review", "required": true},
+    {"id": "G2", "name": "Real Jev and local Codex useful outcomes, not transport-only success", "required": true},
+    {"id": "G3", "name": "Live paired upstream PageIndex and GPTgrep smoke with preserved same-run evidence", "required": true},
+    {"id": "G4", "name": "Full cohort paired benchmark and ablations under declared comparable conditions", "required": true},
+    {"id": "G5", "name": "Demonstrated advantage with no hidden quality, citation or ingestion regression", "required": true},
+    {"id": "G6", "name": "Verified source/release artifacts, PoUW, backup and continuation", "required": true}
+  ],
+  "advantage_rule": {
+    "quality": "Answer correctness at least the paired baseline with matching judge and denominator; retain per-task disagreements",
+    "grounding": "No stale source accepted; citation validity and ingestion coverage at least baseline under the declared scope",
+    "efficiency": "At least one predeclared measured improvement in end-to-end latency, model usage or available provider cost, or strictly higher quality with an explicit resource tradeoff",
+    "uncertainty": "Report repetitions/sample count and paired uncertainty; a small smoke suite cannot establish the complete goal",
+    "missing_metrics": "Unavailable, never zero or success"
+  },
+  "release_policy": "Research previews may record partial goal progress and known limitations; preview publication never advances G3-G5 by itself",
+  "rsi_policy": "Use failures to propose and test scoped changes; keep raw receipts, learned findings and executable policy distinct; no unreviewed global ingestion"
+}

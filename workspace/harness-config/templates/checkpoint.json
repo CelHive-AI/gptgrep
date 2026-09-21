@@ -1,0 +1,12 @@
+{
+  "schema_version": "aicatlog.checkpoint.v1",
+  "objective": "",
+  "status": "in_progress",
+  "source_revision": null,
+  "primary_session_id": null,
+  "partner_sessions": [],
+  "completed": [],
+  "evidence": [],
+  "unresolved": [],
+  "next_action": ""
+}

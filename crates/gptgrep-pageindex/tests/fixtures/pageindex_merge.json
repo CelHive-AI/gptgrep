@@ -1,0 +1,633 @@
+{
+  "schema": "gptgrep.pageindex-merge-fixtures.v1",
+  "source_repository": "https://github.com/VectifyAI/PageIndex",
+  "source_revision": "9c4c3ff2ddd2cbd70501997635578064f2b7c7c3",
+  "source_file": "pageindex/tree_optimize.py",
+  "source_sha256": "3112940bf4c4e4add0203316575e1426cf06b375a97e67d415129af7c119061a",
+  "source_license": "MIT",
+  "method": "execute selected upstream pure operators until fixed point, with routing cost 1 and title limit 200",
+  "cases": [
+    {
+      "name": "leaf_no_change",
+      "page_count": 4,
+      "input_tree": [
+        {
+          "title": "Leaf",
+          "start_index": 1,
+          "end_index": 4,
+          "node_id": "0000"
+        }
+      ],
+      "costs_before": [
+        {
+          "node_id": "0000",
+          "span": 4,
+          "residual": 4,
+          "cost": 4,
+          "frontier_cost": 4
+        }
+      ],
+      "expected_tree": [
+        {
+          "title": "Leaf",
+          "start_index": 1,
+          "end_index": 4,
+          "node_id": "0000"
+        }
+      ]
+    },
+    {
+      "name": "useful_partition_retained",
+      "page_count": 10,
+      "input_tree": [
+        {
+          "title": "Root",
+          "start_index": 1,
+          "end_index": 10,
+          "nodes": [
+            {
+              "title": "Left",
+              "start_index": 1,
+              "end_index": 5,
+              "node_id": "0001"
+            },
+            {
+              "title": "Right",
+              "start_index": 6,
+              "end_index": 10,
+              "node_id": "0002"
+            }
+          ],
+          "node_id": "0000"
+        }
+      ],
+      "costs_before": [
+        {
+          "node_id": "0000",
+          "span": 10,
+          "residual": 0,
+          "cost": 6,
+          "frontier_cost": 6
+        },
+        {
+          "node_id": "0001",
+          "span": 5,
+          "residual": 5,
+          "cost": 5,
+          "frontier_cost": 5
+        },
+        {
+          "node_id": "0002",
+          "span": 5,
+          "residual": 5,
+          "cost": 5,
+          "frontier_cost": 5
+        }
+      ],
+      "expected_tree": [
+        {
+          "title": "Root",
+          "start_index": 1,
+          "end_index": 10,
+          "nodes": [
+            {
+              "title": "Left",
+              "start_index": 1,
+              "end_index": 5,
+              "node_id": "0001"
+            },
+            {
+              "title": "Right",
+              "start_index": 6,
+              "end_index": 10,
+              "node_id": "0002"
+            }
+          ],
+          "node_id": "0000"
+        }
+      ]
+    },
+    {
+      "name": "tie_collapses",
+      "page_count": 3,
+      "input_tree": [
+        {
+          "title": "Root",
+          "start_index": 1,
+          "end_index": 3,
+          "nodes": [
+            {
+              "title": "Child",
+              "start_index": 1,
+              "end_index": 2,
+              "node_id": "0001"
+            }
+          ],
+          "node_id": "0000"
+        }
+      ],
+      "costs_before": [
+        {
+          "node_id": "0000",
+          "span": 3,
+          "residual": 1,
+          "cost": 3,
+          "frontier_cost": 3
+        },
+        {
+          "node_id": "0001",
+          "span": 2,
+          "residual": 2,
+          "cost": 2,
+          "frontier_cost": 2
+        }
+      ],
+      "expected_tree": [
+        {
+          "title": "Root",
+          "start_index": 1,
+          "end_index": 3,
+          "node_id": "0000",
+          "key_items": [
+            "Child"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "bottom_up_chain",
+      "page_count": 2,
+      "input_tree": [
+        {
+          "title": "Root",
+          "start_index": 1,
+          "end_index": 2,
+          "nodes": [
+            {
+              "title": "Middle",
+              "start_index": 1,
+              "end_index": 2,
+              "nodes": [
+                {
+                  "title": "Leaf",
+                  "start_index": 1,
+                  "end_index": 1,
+                  "key_items": [
+                    "Prior leaf title"
+                  ],
+                  "node_id": "0002"
+                }
+              ],
+              "node_id": "0001"
+            }
+          ],
+          "node_id": "0000"
+        }
+      ],
+      "costs_before": [
+        {
+          "node_id": "0000",
+          "span": 2,
+          "residual": 0,
+          "cost": 3,
+          "frontier_cost": 3
+        },
+        {
+          "node_id": "0001",
+          "span": 2,
+          "residual": 1,
+          "cost": 2,
+          "frontier_cost": 2
+        },
+        {
+          "node_id": "0002",
+          "span": 1,
+          "residual": 1,
+          "cost": 1,
+          "frontier_cost": 1
+        }
+      ],
+      "expected_tree": [
+        {
+          "title": "Root",
+          "start_index": 1,
+          "end_index": 2,
+          "node_id": "0000",
+          "key_items": [
+            "Middle",
+            "Leaf",
+            "Prior leaf title"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "overlap_uses_page_union",
+      "page_count": 8,
+      "input_tree": [
+        {
+          "title": "Root",
+          "start_index": 1,
+          "end_index": 8,
+          "nodes": [
+            {
+              "title": "Left",
+              "start_index": 2,
+              "end_index": 5,
+              "node_id": "0001"
+            },
+            {
+              "title": "Right",
+              "start_index": 4,
+              "end_index": 7,
+              "node_id": "0002"
+            }
+          ],
+          "node_id": "0000"
+        }
+      ],
+      "costs_before": [
+        {
+          "node_id": "0000",
+          "span": 8,
+          "residual": 2,
+          "cost": 5,
+          "frontier_cost": 5
+        },
+        {
+          "node_id": "0001",
+          "span": 4,
+          "residual": 4,
+          "cost": 4,
+          "frontier_cost": 4
+        },
+        {
+          "node_id": "0002",
+          "span": 4,
+          "residual": 4,
+          "cost": 4,
+          "frontier_cost": 4
+        }
+      ],
+      "expected_tree": [
+        {
+          "title": "Root",
+          "start_index": 1,
+          "end_index": 8,
+          "nodes": [
+            {
+              "title": "Left",
+              "start_index": 2,
+              "end_index": 5,
+              "node_id": "0001"
+            },
+            {
+              "title": "Right",
+              "start_index": 4,
+              "end_index": 7,
+              "node_id": "0002"
+            }
+          ],
+          "node_id": "0000"
+        }
+      ]
+    },
+    {
+      "name": "residual_dominates",
+      "page_count": 10,
+      "input_tree": [
+        {
+          "title": "Root",
+          "start_index": 1,
+          "end_index": 10,
+          "nodes": [
+            {
+              "title": "Tiny child",
+              "start_index": 5,
+              "end_index": 5,
+              "node_id": "0001"
+            }
+          ],
+          "node_id": "0000"
+        }
+      ],
+      "costs_before": [
+        {
+          "node_id": "0000",
+          "span": 10,
+          "residual": 9,
+          "cost": 10,
+          "frontier_cost": 10
+        },
+        {
+          "node_id": "0001",
+          "span": 1,
+          "residual": 1,
+          "cost": 1,
+          "frontier_cost": 1
+        }
+      ],
+      "expected_tree": [
+        {
+          "title": "Root",
+          "start_index": 1,
+          "end_index": 10,
+          "node_id": "0000",
+          "key_items": [
+            "Tiny child"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "same_page_siblings",
+      "page_count": 2,
+      "input_tree": [
+        {
+          "title": "A",
+          "start_index": 1,
+          "end_index": 1,
+          "key_items": [
+            "A old"
+          ],
+          "node_id": "0000"
+        },
+        {
+          "title": "B",
+          "start_index": 1,
+          "end_index": 1,
+          "node_id": "0001"
+        },
+        {
+          "title": "C",
+          "start_index": 2,
+          "end_index": 2,
+          "node_id": "0002"
+        }
+      ],
+      "costs_before": [
+        {
+          "node_id": "0000",
+          "span": 1,
+          "residual": 1,
+          "cost": 1,
+          "frontier_cost": 1
+        },
+        {
+          "node_id": "0001",
+          "span": 1,
+          "residual": 1,
+          "cost": 1,
+          "frontier_cost": 1
+        },
+        {
+          "node_id": "0002",
+          "span": 1,
+          "residual": 1,
+          "cost": 1,
+          "frontier_cost": 1
+        }
+      ],
+      "expected_tree": [
+        {
+          "title": "A; A old; B",
+          "start_index": 1,
+          "end_index": 1,
+          "key_items": [
+            "A",
+            "A old",
+            "B"
+          ],
+          "node_id": "0000",
+          "_same_page": true
+        },
+        {
+          "title": "C",
+          "start_index": 2,
+          "end_index": 2,
+          "node_id": "0001"
+        }
+      ]
+    },
+    {
+      "name": "same_multi_page_span",
+      "page_count": 3,
+      "input_tree": [
+        {
+          "title": "A",
+          "start_index": 1,
+          "end_index": 3,
+          "node_id": "0000"
+        },
+        {
+          "title": "B",
+          "start_index": 1,
+          "end_index": 3,
+          "node_id": "0001"
+        }
+      ],
+      "costs_before": [
+        {
+          "node_id": "0000",
+          "span": 3,
+          "residual": 3,
+          "cost": 3,
+          "frontier_cost": 3
+        },
+        {
+          "node_id": "0001",
+          "span": 3,
+          "residual": 3,
+          "cost": 3,
+          "frontier_cost": 3
+        }
+      ],
+      "expected_tree": [
+        {
+          "title": "A; B",
+          "start_index": 1,
+          "end_index": 3,
+          "node_id": "0000",
+          "key_items": [
+            "A",
+            "B"
+          ],
+          "_same_page": true
+        }
+      ]
+    },
+    {
+      "name": "same_span_after_bottom_up",
+      "page_count": 2,
+      "input_tree": [
+        {
+          "title": "A",
+          "start_index": 1,
+          "end_index": 2,
+          "nodes": [
+            {
+              "title": "A child",
+              "start_index": 1,
+              "end_index": 1,
+              "node_id": "0001"
+            }
+          ],
+          "node_id": "0000"
+        },
+        {
+          "title": "B",
+          "start_index": 1,
+          "end_index": 2,
+          "nodes": [
+            {
+              "title": "B child",
+              "start_index": 2,
+              "end_index": 2,
+              "node_id": "0003"
+            }
+          ],
+          "node_id": "0002"
+        }
+      ],
+      "costs_before": [
+        {
+          "node_id": "0000",
+          "span": 2,
+          "residual": 1,
+          "cost": 2,
+          "frontier_cost": 2
+        },
+        {
+          "node_id": "0001",
+          "span": 1,
+          "residual": 1,
+          "cost": 1,
+          "frontier_cost": 1
+        },
+        {
+          "node_id": "0002",
+          "span": 2,
+          "residual": 1,
+          "cost": 2,
+          "frontier_cost": 2
+        },
+        {
+          "node_id": "0003",
+          "span": 1,
+          "residual": 1,
+          "cost": 1,
+          "frontier_cost": 1
+        }
+      ],
+      "expected_tree": [
+        {
+          "title": "A; A child; B; B child",
+          "start_index": 1,
+          "end_index": 2,
+          "node_id": "0000",
+          "key_items": [
+            "A",
+            "A child",
+            "B",
+            "B child"
+          ],
+          "_same_page": true
+        }
+      ]
+    },
+    {
+      "name": "unicode_title_length_is_characters",
+      "page_count": 1,
+      "input_tree": [
+        {
+          "title": "数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数",
+          "start_index": 1,
+          "end_index": 1,
+          "node_id": "0000"
+        },
+        {
+          "title": "据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据",
+          "start_index": 1,
+          "end_index": 1,
+          "node_id": "0001"
+        }
+      ],
+      "costs_before": [
+        {
+          "node_id": "0000",
+          "span": 1,
+          "residual": 1,
+          "cost": 1,
+          "frontier_cost": 1
+        },
+        {
+          "node_id": "0001",
+          "span": 1,
+          "residual": 1,
+          "cost": 1,
+          "frontier_cost": 1
+        }
+      ],
+      "expected_tree": [
+        {
+          "title": "数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数; 据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据",
+          "start_index": 1,
+          "end_index": 1,
+          "node_id": "0000",
+          "key_items": [
+            "数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数",
+            "据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据"
+          ],
+          "_same_page": true
+        }
+      ]
+    },
+    {
+      "name": "oversize_union_title_falls_back",
+      "page_count": 1,
+      "input_tree": [
+        {
+          "title": "数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数",
+          "start_index": 1,
+          "end_index": 1,
+          "node_id": "0000"
+        },
+        {
+          "title": "据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据",
+          "start_index": 1,
+          "end_index": 1,
+          "node_id": "0001"
+        }
+      ],
+      "costs_before": [
+        {
+          "node_id": "0000",
+          "span": 1,
+          "residual": 1,
+          "cost": 1,
+          "frontier_cost": 1
+        },
+        {
+          "node_id": "0001",
+          "span": 1,
+          "residual": 1,
+          "cost": 1,
+          "frontier_cost": 1
+        }
+      ],
+      "expected_tree": [
+        {
+          "title": "p.1",
+          "start_index": 1,
+          "end_index": 1,
+          "node_id": "0000",
+          "key_items": [
+            "数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数数",
+            "据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据据"
+          ],
+          "_same_page": true
+        }
+      ]
+    }
+  ]
+}

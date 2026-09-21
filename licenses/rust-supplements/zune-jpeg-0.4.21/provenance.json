@@ -1,0 +1,24 @@
+{
+  "binding": "same source revision",
+  "files": [
+    {
+      "file": "LICENSE-ZLIB",
+      "git_blob": "582ec653390adaf4893b71f3e113a6ac4d392463",
+      "sha256": "7fa429541e55b1509909e058f2d21a37467e4958ec713b357f6e0cf9dc4ee352",
+      "url": "https://raw.githubusercontent.com/etemesi254/zune-image/fa2c767a01d7d9373911d0bf63e0588553d67e0e/LICENSE-ZLIB"
+    },
+    {
+      "file": "LICENSE.md",
+      "git_blob": "4761bfa9a6eb62b4a85927b479294df2fdf1a307",
+      "sha256": "c6dff146a9f31848ac296faa5a08a4253caf2c384c86f906dc99e7fc0a39cc8c",
+      "url": "https://raw.githubusercontent.com/etemesi254/zune-image/fa2c767a01d7d9373911d0bf63e0588553d67e0e/LICENSE.md"
+    }
+  ],
+  "license_payload": "LICENSE-ZLIB contains full Zlib terms; LICENSE.md is an upstream alternative-license notice, not the full Apache/MIT texts.",
+  "license_revision": "fa2c767a01d7d9373911d0bf63e0588553d67e0e",
+  "package": "zune-jpeg",
+  "package_vcs_revision": "fa2c767a01d7d9373911d0bf63e0588553d67e0e",
+  "repository": "https://github.com/etemesi254/zune-image",
+  "schema_version": "gptgrep.license-supplement.v1",
+  "version": "0.4.21"
+}

@@ -1,0 +1,27 @@
+{
+  "binding": "next upstream commit only adds LICENSE; compiled source unchanged",
+  "comparison": {
+    "changed_files": [
+      "LICENSE"
+    ],
+    "commits": 1,
+    "unchanged_source": {
+      "src/lib.rs": "7db09d5a3c2958b2fdcb53f68192e3f3a2d9235b"
+    },
+    "url": "https://github.com/lu-zero/simd_helpers/compare/ca1a2f84aa386d758e98f8a609d990263932fb85...82040194cd05affb060bf94d6f19f82a771d07fb"
+  },
+  "files": [
+    {
+      "file": "LICENSE",
+      "git_blob": "1b7c6aaa5106ef1459ed8c539c06d640e0e0a784",
+      "sha256": "d69f24ad84ec2ade64c0b68bdb31b41170e997b158370342056918329cc9af1e",
+      "url": "https://raw.githubusercontent.com/lu-zero/simd_helpers/82040194cd05affb060bf94d6f19f82a771d07fb/LICENSE"
+    }
+  ],
+  "license_revision": "82040194cd05affb060bf94d6f19f82a771d07fb",
+  "package": "simd_helpers",
+  "package_vcs_revision": "ca1a2f84aa386d758e98f8a609d990263932fb85",
+  "repository": "https://github.com/lu-zero/simd_helpers",
+  "schema_version": "gptgrep.license-supplement.v1",
+  "version": "0.1.0"
+}

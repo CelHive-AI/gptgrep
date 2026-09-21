@@ -1,0 +1,26 @@
+[package]
+name = "gptgrep-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vectorless grep, document trees and Jev reranking for coding agents"
+
+[[bin]]
+name = "gptgrep"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+gptgrep-core = { path = "../gptgrep-core" }
+gptgrep-host = { path = "../gptgrep-host" }
+gptgrep-pageindex = { path = "../gptgrep-pageindex" }
+gptgrep-jev = { path = "../gptgrep-jev" }
+gptgrep-parse = { path = "../gptgrep-parse" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+libc = "0.2"

@@ -1,0 +1,158 @@
+# GPTgrep architecture
+
+GPTgrep gives a reasoning agent fast, inspectable access to local documents. It
+keeps exact retrieval, probabilistic judgments, and model-written synthesis as
+separate operations with separate receipts.
+
+```mermaid
+flowchart TD
+  A[Explicit document root] --> B[Plaintext or LiteParse Rust parser]
+  B --> C[Canonical text, physical pages, layout and bookmarks]
+  C --> D[GPTgrep PageIndex Rust tree and optional merge optimizer]
+  D --> E[Immutable generation: manifest, text, tgrep index]
+  Q[Query] --> F[Native regex or lexical retrieval]
+  E --> F
+  Q --> G[Jev typed document routing and evidence reranking]
+  E --> G
+  F --> H[Fresh source evidence with exact locators]
+  G --> H
+  I[Local Codex host: Luna, max] --> F
+  I --> G
+  I --> J[Tree, catalog and bounded node reads]
+  E --> J
+  H --> I
+  J --> I
+  I --> K[Validated citations and optional summary]
+```
+
+## Module ownership
+
+| Crate/interface | Responsibility | External runtime |
+| --- | --- | --- |
+| `gptgrep-pageindex` | Pure Rust page/section coordinates, heading hierarchy, bookmark composition, structural optimization | None |
+| `gptgrep-parse` | UTF-8 source preservation and source-pinned LiteParse translation | PDFium for native documents; LibreOffice for Office conversion |
+| `gptgrep-index` | Embedded tgrep-core, conservative trigram candidates, exact Rust-regex verification | None; no daemon |
+| `gptgrep-jev` | Choice/Noul/Score Decisions transport, schema validation, bounded inference | Explicit OpenRouter request |
+| `gptgrep-core` | Snapshot publication, source freshness, retrieval composition and evidence contract | Optional Jev only for selected modes |
+| `gptgrep-host` | Bounded local Codex stdio app-server workflow, tool dispatch and final citation validation | Caller-selected Codex installation/account |
+| `gptgrep-cli` | Native argv, JSON, schema and grep presentation | None for local commands |
+| `packages/cli` | Optional incur presentation and discovery wrapper | Node and published incur 0.5.1 |
+
+The host profile defaults are `model = "gpt-5.6-luna"` and
+`model_reasoning_effort = "max"`, as selected for this project. They are local
+helper settings; they do not change the development agent's model. Runtime
+`CODEX_HOME` selects an existing account cell. The program does not read/copy auth
+files, change global profiles, or perform an interactive login.
+
+## Ingestion and snapshot consistency
+
+The corpus root is explicit. Normal ignore rules apply even outside a Git repo;
+hidden entries, Git/runtime/build directories, credential filenames, private keys,
+and symlinked source entries are excluded. Source paths remain inside the corpus.
+Native parsing must cover every physical page. Missing dependencies, extraction
+errors and textless scans with OCR disabled are errors, rather than successful
+empty documents. Empty plaintext is a valid document with no evidence spans.
+
+The writer holds an OS file lock. It creates a unique generation under
+`.gptgrep/generations/`, reads and hashes source bytes, parses, then rechecks the
+source digest. It writes canonical text and a typed source manifest, builds a
+trigram index, verifies completeness, and atomically publishes `CURRENT.json`.
+A failed build leaves the prior pointer unchanged. Old generations are retained;
+automatic deletion is outside the index operation.
+
+The pointer binds the manifest digest and generation. The manifest binds canonical
+root, document IDs, source/text digests, parser identity, pages and nodes. Readers
+reject duplicate identities, malformed spans/hierarchy and incompatible schemas.
+The index adapter separately binds its file table and candidate text digests.
+These checks detect accidental corruption; an index is not a cryptographically
+authenticated artifact from an unknown third party.
+
+`source_fresh=true` on a hit means its original source bytes matched the recorded
+digest when checked for that retrieval. Selected sources are checked again after
+remote inference. It is not a promise that every filesystem entry has been newly
+discovered. `status` verifies existing indexed documents; `index` discovers added
+files and establishes a new corpus snapshot. Negative searches refer to that
+snapshot and must be interpreted with coverage/stale warnings.
+
+## Retrieval modes
+
+**Regex** uses tgrep's conservative trigram plan followed by matching the same
+regex against original canonical UTF-8 lines. MatchAll plans scan candidates;
+they never mean no hits. Unicode case folding and UTF-8 BOM handling require
+conservative candidate expansion. Literal queries are escaped before planning.
+The default context is zero, matching grep; callers request more with `-C`.
+
+**Lexical** finds query-token matches using the same index, groups evidence by
+tree node, and orders it by term coverage. This score is a local lexical measure,
+not an embedding distance or calibrated semantic probability.
+
+**Hybrid** retains lexical candidates and adds a separate semantic tree lane.
+Jev first judges bounded document descriptions containing paths, headings and
+opening text. Selected document leaf nodes contribute evidence independently of
+query-token overlap. A second, per-candidate Score pass orders the bounded union.
+**Semantic** uses that tree lane without a lexical seed. Initial routing examines
+at most 32 document descriptions and the final pass at most 24 candidates; this is
+an explicit development budget, not exhaustive semantic search over a large corpus.
+Coverage reports expose the inspected scope and truncation. Hierarchical corpus
+routing and resumable expansion are subsequent scalability work.
+
+Choice scores compare available options, so they are not used as absolute
+relevance. The reranker applies the same concrete Score rubric independently to
+each candidate, normalizes its expected level to 0..1, and retains optional
+confidence. Neither score nor confidence proves truth. An omitted candidate cannot
+be recovered by reranking. No confidence-based abstention threshold is presented
+as calibrated until held-out evaluation establishes it.
+
+The initial explicit relevance floor is 0.5 of the ordered rubric, an operational
+selection policy. In hybrid mode exact atomic-token matches remain available via
+the lexical lane and are marked `literal_anchor`; the model score is not rewritten.
+This avoids allowing an uncertain semantic judgment to erase a proven grep match.
+No-answer cases, literal queries and natural-language questions are separate evals.
+
+Jev uses `/api/alpha/decisions`, a 20-second request deadline, no automatic retry,
+no redirects or provider fallback, at most 64 questions and a 64 KiB payload.
+Malformed, missing, duplicate and mismatched responses fail explicitly. Returned
+model and available usage/cost are retained; unavailable metrics remain null.
+
+## Evidence and programmatic composition
+
+Hits contain source-relative path, node ID, source SHA-256, physical page range,
+line range, exact canonical UTF-8 byte interval, column offset, truncation flag,
+score, citation and freshness. Plaintext byte/line coordinates refer to original
+UTF-8 source. PDF/Office coordinates refer to canonical extracted text plus
+physical source pages. Printed page labels are not substituted for physical pages.
+
+Long snippets are bounded around the match instead of truncating preceding
+context and losing the match. Text byte intervals preserve CRLF and Unicode.
+The core precomputes line offsets once per document and stops formatting after
+the requested regex result count, so output limits also bound presentation work.
+
+The native CLI is the canonical grep interface. Its optional incur wrapper passes
+typed JSON requests to native argv without shell interpolation. MCP, updater and
+skill-sync entry points are rejected before incur dispatch. `--schema` and
+`--llms` expose a small discoverable programmatic contract.
+
+## Local PageIndex-style reasoning
+
+The local host uses Codex's stdio app-server, not a PageIndex cloud account and
+not an MCP server. It exposes a bounded set of GPTgrep evidence operations to the
+model. The caller owns question, root, timeout, tool-call budget and account home.
+Summary and retrieval use actual source evidence; model-produced citations must
+resolve to evidence issued during that run and remain fresh at completion.
+
+Authentication, source retrieval, inference, citation validation and task
+acceptance are separate outcomes. A successful child process is insufficient.
+The host reports actual thread/turn identity, effective model/effort, tool calls,
+usage when supplied, and final validation. These runtime identities remain private
+when results are used in project delivery receipts.
+
+## Flash rewrite boundary
+
+The raw Flash pipeline has substantial character/font/layout repair, multilingual
+heading detection, outline validation, bookmark tiers and optional model passes.
+LiteParse layout is currently an alternate geometry front end. The Rust tree and
+merge stages carry explicit source mappings and tests; identical JSON shape alone
+does not establish algorithm parity. Local Codex summaries and reasoning replace
+the corresponding agentic service role, while Flash extraction parity remains a
+separate stage-by-stage differential evaluation. See the source research and
+crate notices for implemented stages and remaining differences.

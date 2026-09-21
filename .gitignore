@@ -1,0 +1,17 @@
+# aicatlog local runtime
+.env
+.env.*
+!.env.example
+.cache/
+.local/
+workspace/runs/
+workspace/handoff/
+workspace/tasks/artifacts/
+target/
+node_modules/
+dist/
+.gptgrep/
+*.bundle
+.DS_Store
+__pycache__/
+*.pyc

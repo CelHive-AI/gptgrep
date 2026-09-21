@@ -1,0 +1,14 @@
+{
+  "schema_version": "aicatlog.harness.v1",
+  "resources": "resource-manifest.json",
+  "workspaces": {
+    "issues": "workspace/issues",
+    "tasks": "workspace/tasks",
+    "plans": "workspace/exec-plans",
+    "evidence": "workspace/tasks/artifacts",
+    "handoff": "workspace/handoff",
+    "runs": "workspace/runs"
+  },
+  "record_format": "JSON metadata first line and focused plain text",
+  "optional_integrations": []
+}

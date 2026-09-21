@@ -1,0 +1,21 @@
+{
+  "name": "@gptgrep/cli",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "description": "Optional incur interface for the native GPTgrep binary",
+  "license": "MIT",
+  "bin": {
+    "gptgrep-ai": "src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "incur": "0.5.1"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.24.0"
+}

@@ -1,0 +1,19 @@
+[package]
+name = "gptgrep-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Verified trigram retrieval over GPTgrep document generations"
+publish = false
+
+[dependencies]
+anyhow = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tgrep-core = { git = "https://github.com/microsoft/tgrep", rev = "239711cfb6e69e8780cabf912a8987162a223ff1" }
+
+[dev-dependencies]
+tempfile = "3"

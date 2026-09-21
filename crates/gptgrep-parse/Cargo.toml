@@ -1,0 +1,17 @@
+[package]
+name = "gptgrep-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native plaintext and LiteParse document ingestion for GPTgrep"
+
+[dependencies]
+anyhow = "1"
+gptgrep-pageindex = { path = "../gptgrep-pageindex" }
+liteparse = { git = "https://github.com/run-llama/liteparse", rev = "a7105d3e3cfaf001970578c6615f6e71015aa483", default-features = false }
+tokio = { version = "1", features = ["rt", "fs", "time", "process", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

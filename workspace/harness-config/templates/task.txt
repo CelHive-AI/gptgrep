@@ -1,0 +1,16 @@
+{"schema_version":"aicatlog.task.v1","id":"replace-with-task-id","kind":"template","record_kind":"task","status":"planned","owner":"replace-with-owner"}
+
+Objective
+Replace with the useful result.
+
+Acceptance
+Replace with observable completion criteria.
+
+Sources
+List the actual authority and source references.
+
+Evidence
+List artifacts only after they exist.
+
+Next action
+State one concrete continuation step.

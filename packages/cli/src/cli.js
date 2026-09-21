@@ -1,0 +1,134 @@
+#!/usr/bin/env node
+import { Cli, z } from 'incur'
+
+import { runNative } from './native.js'
+
+const argv = process.argv.slice(2)
+// incur has built-in MCP/update routes; guard them at our executable boundary.
+// Reject those entry points before invoking it; never export a fetch handler.
+if (argv.some((value) => ['--mcp', 'mcp', 'skills', '--update', '--incur-update-check'].includes(value))) {
+  process.stderr.write('gptgrep-ai supports local CLI execution only; MCP, skill sync and wrapper updates are disabled.\n')
+  process.exit(2)
+}
+
+const root = z.string().min(1).default('.').describe('Document corpus root')
+const host = {
+  codexBin: z.string().min(1).default('codex'),
+  codexHome: z.string().min(1).optional().describe('Existing account home; native CODEX_HOME default applies when omitted'),
+  model: z.string().min(1).max(128).default('gpt-5.6-luna'),
+  reasoningEffort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']).default('max'),
+  timeout: z.number().int().min(1).max(900).default(180),
+  maxToolCalls: z.number().int().min(1).max(64).default(12),
+}
+const requests = {
+  search: z.object({
+    query: z.string().describe('Literal or regex query; JSON preserves flag-like text'),
+    root,
+    mode: z.enum(['regex', 'lexical', 'hybrid', 'semantic']).default('regex'),
+    limit: z.number().int().min(1).max(1000).default(20),
+    context: z.number().int().min(0).max(100).default(0),
+    minScore: z.number().min(0).max(1).default(0.5).describe('Jev relevance rubric floor; not calibrated confidence'),
+    ignoreCase: z.boolean().default(false),
+    fixedStrings: z.boolean().default(false),
+  }).strict(),
+  index: z.object({ root, optimizeMerge: z.boolean().default(false) }).strict(),
+  tree: z.object({
+    file: z.string().min(1).describe('Source document path'),
+    root,
+  }).strict(),
+  status: z.object({ root }).strict(),
+  doctor: z.object({}).strict(),
+  ask: z.object({
+    question: z.string().min(1).max(8192),
+    root,
+    ...host,
+  }).strict(),
+  summarize: z.object({
+    nodeId: z.string().min(1).describe('Verified DOCUMENT_ID:NODE_ID from native search/tree output'),
+    root,
+    ...host,
+  }).strict(),
+}
+
+const descriptions = {
+  search: 'Search the current document generation using the native Rust engine.',
+  index: 'Parse and index a document corpus with the native Rust pipeline.',
+  tree: 'Read the indexed section tree for one source document.',
+  status: 'Inspect the current document generation.',
+  doctor: 'Inspect native GPTgrep availability and configuration.',
+  ask: 'Run an explicit bounded retrieval workflow through the local Codex host.',
+  summarize: 'Summarize one verified node through the local Codex host.',
+}
+
+const hostArguments = (r) => [
+  `--codex-bin=${r.codexBin}`, `--model=${r.model}`, `--reasoning-effort=${r.reasoningEffort}`,
+  '--timeout', String(r.timeout), '--max-tool-calls', String(r.maxToolCalls),
+  ...(r.codexHome === undefined ? [] : [`--codex-home=${r.codexHome}`]),
+]
+const argumentsFor = {
+  search: (r) => ['search', '--mode', r.mode, '--limit', String(r.limit), '--context', String(r.context), '--min-score', String(r.minScore),
+    ...(r.ignoreCase ? ['--ignore-case'] : []), ...(r.fixedStrings ? ['--fixed-strings'] : []),
+    '--json', '--', r.query, r.root],
+  index: (r) => ['index', ...(r.optimizeMerge ? ['--optimize-merge'] : []), '--json', '--', r.root],
+  tree: (r) => ['tree', `--root=${r.root}`, '--json', '--', r.file],
+  status: (r) => ['status', '--json', '--', r.root],
+  doctor: () => ['doctor', '--json'],
+  ask: (r) => ['ask', ...hostArguments(r), '--json', '--', r.question, r.root],
+  summarize: (r) => ['summarize', `--root=${r.root}`, ...hostArguments(r), '--json', '--', r.nodeId],
+}
+
+const cli = Cli.create('gptgrep-ai', {
+  version: '0.1.0-alpha.1',
+  description: 'Optional schema and formatting interface for native GPTgrep',
+  format: 'json',
+  config: false,
+  sync: false,
+  update: false,
+})
+
+for (const [name, schema] of Object.entries(requests)) {
+  cli.command(name, {
+    description: descriptions[name],
+    mcp: false,
+    env: z.object({
+      GPTGREP_BIN: z.string().default('gptgrep').describe('Native executable path; never downloaded implicitly'),
+    }),
+    options: z.object({
+      request: z.string().default('{}').describe(`JSON request object. Inspect with gptgrep-ai request-schema ${name} --json.`),
+    }),
+    output: z.record(z.string(), z.unknown()).describe('Native GPTgrep JSON response, preserved as structured data'),
+    async run(c) {
+      let request
+      try {
+        request = schema.parse(JSON.parse(c.options.request))
+      } catch (error) {
+        return c.error({ code: 'INVALID_REQUEST', message: error.message })
+      }
+      try {
+        const timeout = name === 'ask' || name === 'summarize' ? (request.timeout + 10) * 1000 : undefined
+        return await runNative(argumentsFor[name](request), c.env.GPTGREP_BIN, timeout)
+      } catch (error) {
+        return c.error({ code: 'NATIVE_ERROR', message: error.message })
+      }
+    },
+  })
+}
+
+cli.command('request-schema', {
+  description: 'Return JSON Schema for the request object accepted by a command.',
+  mcp: false,
+  args: z.object({ command: z.enum(['search', 'index', 'tree', 'status', 'doctor', 'ask', 'summarize']) }),
+  output: z.record(z.string(), z.unknown()),
+  run(c) {
+    return z.toJSONSchema(requests[c.args.command])
+  },
+})
+
+const help = argv.length === 0 || argv.includes('--help') || argv.includes('-h')
+await cli.serve(argv, {
+  // Published incur 0.5.1 still advertises disabled integration routes. Keep its
+  // generated help accurate for this guarded wrapper, without changing JSON.
+  stdout: (value) => process.stdout.write(help
+    ? value.split('\n').filter((line) => !/^  (?:mcp|skills|--mcp|--update)(?:\s|$)/.test(line)).join('\n')
+    : value),
+})
