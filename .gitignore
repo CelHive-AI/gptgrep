@@ -16,3 +16,5 @@ dist/
 __pycache__/
 *.pyc
 docs/research/
+workspace/exec-plans/
+workspace/issues/

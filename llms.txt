@@ -3,7 +3,8 @@
 - [Project authority](AGENTS.md): implementation, verification, review and delivery.
 - [Product specification](SPEC.md): interfaces, initial release and long-horizon research goal.
 - [Goal contract](workspace/harness-config/goal-contract.json): live PageIndex comparison gates; a preview release alone does not meet them.
-- [Current research gaps](workspace/issues/research-gaps.json): source-backed failures and next experiments.
+- Local research gaps: `workspace/issues/research-gaps.json` (ignored and untracked).
+- Local execution plans: `workspace/exec-plans/` (ignored and untracked).
 - [Architecture](docs/architecture.md): parsing, trees, trigram filtering, Jev and the local Codex host.
 - Local research entry: `docs/research/README.md` (ignored and untracked).
 - [Flash stage coverage](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md): verified port stages, LiteParse alternatives and pending parity.

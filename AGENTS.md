@@ -17,6 +17,7 @@ Keep credentials in the process environment; never commit credentials or private
 Public artifacts must not contain private session identities or machine paths.
 Private evidence and exact native provenance belong under .local/ or workspace/handoff/.
 Keep docs/research/ local-only, ignored and untracked; preserve its files locally.
+Keep workspace/exec-plans/ and workspace/issues/ local-only, ignored and untracked too.
 Every completed code round requires a commit and verified refs/notes/commits PoUW.
 Back up Git history and notes to a local verified bundle under .local/backups/;
 push source and tags to the authorized origin when release checks pass. Do not push
