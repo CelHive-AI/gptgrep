@@ -77,7 +77,8 @@ jobs:
       - name: Build native CLI
         run: cargo build --locked -p gptgrep-cli
       - name: Install locked offline evaluator dependencies
-        run: python -m pip install --only-binary=:all: -r evals/requirements.lock
+        run: |
+          python -m pip install --only-binary=:all: -r evals/requirements.lock
       - name: Offline evaluation and oracle
         shell: bash
         run: |
