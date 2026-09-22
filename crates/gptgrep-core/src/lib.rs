@@ -71,6 +71,15 @@ pub struct IndexReport {
     pub tree_profile: String,
 }
 
+/// Coverage of one excerpt within its node, not cumulative coverage across reads.
+/// Unread counts are node bytes outside this excerpt; prior reads may cover them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCoverage {
+    pub complete: bool,
+    pub unread_before_bytes: usize,
+    pub unread_after_bytes: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
     pub path: String,
@@ -91,6 +100,9 @@ pub struct Hit {
     pub node_offset: Option<usize>,
     /// First unread byte relative to the node, or None at EOF/outside the node.
     pub next_offset: Option<usize>,
+    /// None when the excerpt is not contained in one verified node interval.
+    #[serde(default)]
+    pub node_coverage: Option<NodeCoverage>,
     pub column_start: usize,
     pub coordinate_system: String,
     pub text: String,
@@ -1001,6 +1013,11 @@ fn hit_from_bytes(
     let node_offset = contained.map(|(start, _)| byte_start - start);
     let next_offset =
         contained.and_then(|(start, end)| (byte_end < end).then_some(byte_end - start));
+    let node_coverage = contained.map(|(start, end)| NodeCoverage {
+        complete: byte_start == start && byte_end == end,
+        unread_before_bytes: byte_start - start,
+        unread_after_bytes: end - byte_end,
+    });
     let page_start = doc
         .pages
         .iter()
@@ -1031,6 +1048,7 @@ fn hit_from_bytes(
         byte_end,
         node_offset,
         next_offset,
+        node_coverage,
         column_start: byte_start - lines[start - 1].0 + 1,
         coordinate_system: if plaintext {
             "source_lines"
@@ -2479,6 +2497,7 @@ mod tests {
             )?;
             assert_eq!(replay.text, hit.text);
             assert_eq!(replay.citation, hit.citation);
+            assert_eq!(replay.node_coverage, hit.node_coverage);
             assert_eq!(
                 (replay.byte_start, replay.byte_end),
                 (hit.byte_start, hit.byte_end)
@@ -2587,6 +2606,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_coverage_distinguishes_unclipped_windows_from_complete_nodes() -> Result<()> {
+        for ending in ["\n", "\r\n"] {
+            for width in [1, 7] {
+                for (before, after, file) in [
+                    (0, 0, "single-fact.txt"),
+                    (0, 37, "invented-ledger.txt"),
+                    (17, 21, "renamed-orbit.txt"),
+                    (61, 0, "云灯.txt"),
+                ] {
+                    let directory = tempfile::tempdir()?;
+                    let filler = format!("{}{ending}", "moss 文🙂 ".repeat(width));
+                    let fact = "COPPER_OTTER stores 83 glass beads.";
+                    let source = format!(
+                        "{}{fact}{}{}",
+                        filler.repeat(before),
+                        if after == 0 { "" } else { ending },
+                        filler.repeat(after)
+                    );
+                    fs::write(directory.path().join(file), &source)?;
+                    index(directory.path(), 10).await?;
+                    for mode in ["regex", "lexical"] {
+                        let report = search(
+                            directory.path(),
+                            "COPPER_OTTER",
+                            &SearchOptions {
+                                mode: mode.into(),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                        assert_eq!(report.hits.len(), 1);
+                        assert_eq!(report.metrics.jev_calls_attempted, 0);
+                        assert_eq!(report.metrics.jev_requests, 0);
+                        let hit = &report.hits[0];
+                        assert!(hit.text.contains(fact));
+                        assert!(hit.text.len() < 4096);
+                        assert!(!hit.text_truncated);
+                        assert_eq!(hit.text, source[hit.byte_start..hit.byte_end]);
+                        assert_eq!(hit.score, 1.0);
+                        assert_eq!(hit.literal_anchor, mode == "lexical");
+                        assert!(hit.source_fresh);
+                        let expected = NodeCoverage {
+                            complete: before == 0 && after == 0,
+                            unread_before_bytes: hit.byte_start,
+                            unread_after_bytes: source.len() - hit.byte_end,
+                        };
+                        assert_eq!(hit.node_coverage, Some(expected));
+                        assert_eq!(hit.node_offset, Some(expected.unread_before_bytes));
+                        if after == 0 {
+                            assert_eq!(expected.unread_before_bytes > 0, before > 0);
+                            assert_eq!(expected.unread_after_bytes, 0);
+                            assert_eq!(hit.next_offset, None);
+                        } else {
+                            assert!(expected.unread_after_bytes > 0);
+                            assert_eq!(hit.next_offset, Some(hit.byte_end));
+                        }
+                        let mut serialized = serde_json::to_value(hit)?;
+                        assert_eq!(serialized["node_coverage"], serde_json::to_value(expected)?);
+                        let roundtrip: Hit = serde_json::from_value(serialized.clone())?;
+                        assert_eq!(roundtrip.node_coverage, hit.node_coverage);
+                        serialized.as_object_mut().unwrap().remove("node_coverage");
+                        let legacy: Hit = serde_json::from_value(serialized)?;
+                        assert_eq!(legacy.node_coverage, None);
+                        let replay = read_node_window(
+                            directory.path(),
+                            &hit.node_id,
+                            hit.text.len(),
+                            hit.node_offset.unwrap(),
+                        )?;
+                        assert_eq!(replay.text, hit.text);
+                        assert_eq!(replay.citation, hit.citation);
+                        assert_eq!(replay.node_coverage, hit.node_coverage);
+                        let full = read_node(directory.path(), &hit.node_id, 65536)?;
+                        assert_eq!(full.text, source);
+                        assert_eq!(full.next_offset, None);
+                        assert_eq!(
+                            full.node_coverage,
+                            Some(NodeCoverage {
+                                complete: true,
+                                unread_before_bytes: 0,
+                                unread_after_bytes: 0,
+                            })
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn continuation_reconstructs_headingless_text_larger_than_64kib() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let source = format!("{}final 文🙂\r\n", "alpha 文🙂\r\n".repeat(9000));
@@ -2606,6 +2716,14 @@ mod tests {
             assert_eq!(window.byte_start, offset);
             assert_eq!(window.byte_end, offset + window.text.len());
             assert_eq!(window.text, source[window.byte_start..window.byte_end]);
+            assert_eq!(
+                window.node_coverage,
+                Some(NodeCoverage {
+                    complete: false,
+                    unread_before_bytes: offset,
+                    unread_after_bytes: source.len() - window.byte_end,
+                })
+            );
             assert_eq!(
                 window.line_start,
                 source[..window.byte_start]
@@ -2641,6 +2759,14 @@ mod tests {
         let eof = read_node_window(directory.path(), &id, 4, source.len())?;
         assert_eq!(eof.node_offset, Some(source.len()));
         assert_eq!(eof.next_offset, None);
+        assert_eq!(
+            eof.node_coverage,
+            Some(NodeCoverage {
+                complete: false,
+                unread_before_bytes: source.len(),
+                unread_after_bytes: 0,
+            })
+        );
         assert!(eof.text.is_empty());
         assert_eq!((eof.byte_start, eof.byte_end), (source.len(), source.len()));
         assert_eq!(eof.line_start, source.lines().count());
@@ -2661,6 +2787,14 @@ mod tests {
         assert_eq!(full.node_offset, Some(0));
         assert_eq!(full.next_offset, None);
         assert!(!full.text_truncated);
+        assert_eq!(
+            full.node_coverage,
+            Some(NodeCoverage {
+                complete: true,
+                unread_before_bytes: 0,
+                unread_after_bytes: 0,
+            })
+        );
         let mut combined = String::new();
         let mut offset = 0;
         loop {
@@ -2721,6 +2855,14 @@ mod tests {
             assert_eq!(window.text.len(), 1);
             assert_eq!(window.node_offset, Some(offset));
             assert_eq!(window.next_offset, (offset < 3).then_some(offset + 1));
+            assert_eq!(
+                window.node_coverage,
+                Some(NodeCoverage {
+                    complete: false,
+                    unread_before_bytes: offset,
+                    unread_after_bytes: 3 - offset,
+                })
+            );
             output.push_str(&window.text);
         }
         assert_eq!(output, "\r\n\r\n");
@@ -2760,11 +2902,21 @@ mod tests {
         assert_eq!(context.text, source.trim_end_matches('\n'));
         assert_eq!(context.node_offset, None);
         assert_eq!(context.next_offset, None);
+        assert_eq!(context.node_coverage, None);
+        assert!(serde_json::to_value(context)?["node_coverage"].is_null());
         let direct = search(directory.path(), "needle", &regex_options()).await?;
         let hit = &direct.hits[0];
         let node_start = source.find("## Nested").unwrap();
         assert_eq!(hit.node_offset, Some(hit.byte_start - node_start));
         assert_eq!(hit.next_offset, Some(hit.byte_end - node_start));
+        assert_eq!(
+            hit.node_coverage,
+            Some(NodeCoverage {
+                complete: false,
+                unread_before_bytes: "## Nested\n".len(),
+                unread_after_bytes: "\n".len(),
+            })
+        );
         let replay = read_node_window(
             directory.path(),
             &hit.node_id,

@@ -1,6 +1,6 @@
 use crate::jev_accounting::Accounting;
 use anyhow::{Result, anyhow, ensure};
-use gptgrep_core::{Hit, SearchOptions};
+use gptgrep_core::{Hit, NodeCoverage, SearchOptions};
 use gptgrep_jev::JevClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -46,6 +46,9 @@ pub struct Citation {
     pub byte_end: usize,
     pub node_offset: usize,
     pub next_offset: Option<usize>,
+    /// Coverage of this issued excerpt only; prior reads may cover other bytes.
+    #[serde(default)]
+    pub node_coverage: Option<NodeCoverage>,
     pub column_start: usize,
     pub coordinate_system: String,
     pub text_truncated: bool,
@@ -638,6 +641,7 @@ impl Evidence {
             byte_end: hit.byte_end,
             node_offset,
             next_offset: hit.next_offset,
+            node_coverage: hit.node_coverage,
             column_start: hit.column_start,
             coordinate_system: hit.coordinate_system.clone(),
             text_truncated: hit.text_truncated,
@@ -772,6 +776,7 @@ pub(crate) fn hash(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn tools() -> Value {
+    let coverage = "Each excerpt's node_coverage describes that window only, not prior reads: complete means it covers the entire node; unread_before_bytes and unread_after_bytes count node bytes outside this excerpt. null means the excerpt is not contained in one verified node. text_truncated=false does not imply complete node coverage.";
     let specs = [
         (
             "gptgrep_catalog",
@@ -792,7 +797,7 @@ pub(crate) fn tools() -> Value {
         (
             "gptgrep_read",
             format!(
-                "Read a node_id returned by tree/search. Omit max_bytes for {READ_DEFAULT}; max_bytes must be 1..{MAX_TEXT_BYTES}. offset_bytes defaults to 0. Continue with offset_bytes=next_offset until next_offset is null; preserve the same node_id. Offsets count canonical node UTF-8 bytes, not characters. If tool_output_limit occurs, retry the same offset with fewer bytes."
+                "Read a node_id returned by tree/search. Omit max_bytes for {READ_DEFAULT}; max_bytes must be 1..{MAX_TEXT_BYTES}. offset_bytes defaults to 0. Continue with offset_bytes=next_offset until next_offset is null; preserve the same node_id. Offsets count canonical node UTF-8 bytes, not characters. EOF can leave a prefix outside this excerpt; prior reads may already cover it. If tool_output_limit occurs, retry the same offset with fewer bytes. {coverage}"
             ),
             json!({"node_id":{"type":"string","description":"Exact node_id returned by gptgrep_tree or gptgrep_search, or the selected summary node."},"max_bytes":{"type":"integer","minimum":1,"maximum":MAX_TEXT_BYTES,"default":READ_DEFAULT,"description":format!("UTF-8 excerpt byte budget: 1..{MAX_TEXT_BYTES}, default {READ_DEFAULT}. Values such as 10000 are invalid; omit this argument for the default.")},"offset_bytes":{"type":"integer","minimum":0,"default":0,"description":"Byte offset relative to this node's canonical text; default 0. For continuation use the returned next_offset exactly. To expand a search hit, its node_offset identifies that excerpt's start. Must be a UTF-8 boundary. A null next_offset means EOF."}}),
             vec!["node_id"],
@@ -800,7 +805,7 @@ pub(crate) fn tools() -> Value {
         (
             "gptgrep_search",
             format!(
-                "Search with Jev document routing and evidence reranking. Default mode=hybrid; semantic omits the lexical lane. Regex/lexical are explicit local refinements after the host's mandatory initial Jev pass. limit must be 1..{SEARCH_MAX}, default {SEARCH_MAX}. For more evidence, reformulate the query or inspect/read the document tree."
+                "Search with Jev document routing and evidence reranking. Default mode=hybrid; semantic omits the lexical lane. Regex/lexical are explicit local refinements after the host's mandatory initial Jev pass. limit must be 1..{SEARCH_MAX}, default {SEARCH_MAX}. For more evidence, reformulate the query or inspect/read the document tree. {coverage}"
             ),
             json!({"query":{"type":"string","minLength":1,"maxLength":2048,"description":"Runtime search question, words or regex, 1..2048 UTF-8 bytes."},"mode":{"type":"string","enum":["hybrid","semantic","regex","lexical"],"default":"hybrid","description":"hybrid (default): lexical candidates plus Jev routing/reranking. semantic: Jev semantic lane. regex or lexical: explicit local refinement after required initial Jev work."},"document":{"type":"string","description":"Optional exact relative document path from the current catalog. Omission keeps the caller's scope. This cannot widen or replace a caller-supplied document scope."},"limit":{"type":"integer","minimum":1,"maximum":SEARCH_MAX,"default":SEARCH_MAX,"description":format!("Result count: 1..{SEARCH_MAX}, default {SEARCH_MAX}. This bounded evidence tool does not accept larger result counts.")}}),
             vec!["query"],

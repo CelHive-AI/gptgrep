@@ -329,6 +329,15 @@ async fn node_read_continuation_preserves_markdown_unicode_and_crlf_bytes() {
         let start = hit["byte_start"].as_u64().unwrap() as usize;
         let end = hit["byte_end"].as_u64().unwrap() as usize;
         assert_eq!(&source[start..end], text);
+        assert_eq!(
+            hit["node_coverage"],
+            json!({"complete":false,"unread_before_bytes":offset,"unread_after_bytes":source.len()-end})
+        );
+        let receipt = evidence.receipts.last().unwrap();
+        assert_eq!(
+            serde_json::to_value(receipt.evidence[0].node_coverage).unwrap(),
+            hit["node_coverage"]
+        );
         reconstructed.push_str(text);
         windows += 1;
         assert!(windows < 100);
@@ -347,6 +356,11 @@ async fn node_read_continuation_preserves_markdown_unicode_and_crlf_bytes() {
     assert_eq!(citations.len(), windows);
     assert!(citations.last().unwrap().node_offset > 6144);
     assert_eq!(citations.last().unwrap().next_offset, None);
+    assert!(
+        citations
+            .iter()
+            .all(|citation| !citation.node_coverage.unwrap().complete)
+    );
     let eof = evidence
         .call(
             "eof",
@@ -360,6 +374,10 @@ async fn node_read_continuation_preserves_markdown_unicode_and_crlf_bytes() {
         serde_json::from_str(eof["contentItems"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(value["evidence"]["text"], "");
     assert!(value["next_offset"].is_null());
+    assert_eq!(
+        value["evidence"]["node_coverage"],
+        json!({"complete":false,"unread_before_bytes":source.len(),"unread_after_bytes":0})
+    );
     assert!(evidence.receipts.last().unwrap().evidence.is_empty());
     let inside_scalar = source.find('文').unwrap() + 1;
     let invalid = evidence
@@ -402,6 +420,10 @@ async fn final_citation_replays_a_late_window_past_the_old_prefix_caps() {
     let value: Value =
         serde_json::from_str(reply["contentItems"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(value["evidence"]["text"], &source[offset..]);
+    assert_eq!(
+        value["evidence"]["node_coverage"],
+        json!({"complete":false,"unread_before_bytes":offset,"unread_after_bytes":0})
+    );
     let final_answer =
         json!({"answer":"Retained for 37 days.","citations":[id],"insufficient_evidence":false})
             .to_string();
@@ -409,6 +431,11 @@ async fn final_citation_replays_a_late_window_past_the_old_prefix_caps() {
     assert_eq!(citations.len(), 1);
     assert_eq!(citations[0].node_offset, offset);
     assert_eq!(citations[0].byte_start, offset);
+    assert_eq!(citations[0].byte_end, source.len());
+    assert_eq!(
+        serde_json::to_value(citations[0].node_coverage).unwrap(),
+        value["evidence"]["node_coverage"]
+    );
     assert_eq!(
         citations[0].excerpt_sha256,
         crate::retrieval::hash(&source.as_bytes()[offset..])
@@ -455,6 +482,101 @@ async fn search_evidence_keeps_a_replayable_node_relative_cursor() {
         citations[0].excerpt_sha256,
         crate::retrieval::hash(hit["text"].as_str().unwrap().as_bytes())
     );
+}
+
+#[tokio::test]
+async fn unclipped_search_node_coverage_survives_payload_and_citation_serialization() {
+    let root = tempfile::tempdir().unwrap();
+    let source = format!(
+        "{}COPPER_OTTER stores 83 glass beads.\r\n{}",
+        "quiet 文🙂\r\n".repeat(23),
+        "blue moss remains still.\r\n".repeat(41)
+    );
+    std::fs::write(root.path().join("invented-record.txt"), &source).unwrap();
+    gptgrep_core::index(root.path(), 10).await.unwrap();
+    for mode in ["regex", "lexical"] {
+        let mut evidence = Evidence::open(root.path(), None).unwrap();
+        let reply = evidence
+            .call(
+                "search",
+                "gptgrep_search",
+                json!({"query":"COPPER_OTTER","mode":mode,"limit":1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["success"], true, "{reply}");
+        assert!(serde_json::to_vec(&reply).unwrap().len() <= crate::retrieval::MAX_TOOL_BYTES);
+        let value: Value =
+            serde_json::from_str(reply["contentItems"][0]["text"].as_str().unwrap()).unwrap();
+        let hit = &value["hits"][0];
+        let start = hit["byte_start"].as_u64().unwrap() as usize;
+        let end = hit["byte_end"].as_u64().unwrap() as usize;
+        assert!(start > 0 && end < source.len());
+        assert_eq!(hit["text"], &source[start..end]);
+        assert_eq!(hit["text_truncated"], false);
+        assert_eq!(hit["next_offset"], end);
+        assert_eq!(
+            hit["node_coverage"],
+            json!({"complete":false,"unread_before_bytes":start,"unread_after_bytes":source.len()-end})
+        );
+        assert_eq!(value["metrics"]["jev_calls_attempted"], 0);
+        assert_eq!(value["metrics"]["jev_requests"], 0);
+        let receipt = evidence.receipts.last().unwrap();
+        assert_eq!(receipt.evidence.len(), 1);
+        let mut serialized = serde_json::to_value(&receipt.evidence[0]).unwrap();
+        assert_eq!(serialized["node_coverage"], hit["node_coverage"]);
+        let roundtrip: crate::retrieval::Citation =
+            serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(roundtrip.node_coverage, receipt.evidence[0].node_coverage);
+        serialized.as_object_mut().unwrap().remove("node_coverage");
+        let legacy: crate::retrieval::Citation = serde_json::from_value(serialized).unwrap();
+        assert_eq!(legacy.node_coverage, None);
+        let answer = json!({"answer":"The otter stores glass beads.","citations":[hit["node_id"]],"insufficient_evidence":false}).to_string();
+        let (_, citations, _) = evidence.finish(&answer).unwrap();
+        assert_eq!(citations.len(), 1);
+        assert_eq!(
+            (citations[0].byte_start, citations[0].byte_end),
+            (start, end)
+        );
+        assert_eq!(
+            citations[0].excerpt_sha256,
+            crate::retrieval::hash(&source.as_bytes()[start..end])
+        );
+        assert_eq!(citations[0].node_coverage, roundtrip.node_coverage);
+    }
+}
+
+#[test]
+fn tool_descriptions_expose_window_local_node_coverage_without_new_arguments() {
+    let tools = crate::retrieval::tools();
+    for (name, args) in [
+        ("gptgrep_search", json!({"query":"invented"})),
+        (
+            "gptgrep_read",
+            json!({"node_id":"synthetic:node","offset_bytes":0,"max_bytes":1}),
+        ),
+    ] {
+        let spec = tools[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|spec| spec["name"] == name)
+            .unwrap();
+        assert!(jsonschema::is_valid(&spec["inputSchema"], &args));
+        let description = spec["description"].as_str().unwrap();
+        for field in [
+            "node_coverage",
+            "complete",
+            "unread_before_bytes",
+            "unread_after_bytes",
+        ] {
+            assert!(description.contains(field));
+            assert!(spec["inputSchema"]["properties"].get(field).is_none());
+        }
+        assert!(description.contains("that window only, not prior reads"));
+        assert!(description.contains("null means"));
+        assert!(description.contains("text_truncated=false does not imply"));
+    }
 }
 
 #[tokio::test]
