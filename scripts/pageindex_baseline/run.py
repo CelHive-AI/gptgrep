@@ -26,6 +26,7 @@ import locks
 import profiles
 import cohorts
 import qualification
+from index_admission import audit_index_calls
 from role_hosts import RoleHost
 from capability import answer_evidence, scoring_summary
 
@@ -586,7 +587,7 @@ def execute(args) -> dict:
     rows = [{"source_row": index, **questions[index]} for index in selected]
     filenames = list(dict.fromkeys(row["doc_id"] for row in rows))
     variants = ["raw", "full"] if args.variant == "both" else [args.variant]
-    adapter_files = {name: locks.digest(HERE / name) for name in ("locks.py", "bridge.py", "transports.py", "run.py", "capability.py", "profiles.py", "role_hosts.py", "cohorts.py", "qualification.py")}
+    adapter_files = {name: locks.digest(HERE / name) for name in ("locks.py", "bridge.py", "transports.py", "run.py", "capability.py", "profiles.py", "role_hosts.py", "cohorts.py", "qualification.py", "index_admission.py")}
     binary = args.binary.expanduser().resolve()
     historical_capability = None
     if args.capability_receipt is not None:
@@ -731,8 +732,11 @@ def execute(args) -> dict:
                                         raise ValueError("SDK stored-page coverage differs from source metadata")
                                     if len(host.rejections) != before_rejections:
                                         raise ValueError("Adapter rejected indexing prompts; full index is incomplete")
-                                    if any(call.get("status") != "completed" for call in host.calls[before_calls:]):
-                                        raise ValueError("An indexing model invocation failed; preserve its partial work without claiming a complete full index")
+                                    admission = audit_index_calls(run_dir, host.calls[before_calls:], index_host.phase,
+                                                                  profile["roles"]["index"], args.max_input_bytes, plan["host_output_cap"])
+                                    record["index_admission"] = admission
+                                    if not admission["complete"]:
+                                        raise ValueError("Unresolved indexing host invocations; full index is incomplete")
                                     record.update(status="completed", doc_id=doc["doc_id"], name=doc["name"],
                                                   tree_sha256=fingerprint(tree), stored_page_count=len(pages),
                                                   stored_pages_sha256=fingerprint(pages),
