@@ -360,6 +360,7 @@ sleep 30
                 evidence: &mut evidence,
             },
             Some(started + Duration::from_secs(2)),
+            protocol::RunOptions::default(),
         ),
     )
     .await
