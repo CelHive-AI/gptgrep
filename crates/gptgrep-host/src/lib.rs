@@ -1,5 +1,7 @@
 //! Local, ephemeral Codex workflows over source-bound GPTgrep evidence.
+mod codex_error;
 mod completion;
+pub use codex_error::{CodexErrorInfo, HostProtocolError, HostProtocolErrorKind};
 mod process_group;
 mod protocol;
 pub use completion::{
@@ -92,6 +94,7 @@ pub struct HostReport {
     pub effective_reasoning_effort: Option<String>,
     pub requested_service_tier: String,
     pub effective_service_tier: Option<String>,
+    pub server_retry_notifications: usize,
     pub answer: String,
     pub citations: Vec<Citation>,
     pub tool_calls: Vec<ToolReceipt>,
@@ -196,6 +199,7 @@ async fn execute_with_client(
         effective_reasoning_effort: result.effort,
         requested_service_tier: config.service_tier.clone(),
         effective_service_tier: result.service_tier,
+        server_retry_notifications: result.server_retry_notifications,
         answer,
         citations,
         tool_calls: evidence.receipts.clone(),
@@ -219,6 +223,8 @@ async fn execute_with_client(
                 .is_some()
             {
                 "host_jev_search_failed".to_owned()
+            } else if let Some(protocol) = error.downcast_ref::<HostProtocolError>() {
+                protocol.code().to_owned()
             } else if error.to_string().starts_with("host_") {
                 error.to_string()
             } else {
@@ -227,6 +233,11 @@ async fn execute_with_client(
             let cause = error
                 .downcast_ref::<gptgrep_core::JevSearchError>()
                 .and_then(|error| serde_json::to_value(error).ok())
+                .or_else(|| {
+                    error
+                        .downcast_ref::<HostProtocolError>()
+                        .and_then(|error| serde_json::to_value(error).ok())
+                })
                 .or_else(|| {
                     error
                         .downcast_ref::<jev_accounting::InitializationError>()

@@ -17,6 +17,62 @@ import jsonschema
 
 INPUT_CAP = 256 * 1024
 OUTPUT_CAP = 128 * 1024
+PROTOCOL_ERROR_KINDS = {"terminal_error", "malformed_error", "identity_mismatch", "failed_turn",
+                        "interrupted_turn", "invalid_turn_status"}
+CODEX_ERROR_INFOS = {"contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded", "rateLimitExceeded",
+                     "serverOverloaded", "cyberPolicy", "misalignmentPolicyViolation", "httpConnectionFailed",
+                     "responseStreamConnectionFailed", "internalServerError", "unauthorized", "badRequest",
+                     "threadRollbackFailed", "sandboxError", "responseStreamDisconnected",
+                     "responseTooManyFailedAttempts", "activeTurnNotSteerable", "other"}
+
+
+def _unsigned(value) -> bool:
+    return type(value) is int and 0 <= value <= 2 ** 64 - 1
+
+
+def _observed_usage(value):
+    """Project known numeric token observations; missing or invalid is not zero."""
+    if not isinstance(value, dict):
+        return None
+    result = {}
+    for scope in ("total", "last"):
+        tokens = value.get(scope)
+        if isinstance(tokens, dict):
+            selected = {field: tokens[field] for field in ("totalTokens", "inputTokens", "cachedInputTokens",
+                        "cacheWriteInputTokens", "outputTokens", "reasoningOutputTokens")
+                        if _unsigned(tokens.get(field))}
+            if selected:
+                result[scope] = selected
+    for field in ("modelContextWindow", "total_tokens", "input_tokens", "cached_input_tokens",
+                  "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens"):
+        if _unsigned(value.get(field)):
+            result[field] = value[field]
+    return result or None
+
+
+def _retain_accounting(receipt: dict, report: dict) -> None:
+    receipt["usage"] = _observed_usage(report.get("usage"))
+    protocol = report.get("host_protocol")
+    if isinstance(protocol, dict):
+        # A failed protocol envelope never establishes complete accounting.
+        selected = {"accounting_complete": False, "usage": _observed_usage(protocol.get("usage"))}
+        for field, allowed in (("kind", PROTOCOL_ERROR_KINDS), ("codex_error_info", CODEX_ERROR_INFOS)):
+            value = protocol.get(field)
+            if isinstance(value, str) and value in allowed:
+                selected[field] = value
+            elif value is None:
+                selected[field] = None
+        retry = protocol.get("will_retry")
+        selected["will_retry"] = retry if type(retry) is bool else None
+        status = protocol.get("http_status_code")
+        selected["http_status_code"] = status if type(status) is int and 100 <= status <= 599 else None
+        if _unsigned(protocol.get("server_retry_notifications")):
+            selected["server_retry_notifications"] = protocol["server_retry_notifications"]
+        receipt["host_protocol"] = selected
+        if receipt["usage"] is None:
+            receipt["usage"] = selected["usage"]
+    if _unsigned(report.get("server_retry_notifications")):
+        receipt["server_retry_notifications"] = report["server_retry_notifications"]
 
 
 class AdapterError(RuntimeError):
@@ -150,7 +206,8 @@ class LocalCodex:
                 receipt["response_sha256"] = hashlib.sha256(raw).hexdigest()
                 try:
                     report = json.loads(raw)
-                    receipt["usage"] = report.get("usage") if isinstance(report, dict) else None
+                    if isinstance(report, dict):
+                        _retain_accounting(receipt, report)
                 except (ValueError, UnicodeDecodeError):
                     pass
             self._append({**receipt, "status": "interrupted", "error_code": "interrupted_before_receipt",
@@ -245,7 +302,8 @@ class LocalCodex:
         if not isinstance(report, dict):
             raise AdapterError("invalid_host_json", "Host response must be an object", 401)
         # Retain observed usage even when later status, identity or schema checks fail.
-        receipt.update(usage=report.get("usage"), model=report.get("model"), model_provider=report.get("model_provider"),
+        _retain_accounting(receipt, report)
+        receipt.update(model=report.get("model"), model_provider=report.get("model_provider"),
                        thread_id=report.get("thread_id"), turn_id=report.get("turn_id"),
                        effective_reasoning_effort=report.get("effective_reasoning_effort"),
                        reported_host_elapsed_ms=report.get("elapsed_ms"),
@@ -415,7 +473,7 @@ class LocalCodex:
                     raise AdapterError("output_limit", "Completion value exceeds128KiB")
                 receipt.update(status="completed", model=report["model"], model_provider=report.get("model_provider"),
                                thread_id=report.get("thread_id"), turn_id=report.get("turn_id"),
-                               usage=report.get("usage"), effective_reasoning_effort=report.get("effective_reasoning_effort"),
+                               effective_reasoning_effort=report.get("effective_reasoning_effort"),
                                reported_host_elapsed_ms=report.get("elapsed_ms"),
                                response_sha256=hashlib.sha256(process.stdout).hexdigest(), value_sha256=sha(value))
             except BaseException as error:

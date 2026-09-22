@@ -514,6 +514,10 @@ async fn main() {
                             error.downcast_ref::<gptgrep_host::HostRetrievalError>()
                         {
                             partial.code.as_str()
+                        } else if let Some(protocol) =
+                            error.downcast_ref::<gptgrep_host::HostProtocolError>()
+                        {
+                            protocol.code()
                         } else if error.is::<gptgrep_core::JevSearchError>() {
                             "jev_search_failed"
                         } else if error.is::<gptgrep_host::HostCapabilityError>() {
@@ -528,6 +532,9 @@ async fn main() {
                 }
                 if let Some(partial) = error.downcast_ref::<gptgrep_host::HostRetrievalError>() {
                     report["host_retrieval"] = serde_json::to_value(partial).unwrap_or(Value::Null);
+                }
+                if let Some(protocol) = error.downcast_ref::<gptgrep_host::HostProtocolError>() {
+                    report["host_protocol"] = serde_json::to_value(protocol).unwrap_or(Value::Null);
                 }
                 let _ = emit(&report);
             } else {

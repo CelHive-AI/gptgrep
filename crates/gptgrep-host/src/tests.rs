@@ -1,6 +1,8 @@
 use super::*;
 #[path = "mandatory_tests.rs"]
 mod mandatory;
+#[path = "protocol_error_tests.rs"]
+mod protocol_errors;
 use crate::{protocol, retrieval::Evidence};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
 
@@ -234,14 +236,18 @@ exec sleep 60
     let config = HostConfig {
         codex_bin: executable.to_string_lossy().into_owned(),
         codex_home: home.path().to_owned(),
-        timeout_secs: 1,
+        // Allow bounded process startup under parallel compiler/test load. The
+        // production timeout remains active from the original start instant.
+        timeout_secs: 5,
         ..HostConfig::default()
     };
-    let error = complete_json("Return an empty object.", json!({}), json!({}), &config)
-        .await
-        .unwrap_err();
+    let (result, ready) = tokio::join!(
+        complete_json("Return an empty object.", json!({}), json!({}), &config),
+        wait_for_live_mock_pid(&pid_file),
+    );
+    let error = result.unwrap_err();
     assert!(error.to_string().contains("time limit"), "{error}");
-    let pid = std::fs::read_to_string(pid_file).unwrap();
+    let pid = ready.expect("owned mock did not become ready before its independent startup limit");
     let status = std::process::Command::new("/bin/kill")
         .args(["-0", pid.trim()])
         .output()
@@ -254,6 +260,26 @@ exec sleep 60
         std::fs::read_to_string(profile).unwrap(),
         "# unchanged test profile\n"
     );
+}
+
+#[cfg(unix)]
+async fn wait_for_live_mock_pid(pid_file: &Path) -> Result<String> {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Ok(value) = std::fs::read_to_string(pid_file)
+                && let Ok(pid) = value.trim().parse::<i32>()
+                && pid > 1
+            {
+                // Signal zero only observes the PID written by this private fixture.
+                if unsafe { libc::kill(pid, 0) } == 0 {
+                    return Ok(value);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("Mock runtime did not publish a live PID within the startup limit"))?
 }
 
 type Reader = BufReader<ReadHalf<DuplexStream>>;
@@ -554,6 +580,7 @@ async fn timeout_terminates_launcher_descendants() {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
     let executable = home.path().join("launcher");
+    let pid_file = home.path().join("descendant.pid");
     std::fs::write(
         &executable,
         r#"#!/bin/sh
@@ -569,14 +596,16 @@ wait "$descendant"
     let config = HostConfig {
         codex_bin: executable.to_string_lossy().into_owned(),
         codex_home: home.path().to_owned(),
-        timeout_secs: 1,
+        timeout_secs: 5,
         ..HostConfig::default()
     };
-    let error = complete_json("Return an empty object.", json!({}), json!({}), &config)
-        .await
-        .unwrap_err();
+    let (result, ready) = tokio::join!(
+        complete_json("Return an empty object.", json!({}), json!({}), &config),
+        wait_for_live_mock_pid(&pid_file),
+    );
+    let error = result.unwrap_err();
     assert!(error.to_string().contains("time limit"), "{error}");
-    let pid = std::fs::read_to_string(home.path().join("descendant.pid")).unwrap();
+    let pid = ready.expect("mock descendant did not become ready before its startup limit");
     let status = std::process::Command::new("/bin/kill")
         .args(["-0", pid.trim()])
         .output()
@@ -906,6 +935,10 @@ async fn mock_model_drives_real_catalog_tree_read_and_checked_citations() {
     let server = tokio::spawn(async move {
         let mut reader = BufReader::new(server_reader);
         handshake(&mut reader, &mut server_writer).await;
+        send(&mut server_writer,json!({"method":"error","params":{
+            "threadId":"thread-native","turnId":"turn-native","willRetry":true,
+            "error":{"message":"private-transient-error","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":502}}}
+        }})).await;
         send(&mut server_writer,json!({"id":99,"method":"unknown/request","params":{"secret":"private-config-sentinel"}})).await;
         assert_eq!(receive(&mut reader).await["error"]["code"], -32601);
         let catalog = call(
@@ -961,6 +994,12 @@ async fn mock_model_drives_real_catalog_tree_read_and_checked_citations() {
     assert_eq!(outcome.model, DEFAULT_MODEL);
     assert_eq!(outcome.effort.as_deref(), Some("max"));
     assert_eq!(outcome.service_tier.as_deref(), Some("priority"));
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("1 transient retry notifications"))
+    );
     assert_eq!(outcome.usage.unwrap()["total"]["totalTokens"], 123);
     assert_eq!(answer, "Records are retained for seven years.");
     assert!(!insufficient);

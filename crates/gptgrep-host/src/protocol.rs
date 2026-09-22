@@ -1,5 +1,7 @@
 use crate::{
-    HostConfig, final_schema,
+    HostConfig, HostProtocolError, HostProtocolErrorKind,
+    codex_error::ParsedError,
+    final_schema,
     retrieval::{self, Evidence},
 };
 use anyhow::{Result, anyhow, ensure};
@@ -17,6 +19,7 @@ pub(crate) struct Outcome {
     pub provider: String,
     pub effort: Option<String>,
     pub service_tier: Option<String>,
+    pub server_retry_notifications: usize,
     pub answer: String,
     pub usage: Option<Value>,
     pub warnings: Vec<String>,
@@ -272,10 +275,21 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     let mut turn_id = None;
     let mut answer = None;
     let mut usage = None;
+    let mut server_retry_notifications = 0;
     let mut calls = BTreeSet::new();
     loop {
         let message = rpc.receive().await?;
         let method = message["method"].as_str();
+        if method == Some("error") && message.get("id").is_some() {
+            return Err(HostProtocolError::new(
+                HostProtocolErrorKind::MalformedError,
+                &ParsedError::parse(&message["params"]["error"]),
+                message["params"]["willRetry"].as_bool(),
+                server_retry_notifications,
+                usage.as_ref(),
+            )
+            .into());
+        }
         if let (Some(method), Some(id)) = (method, message.get("id")) {
             if method != "item/tool/call" {
                 rpc.deny(id.clone()).await?;
@@ -358,13 +372,37 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 usage = message["params"].get("tokenUsage").cloned();
             }
             Some("turn/completed") => {
-                same_thread(&message, &thread_id)?;
                 let turn = &message["params"]["turn"];
-                bind_turn(&mut turn_id, &turn["id"])?;
-                ensure!(
-                    turn["status"] == "completed",
-                    "Codex turn did not complete successfully"
-                );
+                let parsed = ParsedError::parse(&turn["error"]);
+                let failure = |kind| {
+                    HostProtocolError::new(
+                        kind,
+                        &parsed,
+                        None,
+                        server_retry_notifications,
+                        usage.as_ref(),
+                    )
+                };
+                if same_thread(&message, &thread_id).is_err()
+                    || bind_turn(&mut turn_id, &turn["id"]).is_err()
+                {
+                    return Err(failure(HostProtocolErrorKind::IdentityMismatch).into());
+                }
+                match turn["status"].as_str() {
+                    Some("completed") if turn["error"].is_null() => {}
+                    Some("failed") => {
+                        let kind = if turn["error"].is_null() || parsed.valid {
+                            HostProtocolErrorKind::FailedTurn
+                        } else {
+                            HostProtocolErrorKind::MalformedError
+                        };
+                        return Err(failure(kind).into());
+                    }
+                    Some("interrupted") => {
+                        return Err(failure(HostProtocolErrorKind::InterruptedTurn).into());
+                    }
+                    _ => return Err(failure(HostProtocolErrorKind::InvalidTurnStatus).into()),
+                }
                 if let Some(items) = turn["items"].as_array() {
                     for item in items {
                         validate_item(item)?;
@@ -383,9 +421,39 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 }
                 break;
             }
-            Some("error") => return Err(anyhow!("Codex reported a turn error")),
+            Some("error") => {
+                let params = &message["params"];
+                let parsed = ParsedError::parse(&params["error"]);
+                let will_retry = params["willRetry"].as_bool();
+                let failure = |kind| {
+                    HostProtocolError::new(
+                        kind,
+                        &parsed,
+                        will_retry,
+                        server_retry_notifications,
+                        usage.as_ref(),
+                    )
+                };
+                if same_thread(&message, &thread_id).is_err()
+                    || bind_turn(&mut turn_id, &params["turnId"]).is_err()
+                {
+                    return Err(failure(HostProtocolErrorKind::IdentityMismatch).into());
+                }
+                if !parsed.valid || will_retry.is_none() {
+                    return Err(failure(HostProtocolErrorKind::MalformedError).into());
+                }
+                if will_retry == Some(false) {
+                    return Err(failure(HostProtocolErrorKind::TerminalError).into());
+                }
+                // The app-server owns this recovery. Continue the same turn under the
+                // outer timeout_at deadline and existing frame/message limits.
+                server_retry_notifications += 1;
+            }
             _ => {}
         }
+    }
+    if server_retry_notifications > 0 {
+        warnings.push(format!("Codex reported {server_retry_notifications} transient retry notifications during this turn. This counts server events, not physical or billed requests."));
     }
     Ok(Outcome {
         thread_id,
@@ -394,6 +462,7 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         provider,
         effort,
         service_tier,
+        server_retry_notifications,
         answer: answer.ok_or_else(|| anyhow!("Codex completed without a final answer"))?,
         usage,
         warnings,

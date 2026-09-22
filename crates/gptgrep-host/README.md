@@ -32,7 +32,9 @@ Before provider work, the host creates a private, create-new ledger under `.gptg
 
 The ledger preserves completed routing usage if reranking fails or is cancelled. Interrupted workflows leave incomplete records. `HostRetrievalError` is serializable and contains `code`, `stage`, `generation`, `ledger_path`, `jev`, projected `receipts`, optional sanitized core `cause`, and `elapsed_ms`. Later Codex or citation failures retain already incurred Jev observations and remain errors. These records and native identities are private runtime evidence, not public release artifacts.
 
-`HostConfig.trace_path` optionally adds a separate bounded method/ID/tool-name-only protocol trace. On Unix, cleanup targets a freshly created owned process group, including launcher descendants, and reaps its leader.
+`HostConfig.trace_path` optionally adds a separate bounded protocol trace containing method, ID, and tool-name metadata. Error events add only a whitelisted Codex error variant, boolean `will_retry`, and a valid numeric HTTP status when present. Error messages, additional details, source payloads, and credentials are never copied into traces or failures. On Unix, cleanup targets a freshly created owned process group, including launcher descendants, and reaps its leader.
+
+An identity-bound `error` notification with explicit `willRetry: true` keeps the same turn running under the original host deadline and protocol limits. The app-server owns that recovery; GPTgrep starts no replacement turn, performs no independent retry, and does not reset the timeout. Missing or malformed retry flags, foreign or missing identities, terminal errors, and failed turn completion remain failures. `HostProtocolError` exposes a typed `kind`, optional whitelisted `codex_error_info`, `will_retry`, valid `http_status_code`, and already-observed numeric token `usage`. Failed workflows retain `accounting_complete: false`; missing usage stays null. Retrieval preserves this object in `HostRetrievalError.cause`. Success reports and typed failures expose `server_retry_notifications`, which counts server events, not physical or billed provider requests.
 
 ## Independent JSON completion
 

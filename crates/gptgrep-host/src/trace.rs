@@ -60,13 +60,23 @@ impl Trace {
             .get("id")
             .filter(|id| id.is_u64() || label(id).is_some())
             .cloned();
+        let error = match message["method"].as_str() {
+            Some("error") => Some(crate::codex_error::ParsedError::parse(&params["error"])),
+            Some("turn/completed") if params["turn"]["status"] == "failed" => Some(
+                crate::codex_error::ParsedError::parse(&params["turn"]["error"]),
+            ),
+            _ => None,
+        };
         let entry = json!({
             "direction":direction,"method":label(&message["method"]),"id":id,
             "thread_id":label(&params["threadId"]).or_else(||label(&message["result"]["thread"]["id"])),
             "turn_id":label(&params["turnId"]).or_else(||label(&params["turn"]["id"])).or_else(||label(&message["result"]["turn"]["id"])),
             "tool":label(&params["tool"]).or_else(||label(&params["item"]["tool"])),
             "namespace":label(&params["namespace"]).or_else(||label(&params["item"]["namespace"])),
-            "advertised_tools":tools
+            "advertised_tools":tools,
+            "codex_error_info":error.as_ref().and_then(|error|error.info),
+            "will_retry":if message["method"] == "error" { params["willRetry"].as_bool() } else { None },
+            "http_status_code":error.and_then(|error|error.http_status_code)
         });
         let mut line = serde_json::to_vec(&entry)?;
         line.push(b'\n');
