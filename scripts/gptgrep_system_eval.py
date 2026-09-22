@@ -15,7 +15,9 @@ import statistics
 import subprocess
 import sys
 import time
+import uuid
 import jsonschema
+from threading import Lock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts/pageindex_baseline"))
@@ -24,7 +26,7 @@ import profiles
 import cohorts
 from bridge import AdapterError, LocalCodex, json_bytes, owned_process
 from role_hosts import RoleHost
-from run import checkpoint_attempt, fingerprint, judge_constants, private_directory, write_json
+from run import checkpoint_attempt, fingerprint, judge_constants, private_directory, run_case_pool, task_concurrency_report, write_json
 
 
 def ask_arguments(binary: Path, root: Path, row: dict, args) -> list[str]:
@@ -101,7 +103,9 @@ def native_metrics(report: dict, doc_id: str, gold_pages: set[int]) -> dict:
         if tool.get("success") is not True:
             continue
         for evidence in tool.get("evidence", []):
-            if evidence.get("path") == doc_id and type(evidence.get("page_start")) is int and type(evidence.get("page_end")) is int:
+            if (evidence.get("path") == doc_id and type(evidence.get("page_start")) is int and type(evidence.get("page_end")) is int
+                    and type(evidence.get("byte_start")) is int and type(evidence.get("byte_end")) is int
+                    and evidence["byte_end"] > evidence["byte_start"]):
                 pages.update(range(evidence["page_start"], evidence["page_end"] + 1))
     jev = jev_receipt(report)
     initial = jev.get("initial_status") if jev else None
@@ -121,6 +125,7 @@ def native_metrics(report: dict, doc_id: str, gold_pages: set[int]) -> dict:
         "invalid_argument_errors": sum(tool.get("error_code") == "invalid_arguments" for tool in tools)
             if any("error_code" in tool for tool in tools) else None,
         "accessed_physical_pages": sorted(pages), "page_access_recall": len(pages & gold_pages) / len(gold_pages) if gold_pages else None,
+        "page_access_semantics": "Physical pages touched by delivered nonempty byte windows; not full-page coverage or semantic entailment",
         "citation_count": len(cited), "citation_validation_completed": successful,
         "cited_target_pages": sorted({page for citation in cited if citation.get("path") == doc_id
                                      for page in range(citation.get("page_start", 1), citation.get("page_end", 0) + 1)}),
@@ -135,24 +140,18 @@ def native_metrics(report: dict, doc_id: str, gold_pages: set[int]) -> dict:
     }
 
 
-def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeout: int) -> tuple[dict, dict]:
-    with shared._lock:
-        if len(shared.calls) >= shared.max_calls:
-            raise AdapterError("call_budget", "Global native-host invocation budget exhausted")
-        number = len(shared.calls) + 1
-        request_path = shared.run_dir / "calls" / f"{number:05d}.request.json"
-        response_path = shared.run_dir / "calls" / f"{number:05d}.response.json"
-        with request_path.open("xb") as output:
-            output.write(json_bytes(payload))
-        receipt = {"ordinal": number, "phase": payload["phase"], "operation": "native_ask",
-                   "requested_model": payload["model"], "requested_effort": payload["reasoning_effort"],
-                   "requested_service_tier": payload["service_tier"],
-                   "request_sha256": locks.digest(request_path), "host_invoked": True}
-        shared.start_attempt(receipt)
-        started = time.perf_counter()
+def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeout: int,
+                  on_reserved=None) -> tuple[dict, dict]:
+    with shared.external_attempt(payload, phase=payload["phase"], model=payload["model"],
+                                 effort=payload["reasoning_effort"], service_tier=payload["service_tier"],
+                                 role="chat", operation="native_ask") as attempt:
+        receipt = attempt.receipt
+        if on_reserved is not None:
+            on_reserved(receipt)
+        response_path = shared.run_dir / "calls" / f"{receipt['ordinal']:05d}.response.json"
         report = {}
         try:
-            process = owned_process(arguments, shared.run_dir, timeout)
+            process = attempt.run(arguments, timeout=timeout)
             if len(process.stdout) > 4 * 1024 * 1024:
                 raise ValueError("Native report exceeded4MiB")
             with response_path.open("xb") as output:
@@ -181,12 +180,10 @@ def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeo
             receipt.update(status="failed", error=str(error), error_code=getattr(error, "code", report.get("code", type(error).__name__)))
             if hasattr(error, "cleanup"):
                 receipt["timeout_cleanup"] = error.cleanup
-        receipt["elapsed_ms"] = (time.perf_counter() - started) * 1000
-        shared._append(receipt)
-        return report, receipt
+    return report, shared.call_by_ordinal(receipt["ordinal"])
 
 
-def ledger_recovery(path: Path) -> dict:
+def ledger_recovery(path: Path, *, generation=None, query_sha256=None, document=None) -> dict:
     """Retain cumulative latest-per-search evidence when the final CLI JSON is absent."""
     data = path.read_bytes()
     if len(data) > 4 * 1024 * 1024:
@@ -204,12 +201,25 @@ def ledger_recovery(path: Path) -> dict:
         if not isinstance(event, dict) or event.get("schema_version") != "gptgrep.jev-attempt.v1":
             raise ValueError("Native Jev ledger schema differs")
         events.append(event)
+    if generation is not None and any(event.get("generation") != generation for event in events):
+        raise ValueError("Native ledger generation differs from the case snapshot")
     searches = {}
     for event in events:
         search = event.get("search")
         if isinstance(search, dict) and isinstance(search.get("search_id"), str):
             searches[search["search_id"]] = search
     last = events[-1] if events else {}
+    initial = [search for search in searches.values() if search.get("required_initial") is True]
+    identity_verified = query_sha256 is None
+    if query_sha256 is not None:
+        if len(initial) == 1:
+            if initial[0].get("query_sha256") != query_sha256 or initial[0].get("document_scope") != document:
+                raise ValueError("Native ledger query/document scope differs from its owning case")
+            identity_verified = True
+        elif last.get("attempted_calls", 0):
+            raise ValueError("Native ledger has model attempts without a unique initial query binding")
+        if any(search.get("document_scope") != document or search.get("generation") not in (None, generation) for search in searches.values()):
+            raise ValueError("Native ledger later search scope/generation differs from its owning case")
     usage, models = [], []
     for search in searches.values():
         metrics = search.get("metrics", {})
@@ -221,10 +231,104 @@ def ledger_recovery(path: Path) -> dict:
            "requests": last.get("requests"), "attempted_calls": last.get("attempted_calls"),
            "unobserved_attempts": last.get("unobserved_attempts"),
            "models": sorted(set(models)), "usage": usage, "searches": list(searches.values()),
-           "accounting_complete": bool(not torn and last.get("event") == "completed" and last.get("accounting_complete") is True)}
+           "accounting_complete": bool(identity_verified and not torn and last.get("event") == "completed" and last.get("accounting_complete") is True)}
     return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
             "complete_events": len(events), "torn_trailing_record": torn,
-            "terminal_event": last.get("event"), "source": "durable_host_ledger", "jev": jev}
+            "terminal_event": last.get("event"), "source": "durable_host_ledger", "case_identity_verified": identity_verified, "jev": jev}
+
+
+def owned_ledger_paths(corpus: Path, receipt: dict, prior_names=(), *, not_before_unix_ns=None) -> list[Path]:
+    """A concurrent reader may inspect only its exact owned native process ledger."""
+    pid = receipt.get("host_pid")
+    if type(pid) is not int or pid <= 0 or type(not_before_unix_ns) is not int:
+        return []
+    prior = set(prior_names)
+    return sorted(path for path in (corpus / ".gptgrep/host-attempts").glob(f"attempt-*-{pid}-*.jsonl")
+                  if path.name not in prior and re.fullmatch(rf"attempt-\d+-{pid}-\d+\.jsonl", path.name)
+                  and int(path.name.split("-")[1]) >= not_before_unix_ns
+                  and int(path.name.split("-")[1]) <= receipt.get("process_finished_unix_ns", 2**128))
+
+
+def retained_reader_start(case_dir: Path, case: dict, shared: LocalCodex, payload: dict, identity: str) -> dict:
+    attempt_dir = case_dir / "reader-attempts" / f"{case['reader_attempt']:04d}"
+    path = attempt_dir / "start.json"
+    if path.exists():
+        start = locks.read_json(path)
+        if start.get("case_identity") != identity:
+            raise ValueError("Retained reader start identity differs")
+        return start
+    claimed = {locks.read_json(saved).get("host_ordinal") for saved in (case_dir / "reader-attempts").glob("*/start.json")}
+    orphan = [call for call in shared.calls_for_phase(payload["phase"]) if call["ordinal"] not in claimed]
+    if len(orphan) > 1:
+        raise ValueError("Ambiguous retained reader reservation; refuse a replacement")
+    if not orphan:
+        return {"host_ordinal": None, "case_identity": identity, "prior_ledgers": []}
+    call = orphan[0]
+    if call.get("request_sha256") != hashlib.sha256(json_bytes(payload)).hexdigest():
+        raise ValueError("Retained reader reservation payload differs")
+    start = {"host_ordinal": call["ordinal"], "case_identity": identity, "prior_ledgers": [], "recovered_reservation": True}
+    write_json(path, start)
+    return start
+
+
+def bounded_stage(items: list, concurrency: int, function, shared: LocalCodex, run_dir: Path, name: str) -> list:
+    started = time.perf_counter()
+    started_ns = time.time_ns()
+    execution_id = uuid.uuid4().hex
+    stage_path = run_dir / f"stage-{name}.json"
+    checkpoint_attempt(stage_path, {"stage": name, "execution_id": execution_id, "status": "started",
+                                   "configured_task_concurrency": concurrency, "selected_tasks": len(items),
+                                   "started_unix_ns": started_ns, "wall_ms": None})
+    task_records, intervals = [], []
+    mutex = Lock()
+    role = "reader" if name == "readers" else "judge"
+    status = "completed"
+    def measured(item):
+        row = item if role == "reader" else item[0]
+        phase = f"{'answer' if role == 'reader' else 'judge'}:native:row-{row['source_row']}"
+        before = {call["ordinal"] for call in shared.calls_for_phase(phase)}
+        result = None
+        try:
+            result = function(item)
+            return result
+        finally:
+            after = {call["ordinal"] for call in shared.calls_for_phase(phase)}
+            state = (result.get("status") if role == "reader" else result.get("judge", {}).get("status", "not_run")) if result is not None else "interrupted"
+            record = {"source_row": row["source_row"], "status": state, "new_final_receipts": len(after - before),
+                      "returned_case": result is not None, "reused_completed": state == "completed" and after == before}
+            with mutex:
+                task_records.append(record)
+    try:
+        return run_case_pool(items, measured, concurrency, shared, role, intervals)
+    except BaseException:
+        status = "interrupted"
+        raise
+    finally:
+        checkpoint_attempt(stage_path, {
+            "stage": name, "execution_id": execution_id, "status": status, "configured_task_concurrency": concurrency,
+            "selected_tasks": len(items), "completed_task_results": sum(row["returned_case"] for row in task_records),
+            "not_started_tasks": len(items) - len(task_records), "reused_completed_tasks": sum(row["reused_completed"] for row in task_records),
+            "tasks_with_new_receipts": sum(row["new_final_receipts"] > 0 for row in task_records),
+            "interrupted_tasks": sum(row["status"] == "interrupted" for row in task_records),
+            "tasks": sorted(task_records, key=lambda row: row["source_row"]),
+            "task_intervals": intervals, "task_concurrency": task_concurrency_report(intervals),
+            "started_unix_ns": started_ns, "finished_unix_ns": time.time_ns(),
+            "wall_ms": (time.perf_counter() - started) * 1000,
+        })
+
+
+def stage_history(run_dir: Path) -> dict:
+    executions = {}
+    for path in sorted((run_dir / "attempts").glob("stage-*/*.json")):
+        record = locks.read_json(path)
+        executions[record["execution_id"]] = record
+    records = list(executions.values())
+    known = [record["wall_ms"] for record in records if isinstance(record.get("wall_ms"), (float, int))]
+    missing = len(records) - len(known)
+    return {"executions": records, "known_active_stage_wall_ms_subtotal": math.fsum(known),
+            "missing_stage_durations": missing, "active_stage_wall_ms": math.fsum(known) if missing == 0 else None,
+            "latest_invocation_is_not_automatically_cold": True,
+            "task_concurrency": task_concurrency_report([interval for record in records for interval in record.get("task_intervals", [])])}
 
 
 def summarize(cases: list[dict], expected: int) -> dict:
@@ -268,6 +372,11 @@ def compare_reports(native: dict, baseline: dict) -> dict:
     for role in ("chat", "judge"):
         if native.get("profile", {}).get("roles", {}).get(role) != baseline.get("profile", {}).get("roles", {}).get(role):
             reasons.append(f"Different {role} profile")
+    for role in ("reader", "judge"):
+        if native.get("host_concurrency_by_role", {}).get(role) != baseline.get("host_concurrency_by_role", {}).get(role):
+            reasons.append(f"Different {role} concurrency")
+    if native.get("qa_stage_strategy") != baseline.get("qa_stage_strategy"):
+        reasons.append("Different reader/judge stage strategy")
     if not native.get("known_document_scope") or not baseline.get("known_document_scope"):
         reasons.append("Known-document protocol scope is not established for both")
     baselines = baseline.get("answers", [])
@@ -290,6 +399,7 @@ def compare_reports(native: dict, baseline: dict) -> dict:
             "g5_pass": None, "universal_winner": None,
             "limits": ["Fresh-host SDK versus persistent native-reader overhead differs",
                        "Baseline citation fidelity may be unavailable; do not substitute zero",
+                       "Native page access touches byte windows; baseline page tools return whole pages",
                        "Paired quality, grounding, build work and model usage require joint interpretation"]}
 
 
@@ -345,9 +455,9 @@ def completed_host_response(ordinal: int, request: dict, model: str, effort: str
     """Reconcile durable outcomes before deciding whether a call may be retried."""
     if type(ordinal) is not int or ordinal < 1:
         raise ValueError("Invalid retained host ordinal")
-    if ordinal > len(shared.calls):
+    call = shared.call_by_ordinal(ordinal)
+    if call is None:
         return None
-    call = shared.calls[ordinal - 1]
     request_path, response_path = (shared.run_dir / "calls" / f"{ordinal:05d}.{kind}.json" for kind in ("request", "response"))
     expected = hashlib.sha256(json_bytes(request)).hexdigest()
     if call.get("ordinal") != ordinal or call.get("request_sha256") != expected or locks.digest(request_path) != expected:
@@ -392,7 +502,7 @@ def validate_cached_reader(case: dict, row: dict, args, run_dir: Path, shared: L
                            corpus: Path, source_hashes: dict, canonical: dict, generation: dict) -> dict:
     receipt = case["host_receipt"]
     ordinal = receipt["ordinal"]
-    if type(ordinal) is not int or not 1 <= ordinal <= len(shared.calls) or shared.calls[ordinal - 1] != receipt:
+    if type(ordinal) is not int or ordinal < 1 or shared.call_by_ordinal(ordinal) != receipt:
         raise ValueError("Cached reader receipt differs from the cumulative host ledger")
     payload = reader_payload(row, args)
     completed = completed_host_response(ordinal, payload, args.model, args.reasoning_effort, payload["phase"], shared, args.service_tier)
@@ -428,7 +538,7 @@ def recover_judge(ordinal: int, prompt: str, constants: dict, host: RoleHost) ->
 
 def validate_cached_judge(judge: dict, prompt: str, constants: dict, host: RoleHost) -> None:
     ordinal = judge.get("host_ordinal")
-    if type(ordinal) is not int or not 1 <= ordinal <= len(host.calls):
+    if type(ordinal) is not int or ordinal < 1 or host.shared.call_by_ordinal(ordinal) is None:
         raise ValueError("Cached judge has no cumulative host receipt")
     completed = recover_judge(ordinal, prompt, constants, host)
     if completed is None:
@@ -538,6 +648,8 @@ def execute(args) -> dict:
     profile = profiles.resolve(args)
     profile["roles"]["index"] = {"engine": "deterministic_native", "model": None, "reasoning_effort": None, "service_tier": None}
     profile["index_effort_note"] = "Native build is deterministic; no Jev or generative indexing stage is claimed."
+    if not 1 <= args.reader_concurrency <= 64 or not 1 <= args.judge_concurrency <= 64:
+        raise ValueError("Reader/judge concurrency must be1..64")
     binary = args.binary.expanduser().resolve()
     judge_binary = (args.judge_binary or args.binary).expanduser().resolve()
     benchmark, upstream = args.benchmark.expanduser().resolve(), args.upstream.expanduser().resolve()
@@ -552,13 +664,15 @@ def execute(args) -> dict:
     private_directory(run_dir)
     corpus = run_dir / "corpus"
     manifest = {
-        "schema_version": "gptgrep.system-eval.v2", "variant": "gptgrep-native-jev",
+        "schema_version": "gptgrep.system-eval.v3", "variant": "gptgrep-native-jev",
         "profile": profile, "source_rows": indices, "question_count": len(rows), "document_count": len(names),
         "cohort_manifest_sha256": cohort_sha,
         "question_sha256": fingerprint(rows), "source_hashes": {name: locks.digest(benchmark / "documents" / name) for name in names},
         "binary_sha256": locks.digest(binary), "judge_binary_sha256": locks.digest(judge_binary),
         "source_and_dependencies": verified, "known_document_scope": True,
         "max_host_invocations": args.max_model_calls, "host_timeout_secs": args.timeout,
+        "host_concurrency_by_role": {"reader": args.reader_concurrency, "judge": args.judge_concurrency},
+        "qa_stage_strategy": "readers_then_judges",
         "host_input_cap": args.max_input_bytes, "build_timeout_secs": args.build_timeout,
         "service_tier": args.service_tier,
         "effective_tier_basis": "Codex thread/start acknowledgement; not independent provider billing confirmation",
@@ -586,8 +700,8 @@ def execute(args) -> dict:
         materialize_corpus(benchmark / "documents", corpus, manifest["source_hashes"])
         shared = LocalCodex(judge_binary, args.codex_bin, args.codex_home.expanduser().resolve(), run_dir,
                             args.max_model_calls, args.timeout, args.model, args.reasoning_effort, args.max_input_bytes,
-                            service_tier=args.service_tier)
-        judge_host = RoleHost(shared, "judge", profile["roles"]["judge"])
+                            service_tier=args.service_tier, reader_concurrency=args.reader_concurrency,
+                            judge_concurrency=args.judge_concurrency)
         build_path = run_dir / "build.json"
         build = locks.read_json(build_path) if build_path.exists() else {"status": "not_built"}
         if build["status"] != "completed" and (build["status"] == "not_built" or args.retry_failed):
@@ -617,8 +731,7 @@ def execute(args) -> dict:
             raise ValueError("Cached native generation changed; never rebuild beneath saved citations")
         canonical = native_snapshot(corpus, manifest["source_hashes"]) if build_ok else {}
         constants = judge_constants(judge_source)
-        cases = []
-        for row in rows:
+        def read_case(row):
             case_dir = run_dir / "cases" / f"{row['source_row']:03d}"
             case_dir.mkdir(parents=True, exist_ok=True)
             case_path = case_dir / "case.json"
@@ -629,19 +742,15 @@ def execute(args) -> dict:
                 raise ValueError("Cached native case inputs differ")
             if case["status"] != "completed" and case.get("reader_attempt") is not None:
                 attempt_dir = case_dir / "reader-attempts" / f"{case['reader_attempt']:04d}"
-                start = locks.read_json(attempt_dir / "start.json")
-                if start.get("case_identity") != identity:
-                    raise ValueError("Retained reader start identity differs")
                 payload = reader_payload(row, args)
+                start = retained_reader_start(case_dir, case, shared, payload, identity)
                 accounting_path = attempt_dir / "accounting.json"
                 accounting = locks.read_json(accounting_path) if accounting_path.exists() else {}
                 never_started = accounting.get("host_started") is False
                 if never_started:
-                    if accounting.get("ordinal") is not None or accounting.get("planned_ordinal") != start["host_ordinal"]:
+                    if accounting.get("ordinal") is not None or start["host_ordinal"] is not None:
                         raise ValueError("Retained no-invocation marker differs")
-                    if start["host_ordinal"] <= len(shared.calls) and shared.calls[start["host_ordinal"] - 1].get("phase") == payload["phase"]:
-                        raise ValueError("Retained no-invocation marker contradicts an actual reader receipt")
-                completed = None if never_started else completed_host_response(
+                completed = None if start["host_ordinal"] is None else completed_host_response(
                     start["host_ordinal"], payload, args.model, args.reasoning_effort, payload["phase"], shared, args.service_tier)
                 if completed is not None:
                     if not build_ok:
@@ -662,23 +771,26 @@ def execute(args) -> dict:
                         write_json(accounting_path, {"ordinal": receipt["ordinal"], "jev": jev_receipt(saved_report)})
                     case = recovered_case
                     checkpoint_attempt(case_path, case)
-            if case["status"] in ("started", "validating"):
+            if case["status"] in ("queued", "started", "validating"):
                 # The previous owner ended without a final case checkpoint. Keep
                 # that attempt and its uncertain usage; do not replay it implicitly.
                 attempt_dir = case_dir / "reader-attempts" / f"{case['reader_attempt']:04d}"
-                start = locks.read_json(attempt_dir / "start.json")
+                start = retained_reader_start(case_dir, case, shared, reader_payload(row, args), identity)
                 accounting_path = attempt_dir / "accounting.json"
                 if not accounting_path.exists():
-                    if start["host_ordinal"] > len(shared.calls):
+                    if start["host_ordinal"] is None:
                         # The case checkpoint preceded request creation. No native
                         # process can have started without that durable request.
-                        write_json(accounting_path, {"ordinal": None, "planned_ordinal": start["host_ordinal"], "host_started": False, "jev": None})
+                        write_json(accounting_path, {"ordinal": None, "host_started": False, "jev": None})
                     else:
-                        paths = set((corpus / ".gptgrep/host-attempts").glob("*.jsonl"))
-                        fresh = sorted(path for path in paths if path.name not in start["prior_ledgers"])
+                        receipt = shared.call_by_ordinal(start["host_ordinal"]) or {}
+                        fresh = owned_ledger_paths(corpus, receipt, start["prior_ledgers"],
+                                                   not_before_unix_ns=start.get("reservation_observed_unix_ns"))
                         try:
                             recovery_path = attempt_dir / "ledger-recovery.json"
-                            recovered = locks.read_json(recovery_path) if recovery_path.exists() else [ledger_recovery(path) for path in fresh]
+                            recovered = locks.read_json(recovery_path) if recovery_path.exists() else [ledger_recovery(
+                                path, generation=build["generation_binding"]["generation"],
+                                query_sha256=hashlib.sha256(row["question"].encode()).hexdigest(), document=row["doc_id"]) for path in fresh]
                             if not recovery_path.exists():
                                 write_json(recovery_path, recovered)
                             write_json(accounting_path, {"ordinal": start["host_ordinal"],
@@ -697,29 +809,32 @@ def execute(args) -> dict:
                 report = validate_cached_reader(case, row, args, run_dir, shared, corpus,
                                                 manifest["source_hashes"], canonical, build["generation_binding"])
             elif can_retry_reader(case, args.retry_failed):
-                if len(shared.calls) >= shared.max_calls:
-                    if case["status"] in ("not_run", "budget_blocked", "build_failed"):
-                        case["status"] = "budget_blocked"
-                    case["retry_budget_blocked"] = True
-                    checkpoint_attempt(case_path, case)
-                    cases.append(case)
-                    continue
+                previous_case = case
                 attempt = int(case.get("reader_attempt", 0)) + 1
                 attempt_dir = case_dir / "reader-attempts" / f"{attempt:04d}"
                 attempt_dir.mkdir(parents=True)
                 ledger_directory = corpus / ".gptgrep/host-attempts"
                 before_ledgers = set(ledger_directory.glob("*.jsonl"))
-                write_json(attempt_dir / "start.json", {"host_ordinal": len(shared.calls) + 1,
-                           "case_identity": identity, "prior_ledgers": sorted(path.name for path in before_ledgers)})
-                case = {**initial, "status": "started", "reader_attempt": attempt}
+                case = {**initial, "status": "queued", "reader_attempt": attempt}
                 checkpoint_attempt(case_path, case)
+                def reserved(receipt):
+                    write_json(attempt_dir / "start.json", {"host_ordinal": receipt["ordinal"],
+                               "case_identity": identity, "reservation_observed_unix_ns": time.time_ns(),
+                               "prior_ledgers": sorted(path.name for path in before_ledgers)})
+                    case.update(status="started")
+                    checkpoint_attempt(case_path, case)
                 try:
-                    report, receipt = invoke_native(shared, ask_arguments(binary, corpus, row, args), reader_payload(row, args), args.timeout + 60)
+                    report, receipt = invoke_native(shared, ask_arguments(binary, corpus, row, args), reader_payload(row, args),
+                                                    args.timeout + 60, on_reserved=reserved)
                     write_json(attempt_dir / "native-response.json", report)
                     case.update(status="validating", elapsed_ms=receipt["elapsed_ms"], host_receipt=receipt,
                                 metrics=native_metrics(report, row["doc_id"], set(json.loads(row["evidence_pages"]))))
                     checkpoint_attempt(case_path, case)
-                    recovered = [ledger_recovery(path) for path in sorted(set(ledger_directory.glob("*.jsonl")) - before_ledgers)]
+                    start = locks.read_json(attempt_dir / "start.json")
+                    recovered = [ledger_recovery(path, generation=build["generation_binding"]["generation"],
+                                 query_sha256=hashlib.sha256(row["question"].encode()).hexdigest(), document=row["doc_id"])
+                                 for path in owned_ledger_paths(corpus, receipt, start["prior_ledgers"],
+                                 not_before_unix_ns=start["reservation_observed_unix_ns"])]
                     write_json(attempt_dir / "ledger-recovery.json", recovered)
                     case["native_attempt_ledgers"] = [{key: value for key, value in item.items() if key != "jev"} for item in recovered]
                     if jev_receipt(report) is None and len(recovered) == 1:
@@ -741,15 +856,32 @@ def execute(args) -> dict:
                     else:
                         case["error"] = receipt.get("error")
                 except Exception as error:
-                    case.update(status="failed", error=str(error), error_code=getattr(error, "code", type(error).__name__))
+                    if getattr(error, "code", None) == "call_budget":
+                        case = {**previous_case, "reader_attempt": attempt, "retry_budget_blocked": True}
+                        if case["status"] in ("not_run", "budget_blocked", "build_failed"):
+                            case["status"] = "budget_blocked"
+                    else:
+                        case.update(status="failed", error=str(error), error_code=getattr(error, "code", type(error).__name__))
                 checkpoint_attempt(case_path, case)
+            return case
+
+        def judge_case(item):
+            row, case = item
+            case_dir = run_dir / "cases" / f"{row['source_row']:03d}"
+            case_path = case_dir / "case.json"
+            judge_host = RoleHost(shared, "judge", profile["roles"]["judge"], phase=f"judge:native:row-{row['source_row']}")
+            report = validate_cached_reader(case, row, args, run_dir, shared, corpus, manifest["source_hashes"], canonical, build["generation_binding"]) if case["status"] == "completed" else None
             if case["status"] == "completed":
                 response = report["answer"]
                 prompt = constants["PROMPT"].format(question=" ".join(row["question"].split()),
                                                    answer=row["answer"], answer_format=row["answer_format"],
                                                    response=response[:constants["MAX_RESPONSE_CHARS"]])
                 judge = case.get("judge", {})
-                judge_host.phase = f"judge:native:row-{row['source_row']}"
+                if judge.get("status") == "queued" and judge.get("host_ordinal") is None:
+                    retained = shared.calls_for_phase(judge_host.phase)
+                    if retained:
+                        judge = {**judge, "host_ordinal": max(call["ordinal"] for call in retained)}
+                        case["judge"] = judge
                 if judge.get("status") != "completed" and judge.get("host_ordinal") is not None:
                     recovered = recover_judge(judge["host_ordinal"], prompt, constants, judge_host)
                     if recovered is not None:
@@ -763,28 +895,55 @@ def execute(args) -> dict:
                 if judge.get("status") == "completed":
                     validate_cached_judge(judge, prompt, constants, judge_host)
                 else:
-                    if judge.get("status") == "started":
+                    if judge.get("status") in ("queued", "started"):
                         case["judge"] = judge = {**judge, "status": "unavailable", "error": "Prior judge attempt was interrupted"}
                         checkpoint_attempt(case_path, case)
                     if not judge or judge.get("status") == "budget_blocked" or args.retry_failed:
-                        if len(shared.calls) >= shared.max_calls:
-                            if not judge or judge.get("status") == "budget_blocked":
-                                case["judge"] = {"status": "budget_blocked"}
-                        else:
-                            judge_host.phase = f"judge:native:row-{row['source_row']}"
-                            case["judge"] = {"status": "started", "host_ordinal": len(shared.calls) + 1}
+                        previous_judge = judge
+                        case["judge"] = {"status": "queued"}
+                        checkpoint_attempt(case_path, case)
+                        def reserved(receipt):
+                            case["judge"] = {"status": "started", "host_ordinal": receipt["ordinal"]}
                             checkpoint_attempt(case_path, case)
-                            try:
-                                verdict, completion_report = judge_host.complete(prompt, {}, constants["SCHEMA"])
-                                case["judge"] = {"status": "completed", **verdict, "model": judge_host.model,
-                                                 "reasoning_effort": judge_host.effort, "host_ordinal": shared.calls[-1]["ordinal"],
-                                                 **service_tier_metadata(judge_host.service_tier, completion_report),
-                                                 "rubric_sha256": fingerprint(constants["PROMPT"]), "schema_sha256": fingerprint(constants["SCHEMA"]),
-                                                 "response_truncated": len(response) > constants["MAX_RESPONSE_CHARS"]}
-                            except Exception as error:
+                        try:
+                            verdict, completion_report = judge_host.complete(prompt, {}, constants["SCHEMA"], on_reserved=reserved)
+                            ordinal = case["judge"]["host_ordinal"]
+                            case["judge"] = {"status": "completed", **verdict, "model": judge_host.model,
+                                             "reasoning_effort": judge_host.effort, "host_ordinal": ordinal,
+                                             **service_tier_metadata(judge_host.service_tier, completion_report),
+                                             "rubric_sha256": fingerprint(constants["PROMPT"]), "schema_sha256": fingerprint(constants["SCHEMA"]),
+                                             "response_truncated": len(response) > constants["MAX_RESPONSE_CHARS"]}
+                        except Exception as error:
+                            if getattr(error, "code", None) == "call_budget":
+                                case["judge"] = {**previous_judge, "retry_budget_blocked": True}
+                                if not previous_judge or previous_judge.get("status") == "budget_blocked":
+                                    case["judge"]["status"] = "budget_blocked"
+                            else:
                                 case["judge"] = {**case["judge"], "status": "unavailable", "error": str(error)}
                         checkpoint_attempt(case_path, case)
-            cases.append(case)
+            return case
+
+        try:
+            readers = bounded_stage(rows, args.reader_concurrency, read_case, shared, run_dir, "readers")
+            cases = bounded_stage(list(zip(rows, readers)), args.judge_concurrency, judge_case, shared, run_dir, "judges")
+        except BaseException as error:
+            # Pools have cancelled and drained owned work before returning here.
+            # Preserve one materialized outcome for every originally selected row.
+            partial = []
+            for row in rows:
+                path = run_dir / "cases" / f"{row['source_row']:03d}" / "case.json"
+                partial.append(locks.read_json(path) if path.exists() else {
+                    "source_row": row["source_row"], "doc_id": row["doc_id"], "status": "not_started"})
+            checkpoint_attempt(run_dir / "interruption.json", {
+                "schema_version": manifest["schema_version"], "status": "interrupted", "error_type": type(error).__name__,
+                "source_rows": indices, "question_denominator": len(rows), "cases": partial,
+                "host_invocations": len(shared.calls), "comparison_eligible": False,
+                "stage_execution_history": stage_history(run_dir),
+                "owned_process_concurrency": shared.concurrency_report(),
+            })
+            raise
+        finally:
+            shared.close(cancel=True)
         if locks.digest(binary) != manifest["binary_sha256"] or locks.digest(judge_binary) != manifest["judge_binary_sha256"]:
             raise ValueError("Executable changed during the evaluation")
         cumulative = cumulative_accounting(shared, run_dir)
@@ -817,6 +976,8 @@ def execute(args) -> dict:
                   "all_host_wall_ms": known_wall if missing_wall == 0 else None,
                   "all_host_wall_ms_known_subtotal": known_wall, "all_host_wall_ms_missing": missing_wall,
                   "host_usage_missing": sum(call.get("usage") is None for call in shared.calls),
+                  "stage_execution_history": stage_history(run_dir),
+                  "owned_process_concurrency": shared.concurrency_report(),
                   "cohorts": {name: summarize([case for case in cases if case["source_row"] in members], len(set(indices) & members))
                               for name, members in groups.items()},
                   "timing_note": "Native ask latency includes Jev and Codex. Fresh-host SDK and persistent native-reader overhead remain distinct.",
@@ -847,6 +1008,8 @@ def main() -> int:
     parser.add_argument("--max-model-calls", type=int, default=0)
     parser.add_argument("--max-input-bytes", type=int, default=262144)
     parser.add_argument("--max-tool-calls", type=int, default=12)
+    parser.add_argument("--reader-concurrency", type=int, default=5)
+    parser.add_argument("--judge-concurrency", type=int, default=5)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--build-timeout", type=int, default=300)
     parser.add_argument("--optimize-merge", action="store_true")
@@ -857,7 +1020,7 @@ def main() -> int:
     try:
         report = execute(args)
     except Exception as error:
-        report = {"schema_version": "gptgrep.system-eval.v2", "status": "failed", "error": str(error)}
+        report = {"schema_version": "gptgrep.system-eval.v3", "status": "failed", "error": str(error)}
     print(json.dumps({key: report.get(key) for key in (
         "schema_version", "status", "variant", "question_count", "document_count", "host_invocations", "summary", "error"
     )}, indent=2))

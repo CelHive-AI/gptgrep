@@ -24,6 +24,13 @@
       "expansion_upstream": 32,
       "host_ceiling": 64,
       "reported_measurement": "observed process overlap; no inferred provider concurrency"
+    },
+    "reader_judge_concurrency": {
+      "reader_ceiling": 5,
+      "judge_ceiling": 5,
+      "strategy": "bounded reader stage followed by bounded independent judge stage",
+      "paired_policy": "Use matching ceilings and stage strategy in both systems; bind changes into new run identities",
+      "accounting": "Include in-flight reservations, failures and interrupted attempts in the shared cap; report measured overlap and actual stage wall time separately"
     }
   },
   "gates": [

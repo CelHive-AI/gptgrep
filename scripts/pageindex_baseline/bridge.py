@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, wait
 import json
 import os
@@ -138,10 +139,29 @@ def owned_process(arguments: list[str], cwd: Path, timeout: float, *, cancelled=
         raise failure from original
 
 
+class ExternalAttempt:
+    """One reserved native invocation; its caller owns bounded report validation."""
+    def __init__(self, host, receipt, request_path):
+        self.host, self.receipt, self.request_path = host, receipt, request_path
+        self._ran = False
+
+    def run(self, arguments, timeout):
+        if self._ran:
+            raise ValueError("A reserved native attempt cannot be replayed")
+        self._ran = True
+        try:
+            return owned_process(arguments, self.host.run_dir, timeout,
+                                 cancelled=self.host._cancelled.is_set,
+                                 on_start=lambda pid: self.host._process_started(self.receipt, pid))
+        finally:
+            self.host._process_finished(self.receipt)
+
+
 class LocalCodex:
     def __init__(self, binary: Path, codex_bin: str, codex_home: Path, run_dir: Path,
                  max_calls: int, timeout: int = 180, model: str = "gpt-5.6-luna", effort: str = "max",
-                 max_input_bytes: int = INPUT_CAP, *, host_concurrency: int = 1, service_tier: str = "fast"):
+                 max_input_bytes: int = INPUT_CAP, *, host_concurrency: int = 1, service_tier: str = "fast",
+                 reader_concurrency: int = 1, judge_concurrency: int = 1):
         self.binary, self.codex_bin, self.codex_home = binary, codex_bin, codex_home
         self.run_dir, self.max_calls, self.timeout = run_dir, max_calls, timeout
         self.model, self.effort = model, effort
@@ -153,15 +173,15 @@ class LocalCodex:
         self.max_input_bytes = max_input_bytes
         self.phase = "unselected"
         self._lock = threading.RLock()
-        if not 1 <= host_concurrency <= 64 or max_calls < 0:
+        if any(not 1 <= value <= 64 for value in (host_concurrency, reader_concurrency, judge_concurrency)) or max_calls < 0:
             raise ValueError("Host concurrency must be1..64 and the cumulative call cap nonnegative")
         self.host_concurrency = host_concurrency
-        self._slots = threading.BoundedSemaphore(host_concurrency)
-        self._role_slots = {"index": threading.BoundedSemaphore(host_concurrency),
-                            "chat": threading.BoundedSemaphore(1), "judge": threading.BoundedSemaphore(1),
-                            "other": threading.BoundedSemaphore(1)}
+        self.role_concurrency = {"index": host_concurrency, "chat": reader_concurrency, "judge": judge_concurrency, "other": 1}
+        self.total_concurrency = max(self.role_concurrency.values())
+        self._slots = threading.BoundedSemaphore(self.total_concurrency)
+        self._role_slots = {role: threading.BoundedSemaphore(limit) for role, limit in self.role_concurrency.items()}
         self._cancelled = threading.Event()
-        self._executor = ThreadPoolExecutor(max_workers=host_concurrency, thread_name_prefix="gptgrep-host")
+        self._executor = ThreadPoolExecutor(max_workers=self.total_concurrency, thread_name_prefix="gptgrep-host")
         self._futures = set()
         self._active = {}
         self._measurement_id = uuid.uuid4().hex
@@ -266,6 +286,72 @@ class LocalCodex:
                     "service_tier": self.service_tier if service_tier is None else service_tier,
                     "role": selected_role if selected_role in self._role_slots else "other"}
 
+    def calls_for_phase(self, phase: str) -> list[dict]:
+        with self._lock:
+            return [dict(call) for call in self.calls if call.get("phase") == phase]
+
+    def call_by_ordinal(self, ordinal: int):
+        with self._lock:
+            return next((dict(call) for call in self.calls if call["ordinal"] == ordinal), None)
+
+    @contextmanager
+    def external_attempt(self, payload: dict, *, phase, model, effort, service_tier, role="chat", operation="native_ask"):
+        """Reserve before launch; role slots and paid-attempt accounting survive errors."""
+        binding = self._bindings(model, effort, phase, role, service_tier)
+        if binding["service_tier"] not in ("fast", "priority", "flex", "default"):
+            raise AdapterError("service_tier", "Unsupported requested service tier", 401)
+        raw = json_bytes(payload)
+        if len(raw) > self.max_input_bytes:
+            with self._lock:
+                self.rejections.append({"phase": phase, "code": "input_limit", "input_bytes": len(raw), "host_invoked": False})
+            raise AdapterError("input_limit", "Native request exceeds its explicit byte cap")
+        acquired = []
+        try:
+            for gate in (self._role_slots[binding["role"]], self._slots):
+                while not gate.acquire(timeout=0.1):
+                    if self._cancelled.is_set():
+                        raise AdapterError("host_cancelled", "Native host cancelled while queued", 401)
+                acquired.append(gate)
+            with self._lock:
+                if self._cancelled.is_set():
+                    raise AdapterError("host_cancelled", "Native host cancelled before reservation", 401)
+                if self._next_ordinal > self.max_calls:
+                    self.rejections.append({"phase": phase, "code": "call_budget", "host_invoked": False})
+                    raise AdapterError("call_budget", "Global native-host invocation budget exhausted")
+                number = self._next_ordinal
+                request_path = self.run_dir / "calls" / f"{number:05d}.request.json"
+                with request_path.open("xb") as output:
+                    output.write(raw)
+                    output.flush()
+                    os.fsync(output.fileno())
+                receipt = {"ordinal": number, "phase": phase, "role": binding["role"], "operation": operation,
+                           "request_sha256": hashlib.sha256(raw).hexdigest(), "input_bytes": len(raw),
+                           "requested_model": binding["model"], "requested_effort": binding["effort"],
+                           "requested_service_tier": binding["service_tier"], "host_invoked": False,
+                           "host_process_started": False, "measurement_id": self._measurement_id}
+                self.start_attempt(receipt)
+            started = time.perf_counter()
+            try:
+                yield ExternalAttempt(self, receipt, request_path)
+                if receipt.get("status") not in ("completed", "failed", "interrupted"):
+                    raise AdapterError("external_attempt_unfinished", "Native caller did not validate a final status", 401)
+            except BaseException as error:
+                receipt.update(status="interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) or getattr(error, "code", None) == "host_cancelled" else "failed",
+                               error_code=getattr(error, "code", type(error).__name__), accounting_complete=False)
+                if hasattr(error, "cleanup"):
+                    receipt["timeout_cleanup"] = error.cleanup
+                raise
+            finally:
+                self._process_finished(receipt)
+                if receipt.get("status") != "completed":
+                    receipt["accounting_complete"] = False
+                receipt.setdefault("usage", None)
+                receipt["elapsed_ms"] = (time.perf_counter() - started) * 1000
+                self._append(receipt)
+        finally:
+            for gate in reversed(acquired):
+                gate.release()
+
     def _process_started(self, receipt: dict, pid: int) -> None:
         with self._lock:
             number, role = receipt["ordinal"], receipt["role"]
@@ -311,7 +397,8 @@ class LocalCodex:
                        effective_service_tier=report.get("effective_service_tier"))
         return report
 
-    async def acomplete(self, instructions: str, state, schema: dict, *, model=None, effort=None, phase=None, role=None, service_tier=None):
+    async def acomplete(self, instructions: str, state, schema: dict, *, model=None, effort=None, phase=None, role=None, service_tier=None,
+                        on_reserved=None):
         # Snapshot before dispatch; neither caller mutation nor later role phases
         # can change a queued request. This executor is never asyncio's default pool.
         request = json.loads(json_bytes({"instructions": instructions, "state": state, "schema": schema}))
@@ -321,7 +408,7 @@ class LocalCodex:
             if self._cancelled.is_set():
                 raise AdapterError("host_cancelled", "Local host is closed", 401)
             future = self._executor.submit(self.complete, request["instructions"], request["state"], request["schema"],
-                                           **binding, _cancel_event=cancelled)
+                                           **binding, on_reserved=on_reserved, _cancel_event=cancelled)
             self._futures.add(future)
             future.add_done_callback(self._forget_future)
         wrapped = asyncio.wrap_future(future)
@@ -385,13 +472,14 @@ class LocalCodex:
                     "summed_process_ms": summed_ns / 1e6 if complete else None,
                     "overlap_ms": (summed_ns - busy_ns) / 1e6 if complete else None}
         return {"configured_host_ceiling": self.host_concurrency,
-                "configured_role_ceilings": {"index": self.host_concurrency, "chat": 1, "judge": 1},
+                "configured_role_ceilings": {role: self.role_concurrency[role] for role in ("index", "chat", "judge")},
+                "configured_total_ceiling": self.total_concurrency,
                 "measurement": "Observed owned-host process intervals; not provider request concurrency or inferred speedup",
                 **observed(selected), "by_role": {role: observed([item for item in selected if item.get("role") == role])
                                                    for role in ("index", "chat", "judge")}}
 
     def complete(self, instructions: str, state, schema: dict, *, model=None, effort=None, phase=None, role=None, service_tier=None,
-                 _cancel_event=None) -> tuple[dict, dict]:
+                 on_reserved=None, _cancel_event=None) -> tuple[dict, dict]:
         request = {"instructions": instructions, "state": state, "schema": schema}
         payload = json_bytes(request)
         request = json.loads(payload)
@@ -436,6 +524,8 @@ class LocalCodex:
                 self.start_attempt(receipt)
             started = time.perf_counter()
             try:
+                if on_reserved is not None:
+                    on_reserved(dict(receipt))
                 process = owned_process(
                     [str(self.binary), "host-complete", "--input", str(request_path),
                      "--codex-bin", self.codex_bin, "--codex-home", str(self.codex_home),

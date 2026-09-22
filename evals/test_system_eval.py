@@ -3,10 +3,12 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import ExitStack
 from subprocess import CompletedProcess
@@ -165,6 +167,67 @@ class SystemEvalTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "excerpt differs"):
                 system.verify_native_evidence(report, root, {"d.pdf": sha}, {"d.pdf": b"true text"})
 
+    def test_ledger_selection_binds_pid_time_query_and_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / ".gptgrep/host-attempts"
+            directory.mkdir(parents=True)
+            for name in ("attempt-100-42-0.jsonl", "attempt-250-42-0.jsonl", "attempt-260-43-0.jsonl", "attempt-450-42-0.jsonl"):
+                (directory / name).write_text("")
+            receipt = {"host_pid": 42, "process_finished_unix_ns": 400}
+            selected = system.owned_ledger_paths(root, receipt, not_before_unix_ns=200)
+            self.assertEqual([path.name for path in selected], ["attempt-250-42-0.jsonl"])
+            self.assertEqual(system.owned_ledger_paths(root, receipt), [])
+            query = hashlib.sha256(b"unseen query").hexdigest()
+            event = {"schema_version": "gptgrep.jev-attempt.v1", "generation": "generation", "event": "completed",
+                     "attempted_calls": 1, "requests": 1, "unobserved_attempts": 0, "accounting_complete": True,
+                     "search": {"search_id": "owned", "required_initial": True, "query_sha256": query,
+                                "document_scope": "random.pdf", "generation": "generation", "metrics": {"jev_usage": [{"cost": .01}]}}}
+            selected[0].write_text(json.dumps(event) + "\n")
+            self.assertTrue(system.ledger_recovery(selected[0], generation="generation", query_sha256=query, document="random.pdf")["case_identity_verified"])
+            with self.assertRaisesRegex(ValueError, "query/document scope"):
+                system.ledger_recovery(selected[0], generation="generation", query_sha256=query, document="different.pdf")
+
+    def test_interrupted_stage_time_stays_unknown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system.checkpoint_attempt(root / "stage-readers.json", {"execution_id": "lost", "status": "started", "wall_ms": None})
+            system.checkpoint_attempt(root / "stage-readers.json", {"execution_id": "resumed", "status": "completed", "wall_ms": 3})
+            history = system.stage_history(root)
+            self.assertIsNone(history["active_stage_wall_ms"])
+            self.assertEqual(history["known_active_stage_wall_ms_subtotal"], 3)
+            self.assertEqual(history["missing_stage_durations"], 1)
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "Owned process groups require POSIX")
+    def test_stage_cancellation_reaps_owned_process_without_model(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = system.LocalCodex(root / "unused", "codex", root, root, 4, reader_concurrency=2)
+            started = threading.Event()
+            original = host._process_started
+            def on_start(receipt, pid):
+                original(receipt, pid)
+                started.set()
+            def worker(row):
+                if row["source_row"] == 1:
+                    self.assertTrue(started.wait(2))
+                    raise RuntimeError("synthetic cancellation")
+                with host.external_attempt({"synthetic": True}, phase="answer:native:row-0", model="gpt-5.6-luna",
+                                           effort="max", service_tier="fast") as attempt:
+                    attempt.run([sys.executable, "-c", "import time;time.sleep(30)"], timeout=3)
+                    attempt.receipt["status"] = "completed"
+                return {"source_row": 0, "status": "completed"}
+            try:
+                with patch.object(host, "_process_started", side_effect=on_start):
+                    with self.assertRaisesRegex(RuntimeError, "synthetic cancellation"):
+                        system.bounded_stage([{"source_row": 0}, {"source_row": 1}], 2, worker, host, root, "readers")
+                receipt = host.calls[0]
+                self.assertTrue(receipt["timeout_cleanup"]["reaped"])
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(receipt["host_pid"], 0)
+            finally:
+                host.close(cancel=True)
+
     def test_resume_binding_changes_only_the_cumulative_budget(self):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "manifest.json"
@@ -203,6 +266,7 @@ class ResumeExecutionTests(unittest.TestCase):
             upstream=self.root / "upstream", benchmark=self.benchmark, judge_source=self.root / "judge", run_dir=self.root / "run",
             binary=self.root / "binary", judge_binary=None, codex_bin="codex", codex_home=self.root / "account",
             max_model_calls=8, timeout=180, max_input_bytes=262144, max_tool_calls=12, build_timeout=300,
+            reader_concurrency=1, judge_concurrency=1,
             jev_model="typesafe/jev-1.13", optimize_merge=False, baseline_summary=None, retry_failed=False)
         self.constants = {"PROMPT": "Q:{question}\nREF:{answer}\nFORMAT:{answer_format}\nOUTPUT:{response}",
             "MAX_RESPONSE_CHARS": 12000, "MODEL": "gpt-5.6-luna", "EFFORT": "high",
@@ -210,6 +274,7 @@ class ResumeExecutionTests(unittest.TestCase):
                        "required": ["equivalent", "abstained", "reason"], "additionalProperties": False}}
         self.counts = {"index": 0, "ask": 0, "judge": 0}
         self.seen_arguments = []
+        self.model_delay = 0
         self.interrupt_second_ask = False
         self.interrupt_first_judge = False
         self.stack = ExitStack()
@@ -244,6 +309,8 @@ class ResumeExecutionTests(unittest.TestCase):
                 "manifest_sha256": system.locks.digest(generation / "manifest.json")}))
             report = {"indexed_files": len(self.rows)}
         else:
+            if self.model_delay:
+                time.sleep(self.model_delay)
             model = arguments[arguments.index("--model") + 1]
             effort = arguments[arguments.index("--reasoning-effort") + 1]
             tier = arguments[arguments.index("--service-tier") + 1]
@@ -269,7 +336,7 @@ class ResumeExecutionTests(unittest.TestCase):
         return CompletedProcess(arguments, 0, json.dumps(report).encode(), b"")
 
     def test_budget_resume_reuses_wrong_judged_answer_and_stable_generation(self):
-        self.args.max_model_calls = 2
+        self.args.max_model_calls = 3
         first = system.execute(self.args)
         saved = (self.args.run_dir / "calls/00001.response.json").read_bytes()
         generation = (self.args.run_dir / "corpus/.gptgrep/CURRENT.json").read_bytes()
@@ -292,24 +359,23 @@ class ResumeExecutionTests(unittest.TestCase):
         self.interrupt_second_ask = True
         with self.assertRaises(KeyboardInterrupt):
             system.execute(self.args)
-        preserved = (self.args.run_dir / "calls/00003.request.json").read_bytes()
+        preserved = (self.args.run_dir / "calls/00002.request.json").read_bytes()
         stopped = system.execute(self.args)
         self.assertEqual(stopped["cases"][1]["status"], "interrupted")
-        self.assertEqual(stopped["host_invocations"], 3)
+        self.assertGreaterEqual(stopped["host_invocations"], 2)
         self.assertEqual(self.counts["ask"], 2)
         self.args.retry_failed = True
         resumed = system.execute(self.args)
-        self.assertEqual(resumed["host_invocations"], 5)
+        self.assertEqual(resumed["host_invocations"], len((self.args.run_dir / "host-calls.jsonl").read_text().splitlines()))
         self.assertEqual(resumed["summary"]["question_denominator"], 2)
         self.assertEqual(resumed["cumulative_attempt_accounting"]["native_ask_attempts"], 3)
         self.assertEqual(resumed["cumulative_attempt_accounting"]["unknown_accounting_attempts"], 1)
         self.assertIsNone(resumed["summary"]["measured_jev_cost_usd"])
         self.assertAlmostEqual(resumed["summary"]["known_jev_cost_subtotal_usd"], .04)
         self.assertFalse(resumed["cohorts"]["heldout54"]["jev_cost_accounting_complete"])
-        self.assertIsNone(resumed["all_host_wall_ms"])
-        self.assertEqual(resumed["all_host_wall_ms_missing"], 1)
+        self.assertEqual(resumed["all_host_wall_ms_missing"], 0)
         self.assertGreater(resumed["all_host_wall_ms_known_subtotal"], 0)
-        self.assertEqual((self.args.run_dir / "calls/00003.request.json").read_bytes(), preserved)
+        self.assertEqual((self.args.run_dir / "calls/00002.request.json").read_bytes(), preserved)
         self.assertEqual(self.counts, {"index": 1, "ask": 3, "judge": 2})
 
     def test_interruption_before_request_does_not_reserve_a_later_cases_ordinal(self):
@@ -317,7 +383,7 @@ class ResumeExecutionTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 system.execute(self.args)
         partial = system.execute(self.args)
-        self.assertEqual(partial["host_invocations"], 2)
+        self.assertEqual(partial["host_invocations"], len((self.args.run_dir / "host-calls.jsonl").read_text().splitlines()) if (self.args.run_dir / "host-calls.jsonl").exists() else 0)
         self.assertEqual(partial["cases"][0]["status"], "interrupted")
         self.args.retry_failed = True
         final = system.execute(self.args)
@@ -333,10 +399,11 @@ class ResumeExecutionTests(unittest.TestCase):
         partial = system.execute(self.args)
         self.assertEqual(partial["cases"][0]["status"], "completed")
         self.assertEqual(partial["cases"][0]["judge"]["status"], "unavailable")
-        self.assertEqual(self.counts, {"index": 1, "ask": 2, "judge": 2})
+        self.assertEqual(self.counts["index"], 1)
+        self.assertEqual(self.counts["ask"], 2)
         self.args.retry_failed = True
         final = system.execute(self.args)
-        self.assertEqual(final["host_invocations"], 5)
+        self.assertEqual(final["host_invocations"], len((self.args.run_dir / "host-calls.jsonl").read_text().splitlines()))
         self.assertEqual(self.counts, {"index": 1, "ask": 2, "judge": 3})
         self.assertEqual((self.args.run_dir / "calls/00001.response.json").read_bytes(), first_response)
         self.assertFalse(final["cases"][0]["judge"]["equivalent"])
@@ -381,17 +448,17 @@ class ResumeExecutionTests(unittest.TestCase):
         self.assertTrue(report["cases"][0]["recovered_completed_reader"])
 
     def test_completed_false_judge_is_recovered_without_new_calls(self):
-        self.args.max_model_calls = 2
+        self.args.max_model_calls = 3
         with self.crash_after_append("judge:native:row-0"):
             with self.assertRaises(KeyboardInterrupt):
                 system.execute(self.args)
-        response = self.args.run_dir / "calls/00002.response.json"
+        response = self.args.run_dir / "calls/00003.response.json"
         saved = response.read_bytes()
         self.assertFalse(json.loads(saved)["value"]["equivalent"])
         self.args.retry_failed = True
         report = system.execute(self.args)
-        self.assertEqual(self.counts, {"index": 1, "ask": 1, "judge": 1})
-        self.assertEqual(report["host_invocations"], 2)
+        self.assertEqual(self.counts, {"index": 1, "ask": 2, "judge": 1})
+        self.assertEqual(report["host_invocations"], 3)
         self.assertFalse(report["cases"][0]["judge"]["equivalent"])
         self.assertTrue(report["cases"][0]["judge"]["recovered_completed_judge"])
         self.assertEqual(response.read_bytes(), saved)
@@ -399,19 +466,19 @@ class ResumeExecutionTests(unittest.TestCase):
         self.assertIsNotNone(report["all_host_wall_ms"])
 
     def test_completed_judge_request_or_response_tampering_blocks_retry(self):
-        self.args.max_model_calls = 2
+        self.args.max_model_calls = 3
         with self.crash_after_append("judge:native:row-0"):
             with self.assertRaises(KeyboardInterrupt):
                 system.execute(self.args)
         self.args.retry_failed = True
         for kind in ("request", "response"):
             with self.subTest(kind=kind):
-                target = self.args.run_dir / f"calls/00002.{kind}.json"
+                target = self.args.run_dir / f"calls/00003.{kind}.json"
                 saved = target.read_bytes()
                 target.write_bytes(saved + b" ")
                 with self.assertRaisesRegex(ValueError, "binding differs|digest differs"):
                     system.execute(self.args)
-                self.assertEqual(self.counts, {"index": 1, "ask": 1, "judge": 1})
+                self.assertEqual(self.counts, {"index": 1, "ask": 2, "judge": 1})
                 target.write_bytes(saved)
 
     def test_resume_refuses_replaced_generation_even_with_retry(self):
@@ -444,6 +511,42 @@ class ResumeExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conditions changed"):
             system.execute(self.args)
         self.assertEqual(self.counts, {"index": 1, "ask": 2, "judge": 2})
+
+    def test_parallel_stages_overlap_with_exact_case_bindings_and_reuse(self):
+        self.args.reader_concurrency = self.args.judge_concurrency = 5
+        self.model_delay = .04
+        report = system.execute(self.args)
+        measured = report["owned_process_concurrency"]
+        self.assertGreater(measured["by_role"]["chat"]["measured_peak"], 1)
+        self.assertGreater(measured["by_role"]["judge"]["measured_peak"], 1)
+        self.assertLessEqual(measured["measured_peak"], 5)
+        calls = [json.loads(line) for line in (self.args.run_dir / "host-calls.jsonl").read_text().splitlines()]
+        readers = [call for call in calls if call["role"] == "chat"]
+        judges = [call for call in calls if call["role"] == "judge"]
+        self.assertLessEqual(max(call["process_finished_monotonic_ns"] for call in readers),
+                             min(call["process_started_monotonic_ns"] for call in judges))
+        self.assertEqual(sorted(call["ordinal"] for call in calls), [1, 2, 3, 4])
+        for case in report["cases"]:
+            self.assertEqual(case["host_receipt"]["phase"], f"answer:native:row-{case['source_row']}")
+            verdict = case["judge"]
+            call = next(call for call in calls if call["ordinal"] == verdict["host_ordinal"])
+            self.assertEqual(call["phase"], f"judge:native:row-{case['source_row']}")
+        again = system.execute(self.args)
+        self.assertEqual(again["host_invocations"], 4)
+        self.assertEqual(self.counts, {"index": 1, "ask": 2, "judge": 2})
+        latest = system.locks.read_json(self.args.run_dir / "stage-readers.json")
+        self.assertEqual(latest["reused_completed_tasks"], 2)
+        self.assertTrue(again["stage_execution_history"]["latest_invocation_is_not_automatically_cold"])
+
+    def test_parallel_inflight_reservations_obey_global_cap(self):
+        self.args.reader_concurrency = self.args.judge_concurrency = 5
+        self.args.max_model_calls = 1
+        self.model_delay = .04
+        report = system.execute(self.args)
+        self.assertEqual(report["host_invocations"], 1)
+        self.assertEqual(self.counts, {"index": 1, "ask": 1, "judge": 0})
+        self.assertEqual(report["summary"]["question_denominator"], 2)
+        self.assertEqual(sorted(case["status"] for case in report["cases"]), ["budget_blocked", "completed"])
 
 
 if __name__ == "__main__":

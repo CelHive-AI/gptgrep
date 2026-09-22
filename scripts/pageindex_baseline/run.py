@@ -6,6 +6,7 @@ import argparse
 import ast
 import asyncio
 import contextlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fcntl
 import hashlib
 import json
@@ -19,6 +20,7 @@ import threading
 import sys
 import time
 import types
+import uuid
 
 import locks
 import profiles
@@ -81,8 +83,10 @@ def benchmark_qualification(answer, index, stored_pages, page_count, run_dir, ho
         pages = returned_pages({"items": [call, *outputs]}, index["name"], page_count, expected_texts)
         if pages:
             verified_calls[call["call_id"]] = pages
+    with host._lock:
+        calls = list(host.calls)
     return qualification.qualify(envelope, index["name"], verified_calls, run_dir,
-                                 answer.get("host_call_ordinals", []), host.calls,
+                                 answer.get("host_call_ordinals", []), calls,
                                  plan["profile"]["roles"]["chat"],
                                  {"host_binary_sha256": plan["host_binary_sha256"],
                                   "adapter_files": plan["adapter_files"], "chat_profile": plan["profile"]["roles"]["chat"],
@@ -231,12 +235,344 @@ def reader_request(row: dict, document_id: str, effort: str, max_turns: int) -> 
                              "reasoning_effort": effort, "max_turns": max_turns}
 
 
+def run_case_pool(items, worker, concurrency, host, role, intervals):
+    """Drain one bounded stage before another role starts; cancel only owned work."""
+    pool_id = uuid.uuid4().hex
+    stage_path = host.run_dir / "qa-stages" / f"{role}-{pool_id}.json"
+    stage = {"pool_id": pool_id, "role": role, "status": "started", "configured_concurrency": concurrency,
+             "task_count": len(items), "started_unix_ns": time.time_ns()}
+    checkpoint_attempt(stage_path, stage)
+    started = time.perf_counter()
+    interval_lock = threading.Lock()
+    def invoke(number, item):
+        interval = {"pool_id": pool_id, "role": role, "task_index": number,
+                    "configured_concurrency": concurrency, "started_monotonic_ns": time.monotonic_ns()}
+        try:
+            result = worker(item)
+            outcome = result[0] if isinstance(result, tuple) else result
+            interval["disposition"] = outcome.get(f"{role}_stage_disposition", "unknown") if isinstance(outcome, dict) else "unknown"
+            status_source = outcome.get("judge", {}) if role == "judge" and isinstance(outcome, dict) else outcome
+            interval["task_status"] = status_source.get("status", "unknown") if isinstance(status_source, dict) else "unknown"
+            return result
+        except BaseException as error:
+            host.cancel()
+            interval["disposition"] = "task_failed" if isinstance(error, Exception) else "interrupted"
+            interval["task_status"] = "failed" if isinstance(error, Exception) else "interrupted"
+            raise
+        finally:
+            interval["finished_monotonic_ns"] = time.monotonic_ns()
+            with interval_lock:
+                intervals.append(interval)
+    executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=f"gptgrep-{role}-case")
+    futures = {}
+    try:
+        futures = {executor.submit(invoke, number, item): number for number, item in enumerate(items)}
+        results = [None] * len(futures)
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+        stage["status"] = "drained"
+        return results
+    except BaseException:
+        stage["status"] = "interrupted"
+        host.cancel()
+        for future in futures:
+            future.cancel()
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        host.drain()
+        selected = [item for item in intervals if item["pool_id"] == pool_id]
+        stage.update(elapsed_ms=(time.perf_counter() - started) * 1000,
+                     finished_unix_ns=time.time_ns(), queued_tasks_not_started=len(items) - len(selected),
+                     task_dispositions={name: sum(item.get("disposition") == name for item in selected)
+                                        for name in ("new_attempt", "reused", "unavailable", "task_failed", "interrupted", "unknown")},
+                     task_outcomes={name: sum(item.get("task_status") == name for item in selected)
+                                    for name in ("completed", "failed", "interrupted", "budget_blocked", "index_unavailable", "not_answered", "unavailable", "unknown")})
+        checkpoint_attempt(stage_path, stage)
+
+
+def qa_stage_summary(run_dir):
+    records = [locks.read_json(path) for path in sorted((run_dir / "qa-stages").glob("*.json"))]
+    return {"measurement": "Cumulative observed QA stage invocations, including cache reuse; latest resumed wall time is not a cold full-run measurement",
+            "records": records, **timing_fields(records),
+            "by_role": {role: {"stage_invocations": len(selected), **timing_fields(selected),
+                               "missing_final_receipts": sum(item.get("status") == "started" for item in selected)}
+                        for role, selected in ((name, [item for item in records if item["role"] == name])
+                                               for name in ("reader", "judge"))}}
+
+
+def task_concurrency_report(intervals):
+    def observed(selected):
+        peaks, summed, busy = [], 0, 0
+        for pool_id in {item["pool_id"] for item in selected}:
+            events = []
+            for item in selected:
+                if item["pool_id"] == pool_id:
+                    start, end = item["started_monotonic_ns"], item["finished_monotonic_ns"]
+                    events.extend(((start, 1), (end, -1)))
+                    summed += end - start
+            active = peak = 0
+            previous = None
+            for point, delta in sorted(events):
+                if active and previous is not None:
+                    busy += point - previous
+                active += delta
+                peak = max(peak, active)
+                previous = point
+            peaks.append(peak)
+        return {"completed_task_intervals": len(selected), "measured_peak": max(peaks) if peaks else None,
+                "summed_task_ms": summed / 1e6 if selected else None, "busy_ms": busy / 1e6 if selected else None,
+                "overlap_ms": (summed - busy) / 1e6 if selected else None}
+    return {"measurement": "Observed case-task intervals including cache checks and SDK work; separate from owned-host or provider concurrency",
+            **observed(intervals), "by_role": {role: observed([item for item in intervals if item["role"] == role])
+                                              for role in ("reader", "judge")}}
+
+
+def refuse_reader_final_replacement(answer, host):
+    """Do not reconstruct SDK state or replace a retained final model answer."""
+    phase, ordinals = answer.get("host_phase"), answer.get("host_call_ordinals", [])
+    if phase is None and not ordinals:
+        return
+    prefix = f"answer:{answer['variant']}:row-{answer['source_row']}:attempt-"
+    if not isinstance(phase, str) or not phase.startswith(prefix):
+        raise ValueError("Retained reader phase differs from its source case")
+    calls = host.calls_for_phase(phase)
+    if not isinstance(ordinals, list) or any(type(number) is not int for number in ordinals) or not set(ordinals).issubset({call["ordinal"] for call in calls}):
+        raise ValueError("Retained reader ordinals differ from the cumulative phase ledger")
+    for call in calls:
+        request, response = (host.run_dir / "calls" / f"{call['ordinal']:05d}.{kind}.json" for kind in ("request", "response"))
+        if locks.digest(request) != call.get("request_sha256"):
+            raise ValueError("Retained reader request digest differs")
+        if not response.exists() and call.get("status") != "completed":
+            continue
+        if locks.digest(response) != call.get("response_sha256"):
+            raise ValueError("Retained reader response digest differs")
+        report = locks.read_json(response)
+        value = report.get("value") if isinstance(report, dict) else None
+        if (isinstance(value, dict) and report.get("status") == "completed" and isinstance(value.get("text"), str)
+                and value["text"].strip() and not value.get("tool_calls")):
+            raise ValueError("Retained completed reader final output lacks a complete SDK case checkpoint; refuse replacement")
+
+
+def read_case(row, *, args, plan, indexes, metadata, variant, variant_dir, benchmark, host, client_factory):
+    answer_path = variant_dir / f"question-{row['source_row']:03d}.json"
+    index = indexes[row["doc_id"]]
+    if index["status"] != "completed":
+        unavailable = {"variant": variant, "source_row": row["source_row"], "status": "index_unavailable",
+                       "index_status": index["status"], "question_denominator_retained": True}
+        checkpoint_attempt(variant_dir / f"question-{row['source_row']:03d}.unavailable.json", unavailable)
+        return {**unavailable, "reader_stage_disposition": "unavailable"}, []
+    identity = fingerprint({"row": row, "index": index["cache_key"], "max_turns": args.max_turns,
+                            "transport": plan["adapter_mode"]})
+    answer = locks.read_json(answer_path) if answer_path.exists() else {
+        **row, "variant": variant, "identity": identity, "status": "not_answered"}
+    if answer.get("identity") != identity:
+        raise ValueError("Answer cache identity changed; use a new run directory")
+    if args.stage in ("answer", "run") and may_attempt(answer["status"], args.retry_failed):
+        refuse_reader_final_replacement(answer, host)
+    phase = f"answer:{variant}:row-{row['source_row']}:attempt-{uuid.uuid4().hex}"
+    def reserved(receipt):
+        answer["host_call_ordinals"].append(receipt["ordinal"])
+        checkpoint_attempt(answer_path, answer)
+    role_host = RoleHost(host, "chat", plan["profile"]["roles"]["chat"], phase=phase, on_reserved=reserved)
+    client, transport, backend = client_factory(role_host)
+    attempted = False
+    try:
+        if args.stage in ("answer", "run") and may_attempt(answer["status"], args.retry_failed):
+            attempted = True
+            started = time.perf_counter()
+            answer.pop("judge", None)
+            answer.pop("error", None)
+            answer.pop("host_call_start", None)
+            answer.update(status="started", host_phase=phase, host_call_ordinals=[])
+            checkpoint_attempt(answer_path, answer)
+            try:
+                question, options = reader_request(row, index["doc_id"], args.reasoning_effort, args.max_turns)
+                envelope = client.chat(question, **options)
+                if any(call.get("status") != "completed" for call in host.calls_for_phase(phase)):
+                    raise ValueError("A reader invocation failed; no completed answer can hide its failure")
+                if locks.digest(benchmark / "documents" / row["doc_id"]) != plan["source_hashes"][row["doc_id"]]:
+                    raise ValueError("Reference source changed during SDK retrieval")
+                text = "\n".join(part["text"] for item in envelope["output"] if item.get("type") == "message"
+                                 for part in item.get("content", []) if part.get("type") == "output_text")
+                if not text.strip():
+                    raise ValueError("SDK returned no answer text")
+                stored_pages = client.get_ocr(index["doc_id"], format="page")["result"]
+                expected_texts = {page["page_index"]: page["markdown"] for page in stored_pages}
+                pages = returned_pages(envelope, index["name"], metadata[row["doc_id"]]["pages"], expected_texts)
+                gold = set(json.loads(row["evidence_pages"]))
+                contexts = [wire["index_context"] for wire in transport.wire_receipts
+                            if wire.get("status") == "completed" and "index_context" in wire]
+                answer.update(status="completed", response=text, sdk_envelope=envelope,
+                              accessed_physical_pages=sorted(pages), page_access_recall=len(pages & gold) / len(gold) if gold else None,
+                              index_metadata_supplied=any(context["index_metadata_supplied"] for context in contexts),
+                              index_summary_supplied=any(context["index_summary_supplied"] for context in contexts),
+                              index_context_observations=contexts, raw_page_output_integrity_verified=True if pages else None,
+                              source_digest_verified=True, sdk_usage_authoritative=False)
+                answer.update(answer_evidence(answer))
+            except BaseException as error:
+                calls = host.calls_for_phase(phase)
+                with host._lock:
+                    budget_blocked = not calls and any(item.get("phase") == phase and item.get("code") == "call_budget"
+                                                      for item in host.rejections)
+                interrupted = (not isinstance(error, Exception) or host._cancelled.is_set()
+                               or any(call.get("status") == "interrupted" for call in calls))
+                answer.update(status="interrupted" if interrupted else "budget_blocked" if budget_blocked else "failed",
+                              error=str(error))
+                if not isinstance(error, Exception):
+                    raise
+            finally:
+                calls = host.calls_for_phase(phase)
+                answer.update(elapsed_ms=(time.perf_counter() - started) * 1000, host_invocations=len(calls),
+                              host_call_ordinals=[call["ordinal"] for call in calls], wire_receipts=transport.wire_receipts,
+                              achieved_host_concurrency=host.concurrency_report(calls))
+                checkpoint_attempt(answer_path, answer)
+        if answer["status"] == "completed":
+            answer["transport_qualification"] = benchmark_qualification(
+                answer, index, client.get_ocr(index["doc_id"], format="page")["result"],
+                metadata[row["doc_id"]]["pages"], host.run_dir, host, plan)
+            write_json(answer_path, answer)
+        return {**answer, "reader_stage_disposition": "new_attempt" if attempted else
+                "reused" if answer["status"] == "completed" else "unavailable"}, transport.wire_receipts
+    finally:
+        asyncio.run(backend["http_client"].aclose())
+
+
+def retained_judge(judge, metadata, phase_prefix, prompt, constants, host):
+    """Validate durable completion evidence before permitting any replacement verdict."""
+    from bridge import json_bytes
+    import jsonschema
+    if not judge:
+        return None
+    phase = judge.get("host_phase")
+    if not isinstance(phase, str) or not phase.startswith(phase_prefix):
+        raise ValueError("Retained judge source-case phase differs")
+    if any(judge.get(key) != value for key, value in metadata.items()):
+        raise ValueError("Retained judge source-case, rubric or profile binding differs")
+    ordinal = judge.get("host_call_ordinal")
+    calls = host.calls_for_phase(phase)
+    if ordinal is None and len(calls) == 1:
+        ordinal = calls[0]["ordinal"]
+    if ordinal is None:
+        if calls or judge.get("status") == "completed":
+            raise ValueError("Retained judge lacks a unique host invocation")
+        return None
+    if type(ordinal) is not int or ordinal < 1:
+        raise ValueError("Invalid retained judge ordinal")
+    call = host.call_by_ordinal(ordinal)
+    if call is None or len(calls) != 1 or calls[0]["ordinal"] != ordinal:
+        raise ValueError("Retained judge ordinal differs from its cumulative phase ledger")
+    if (call.get("phase"), call.get("role"), call.get("requested_model"), call.get("requested_effort"), call.get("requested_service_tier")) != (
+            phase, "judge", metadata["model"], metadata["actual_requested_effort"], metadata["requested_service_tier"]):
+        raise ValueError("Retained judge host profile differs")
+    request = {"instructions": prompt, "state": {}, "schema": constants["SCHEMA"]}
+    expected = hashlib.sha256(json_bytes(request)).hexdigest()
+    request_path, response_path = (host.run_dir / "calls" / f"{ordinal:05d}.{kind}.json" for kind in ("request", "response"))
+    if call.get("request_sha256") != expected or locks.digest(request_path) != expected or locks.read_json(request_path) != request:
+        raise ValueError("Retained judge request bytes or binding differ")
+    if call.get("status") != "completed":
+        if response_path.exists():
+            if call.get("response_sha256") and locks.digest(response_path) != call["response_sha256"]:
+                raise ValueError("Retained judge response digest differs")
+            try:
+                previous = locks.read_json(response_path)
+            except (ValueError, UnicodeDecodeError):
+                previous = None
+            if isinstance(previous, dict) and previous.get("status") == "completed":
+                raise ValueError("A completed judge response lacks a validated final receipt; refuse replacement")
+        return None
+    if locks.digest(response_path) != call.get("response_sha256"):
+        raise ValueError("Retained judge response digest differs")
+    report = locks.read_json(response_path)
+    if (report.get("status"), report.get("model"), report.get("requested_reasoning_effort"), report.get("auth_mode"), report.get("model_provider")) != (
+            "completed", metadata["model"], metadata["actual_requested_effort"], "chatgpt", "openai"):
+        raise ValueError("Retained judge runtime or outcome differs")
+    if report.get("effective_reasoning_effort") not in (None, metadata["actual_requested_effort"]):
+        raise ValueError("Retained judge effective effort differs")
+    normalize = lambda value: "priority" if value in ("fast", "priority") else value
+    if any(report.get(key) is not None and normalize(report[key]) != normalize(metadata["requested_service_tier"])
+           for key in ("requested_service_tier", "effective_service_tier")):
+        raise ValueError("Retained judge service tier differs")
+    identity = report.get("thread_id"), report.get("turn_id")
+    if not all(isinstance(value, str) and value for value in identity) or identity != (call.get("thread_id"), call.get("turn_id")):
+        raise ValueError("Retained judge native identity differs")
+    value = report.get("value")
+    jsonschema.Draft202012Validator(constants["SCHEMA"]).validate(value)
+    if hashlib.sha256(json_bytes(value)).hexdigest() != call.get("value_sha256"):
+        raise ValueError("Retained judge value digest differs")
+    if judge.get("status") == "completed" and any(judge.get(key) != item for key, item in value.items()):
+        raise ValueError("Cached judge verdict differs from its durable response")
+    completed = {**judge, **metadata, **value, "status": "completed", "host_call_ordinal": ordinal,
+                 "host_call_ordinals": [ordinal], "host_invocations": 1,
+                 "host_request_sha256": expected, "host_response_sha256": call["response_sha256"],
+                 "effective_service_tier": report.get("effective_service_tier"),
+                 "achieved_host_concurrency": host.concurrency_report(calls)}
+    completed.pop("error", None)  # Original interrupted checkpoints remain immutable.
+    return completed
+
+
+def judge_case(answer, *, args, profile, constants, host, variant_dir):
+    judge = answer.get("judge", {})
+    if args.stage not in ("judge", "run") or answer["status"] != "completed":
+        return {**answer, "judge_stage_disposition": "reused" if judge.get("status") == "completed" else "unavailable"}
+    answer_path = variant_dir / f"question-{answer['source_row']:03d}.json"
+    response = str(answer["response"])
+    prompt = constants["PROMPT"].format(question=" ".join(answer["question"].split()), answer=answer["answer"],
+                                       answer_format=answer["answer_format"], response=response[:constants["MAX_RESPONSE_CHARS"]])
+    if not isinstance(answer.get("identity"), str) or not answer["identity"]:
+        raise ValueError("Judge requires the source-bound reader case identity")
+    metadata = {"case_sha256": fingerprint({"identity": answer["identity"], "source_row": answer["source_row"],
+                                            "variant": answer["variant"], "doc_id": answer["doc_id"],
+                                            "reader_response_sha256": hashlib.sha256(response.encode()).hexdigest(),
+                                            "reader_call_ordinals": answer.get("host_call_ordinals", [])}),
+                "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                "response_truncated": len(response) > constants["MAX_RESPONSE_CHARS"],
+                "upstream_effort": constants["EFFORT"], "actual_requested_effort": profile["roles"]["judge"]["reasoning_effort"],
+                "model": profile["roles"]["judge"]["model"], "requested_service_tier": profile["roles"]["judge"].get("service_tier", host.service_tier),
+                "rubric_sha256": fingerprint(constants["PROMPT"]), "schema_sha256": fingerprint(constants["SCHEMA"])}
+    phase_prefix = f"judge:{answer['variant']}:row-{answer['source_row']}:case-{metadata['case_sha256']}:attempt-"
+    recovered = retained_judge(judge, metadata, phase_prefix, prompt, constants, host)
+    if recovered is not None:
+        if judge.get("status") != "completed":
+            answer["judge"] = {**recovered, "recovered_completed_judge": True}
+            checkpoint_attempt(answer_path, answer)
+        return {**answer, "judge_stage_disposition": "reused"}
+    if judge.get("status") == "completed":
+        raise ValueError("Completed cached judge lacks a validated durable outcome")
+    should_judge = not judge or judge.get("status") == "budget_blocked" or args.retry_failed
+    if not should_judge:
+        return {**answer, "judge_stage_disposition": "unavailable"}
+    phase = phase_prefix + uuid.uuid4().hex
+    role_host = RoleHost(host, "judge", profile["roles"]["judge"], phase=phase)
+    answer["judge"] = {"status": "started", "host_phase": phase, **metadata}
+    checkpoint_attempt(answer_path, answer)
+    def reserved(receipt):
+        answer["judge"]["host_call_ordinal"] = receipt["ordinal"]
+        checkpoint_attempt(answer_path, answer)
+    try:
+        role_host.complete(prompt, {}, constants["SCHEMA"], on_reserved=reserved)
+        answer["judge"] = retained_judge(answer["judge"], metadata, phase_prefix, prompt, constants, host)
+    except BaseException as error:
+        answer["judge"].update(status="interrupted" if not isinstance(error, Exception) or getattr(error, "code", None) == "host_cancelled" else
+                              "budget_blocked" if getattr(error, "code", None) == "call_budget" else "unavailable",
+                              error=str(error))
+        if not isinstance(error, Exception):
+            raise
+    finally:
+        calls = host.calls_for_phase(phase)
+        answer["judge"].update(host_call_ordinals=[call["ordinal"] for call in calls], host_invocations=len(calls),
+                               achieved_host_concurrency=host.concurrency_report(calls))
+        checkpoint_attempt(answer_path, answer)
+    return {**answer, "judge_stage_disposition": "new_attempt"}
+
+
 def execute(args) -> dict:
     from bridge import LocalCodex
     profile = profiles.resolve(args)
     index_host_concurrency = getattr(args, "index_host_concurrency", 64)
-    if not 1 <= index_host_concurrency <= 64:
-        raise ValueError("Index host concurrency must be1..64")
+    reader_concurrency, judge_concurrency = getattr(args, "reader_concurrency", 5), getattr(args, "judge_concurrency", 5)
+    if any(not 1 <= value <= 64 for value in (index_host_concurrency, reader_concurrency, judge_concurrency)):
+        raise ValueError("Index, reader and judge concurrency must be1..64")
     roots = {name: getattr(args, name).expanduser().resolve() for name in ("upstream", "benchmark", "run_dir")}
     upstream, benchmark, run_dir = roots["upstream"], roots["benchmark"], roots["run_dir"]
     judge_source = args.judge_source.expanduser().resolve() if args.judge_source else None
@@ -272,11 +608,12 @@ def execute(args) -> dict:
         "host_input_cap": args.max_input_bytes, "host_output_cap": 131072,
         "max_host_invocations": args.max_model_calls, "host_timeout_secs": args.timeout,
         "sdk_max_turns": args.max_turns, "host_concurrency": index_host_concurrency,
-        "host_concurrency_by_role": {"index": index_host_concurrency, "reader": 1, "judge": 1},
+        "host_concurrency_by_role": {"index": index_host_concurrency, "reader": reader_concurrency, "judge": judge_concurrency},
+        "qa_stage_strategy": "readers_then_judges",
         "upstream_defaults": {"benchmark_max_turns_argument": None, "pinned_sdk_effective_max_turns": 10,
                               "benchmark_concurrency": 5, "index_summary_concurrency": 64,
                               "index_expansion_concurrency": 32},
-        "concurrency_adaptation": "Upstream index scheduling retained under an explicit host ceiling; reader and judge serial1, not upstream QA-throughput5 reproduction",
+        "concurrency_adaptation": "Upstream index scheduling retained; bounded per-case reader pool drains before a separate bounded judge pool. Measured overlap is reported, not inferred throughput parity",
         "turn_budget_unit": "Original Agents SDK model-loop turns; not native tool-call count",
         "source_hashes": {name: locks.digest(benchmark / "documents" / name) for name in filenames},
         "question_sha256": fingerprint(rows), "adapter_files": adapter_files,
@@ -294,7 +631,7 @@ def execute(args) -> dict:
         initial_plan = run_dir / "plan.json"
         if initial_plan.exists():
             prior = locks.read_json(initial_plan)
-            for key in ("variants", "source_rows", "source_hashes", "question_sha256", "cohort_manifest_sha256", "source_and_dependencies", "adapter_files", "model", "reasoning_effort", "profile", "host_input_cap", "host_binary_sha256", "sdk_max_turns", "host_timeout_secs", "host_concurrency_by_role"):
+            for key in ("variants", "source_rows", "source_hashes", "question_sha256", "cohort_manifest_sha256", "source_and_dependencies", "adapter_files", "model", "reasoning_effort", "profile", "host_input_cap", "host_binary_sha256", "sdk_max_turns", "host_timeout_secs", "host_concurrency_by_role", "qa_stage_strategy"):
                 if prior.get(key) != plan.get(key):
                     raise ValueError("Run identity changed; use a new private directory without rewriting prior evidence")
         else:
@@ -310,10 +647,11 @@ def execute(args) -> dict:
             raise ValueError("Judge stages require the locked private judge source")
         host = LocalCodex(binary, args.codex_bin, args.codex_home.expanduser().resolve(), run_dir,
                           args.max_model_calls, args.timeout, args.model, args.reasoning_effort, args.max_input_bytes,
-                          host_concurrency=index_host_concurrency, service_tier=args.service_tier)
+                          host_concurrency=index_host_concurrency, service_tier=args.service_tier,
+                          reader_concurrency=reader_concurrency, judge_concurrency=judge_concurrency)
         index_host = RoleHost(host, "index", profile["roles"]["index"])
         chat_host = RoleHost(host, "chat", profile["roles"]["chat"])
-        judge_host = RoleHost(host, "judge", profile["roles"]["judge"])
+        task_intervals = locks.read_json(run_dir / "task-intervals.json") if (run_dir / "task-intervals.json").exists() else []
         before_cwd = Path.cwd()
         previous_signals = {}
         if threading.current_thread() is threading.main_thread():
@@ -415,92 +753,31 @@ def execute(args) -> dict:
                                     raise ValueError("Cached SDK reading-text digest changed")
                         indexes = {record["source"]: record for record in index_records if record["variant"] == variant}
                         if args.stage in ("answer", "judge", "run"):
-                            for row in rows:
-                                answer_path = variant_dir / f"question-{row['source_row']:03d}.json"
-                                index = indexes[row["doc_id"]]
-                                if index["status"] != "completed":
-                                    unavailable = {"variant": variant, "source_row": row["source_row"], "status": "index_unavailable",
-                                                   "index_status": index["status"], "question_denominator_retained": True}
-                                    answer_records.append(unavailable)
-                                    # Preserve one outcome for every selected row, including build failures.
-                                    checkpoint_attempt(variant_dir / f"question-{row['source_row']:03d}.unavailable.json", unavailable)
-                                    continue
-                                identity = fingerprint({"row": row, "index": index["cache_key"], "max_turns": args.max_turns,
-                                                        "transport": plan["adapter_mode"]})
-                                if answer_path.exists():
-                                    answer = locks.read_json(answer_path)
-                                    if answer.get("identity") != identity:
-                                        raise ValueError("Answer cache identity changed; use a new run directory")
-                                else:
-                                    answer = {**row, "variant": variant, "identity": identity, "status": "not_answered"}
-                                if args.stage in ("answer", "run") and may_attempt(answer["status"], args.retry_failed):
-                                    if len(host.calls) >= host.max_calls:
-                                        if not answer_path.exists():
-                                            answer.update(status="budget_blocked", host_invocations=0)
-                                            checkpoint_attempt(answer_path, answer)
-                                        answer_records.append({key: value for key, value in answer.items()
-                                                               if key not in ("sdk_envelope", "response", "question", "answer")})
-                                        continue
-                                    chat_host.phase = f"answer:{variant}:row-{row['source_row']}"
-                                    started, before_calls = time.perf_counter(), len(host.calls)
-                                    before_wire = len(transport.wire_receipts)
-                                    answer.pop("judge", None)
-                                    answer.pop("error", None)
-                                    answer.update(status="started", host_call_start=before_calls + 1)
-                                    checkpoint_attempt(answer_path, answer)
-                                    try:
-                                        question, request_options = reader_request(row, index["doc_id"], args.reasoning_effort, args.max_turns)
-                                        envelope = client.chat(question, **request_options)
-                                        if locks.digest(benchmark / "documents" / row["doc_id"]) != plan["source_hashes"][row["doc_id"]]:
-                                            raise ValueError("Reference source changed during SDK retrieval")
-                                        text = "\n".join(part["text"] for item in envelope["output"] if item.get("type") == "message"
-                                                         for part in item.get("content", []) if part.get("type") == "output_text")
-                                        if not text.strip():
-                                            raise ValueError("SDK returned no answer text")
-                                        stored_pages = client.get_ocr(index["doc_id"], format="page")["result"]
-                                        expected_texts = {page["page_index"]: page["markdown"] for page in stored_pages}
-                                        pages = returned_pages(envelope, index["name"], metadata[row["doc_id"]]["pages"], expected_texts)
-                                        gold = set(json.loads(row["evidence_pages"]))
-                                        contexts = [wire["index_context"] for wire in transport.wire_receipts[before_wire:]
-                                                    if wire.get("status") == "completed" and "index_context" in wire]
-                                        answer.update(status="completed", response=text, sdk_envelope=envelope,
-                                                      accessed_physical_pages=sorted(pages), page_access_recall=len(pages & gold) / len(gold) if gold else None,
-                                                      index_metadata_supplied=any(context["index_metadata_supplied"] for context in contexts),
-                                                      index_summary_supplied=any(context["index_summary_supplied"] for context in contexts),
-                                                      index_context_observations=contexts,
-                                                      raw_page_output_integrity_verified=True if pages else None,
-                                                      source_digest_verified=True,
-                                                      sdk_usage_authoritative=False)
-                                        answer.update(answer_evidence(answer))
-                                    except Exception as error:
-                                        answer.update(status="failed", error=str(error))
-                                    answer.update(elapsed_ms=(time.perf_counter() - started) * 1000, host_invocations=len(host.calls) - before_calls,
-                                                  host_call_ordinals=[call["ordinal"] for call in host.calls[before_calls:]],
-                                                  wire_receipts=transport.wire_receipts[before_wire:])
-                                    checkpoint_attempt(answer_path, answer)
-                                if answer["status"] == "completed":
-                                    answer["transport_qualification"] = benchmark_qualification(
-                                        answer, index, client.get_ocr(index["doc_id"], format="page")["result"],
-                                        metadata[row["doc_id"]]["pages"], run_dir, host, plan)
-                                    write_json(answer_path, answer)
-                                if args.stage in ("judge", "run") and answer["status"] == "completed" and (
-                                        "judge" not in answer or (args.retry_failed and answer["judge"].get("status") != "completed")):
-                                    constants = judge_constants(judge_source)
-                                    response = str(answer["response"])
-                                    prompt = constants["PROMPT"].format(
-                                        question=" ".join(row["question"].split()), answer=row["answer"],
-                                        answer_format=row["answer_format"], response=response[:constants["MAX_RESPONSE_CHARS"]])
-                                    judge_host.phase = f"judge:{variant}:row-{row['source_row']}"
-                                    try:
-                                        value, _ = judge_host.complete(prompt, {}, constants["SCHEMA"])
-                                        answer["judge"] = {"status": "completed", **value, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-                                                           "response_truncated": len(response) > constants["MAX_RESPONSE_CHARS"],
-                                                           "upstream_effort": constants["EFFORT"], "actual_requested_effort": judge_host.effort,
-                                                           "model": judge_host.model, "rubric_sha256": fingerprint(constants["PROMPT"]),
-                                                           "schema_sha256": fingerprint(constants["SCHEMA"])}
-                                    except Exception as error:
-                                        answer["judge"] = {"status": "unavailable", "error": str(error)}
-                                    checkpoint_attempt(answer_path, answer)
+                            def reader_client(role_host):
+                                case_transport = ResponsesTransport(role_host)
+                                case_backend = chat_backend(case_transport)
+                                case_client = PageIndexClient(
+                                    mode="local", storage_path=variant_dir / "store",
+                                    index_model=f"{PROVIDER}/{INDEX_ALIAS}", chat_model=profile["roles"]["chat"]["model"],
+                                    chat_backend=case_backend,
+                                )
+                                return case_client, case_transport, case_backend
+                            def reader(row):
+                                return read_case(row, args=args, plan=plan, indexes=indexes, metadata=metadata,
+                                                 variant=variant, variant_dir=variant_dir, benchmark=benchmark,
+                                                 host=host, client_factory=reader_client)
+                            reads = run_case_pool(rows, reader, reader_concurrency, host, "reader", task_intervals)
+                            answers = [answer for answer, _receipts in reads]
+                            for _answer, receipts in reads:
+                                wire.extend(receipts)
+                            write_json(run_dir / "wire-receipts.json", wire)
+                            if args.stage in ("judge", "run"):
+                                constants = judge_constants(judge_source)
+                                def judge(answer):
+                                    return judge_case(answer, args=args, profile=profile, constants=constants,
+                                                      host=host, variant_dir=variant_dir)
+                                answers = run_case_pool(answers, judge, judge_concurrency, host, "judge", task_intervals)
+                            for answer in answers:
                                 answer.update(answer_evidence(answer))
                                 answer_records.append({key: value for key, value in answer.items()
                                                        if key not in ("sdk_envelope", "response", "question", "answer")})
@@ -546,6 +823,8 @@ def execute(args) -> dict:
                                               for name in ("index", "answer", "judge", "interrupted_unknown"))},
                       "adapter_rejections": len(host.rejections), "paired_baseline_complete": paired_complete,
                       "achieved_host_concurrency": host.concurrency_report(),
+                      "achieved_task_concurrency": task_concurrency_report(task_intervals),
+                      "qa_stage_timings": qa_stage_summary(run_dir),
                       **outer_timing, **inner_timing,
                       "reported_host_timing_missing": inner_timing["reported_host_wall_ms_missing"],
                       "host_elapsed_aggregation": "Sum of per-invocation durations, not elapsed concurrent benchmark wall time; measured process overlap is separate",
@@ -559,6 +838,9 @@ def execute(args) -> dict:
             try:
                 host.close(cancel=True)
                 write_json(run_dir / "host-concurrency.json", host.concurrency_report())
+                write_json(run_dir / "task-intervals.json", task_intervals)
+                write_json(run_dir / "task-concurrency.json", task_concurrency_report(task_intervals))
+                write_json(run_dir / "qa-stage-timings.json", qa_stage_summary(run_dir))
                 write_json(run_dir / "adapter-rejections.json", host.rejections)
             finally:
                 for signum, previous in previous_signals.items():
@@ -583,13 +865,15 @@ def main() -> int:
     profiles.add_arguments(parser)
     parser.add_argument("--max-model-calls", type=int, default=0, help="Cap total local host invocations for this run;0 forbids model calls")
     parser.add_argument("--index-host-concurrency", type=int, default=64, help="Owned index-host upper ceiling1..64; upstream summary64/expansion32 scheduling still applies")
+    parser.add_argument("--reader-concurrency", type=int, default=5, help="Bounded reader-case and reader-host ceiling1..64; drained before judging")
+    parser.add_argument("--judge-concurrency", type=int, default=5, help="Bounded judge-case and judge-host ceiling1..64")
     parser.add_argument("--max-input-bytes", type=int, default=262144)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--max-turns", type=int, default=10, help="Original SDK model-loop turns (source default10); distinct from native tool-call count")
     parser.add_argument("--capability-receipt", type=Path, help="Optional historical supporting receipt; does not qualify this benchmark")
     parser.add_argument("--retry-failed", action="store_true", help="Retry failed/interrupted stages while retaining immutable prior attempts and all billed calls")
     args = parser.parse_args()
-    if args.max_model_calls < 0 or not 1 <= args.max_input_bytes <= 1048576 or args.timeout <= 0 or args.max_turns <= 0 or not 1 <= args.index_host_concurrency <= 64:
+    if args.max_model_calls < 0 or not 1 <= args.max_input_bytes <= 1048576 or args.timeout <= 0 or args.max_turns <= 0 or any(not 1 <= value <= 64 for value in (args.index_host_concurrency, args.reader_concurrency, args.judge_concurrency)):
         parser.error("Invalid call, input, time or turn bounds")
     try:
         report = execute(args)
