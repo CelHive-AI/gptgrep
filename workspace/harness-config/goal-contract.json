@@ -97,8 +97,11 @@
     "observed provider cost and missing accounting"
   ],
   "embedding_rag_comparator": {
-    "status": "profile_under_research",
-    "required_comparison": true,
+    "status": "deferred_after_first_research_preview",
+    "required_comparison": false,
+    "milestone": "next-version backlog after successful first research-preview release",
+    "first_release_dependency": false,
+    "execution": "preparation, experiments and benchmarks pending until that milestone",
     "runtime_scope": "evaluation only; GPTgrep remains vectorless",
     "requirements": [
       "pin encoder revision and license",

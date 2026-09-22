@@ -74,11 +74,14 @@ this goal. The same corpus/task cohort, model/effort, source revisions, prompt a
 tool budgets, judge and failure denominators must be retained for each comparison.
 Provider/backend substitutions and harness differences must be explicit.
 
-The harness also measures a named, pinned conventional embedding-RAG comparator
-with declared chunking, encoder, similarity metric and context budget. It is an
-evaluation dependency, not part of GPTgrep's vectorless runtime. Use the same task
-scope, reader and judge profiles where the experiment controls them. A generic
-"standard RAG" label is not a reproducible baseline specification.
+A named, pinned conventional embedding-RAG comparator is deferred to the version
+after the first accepted research-preview release. Its preparation, experiments
+and benchmarks are pending and do not block that first release. The current
+release comparison remains PageIndex Flash under G3-G5. When resumed, the separate
+evaluation comparator must declare chunking, encoder, similarity metric and context
+budget, with the same task scope, reader and judge profiles where controlled. It
+does not become part of GPTgrep's vectorless runtime; a generic "standard RAG" label
+is not a reproducible baseline specification.
 
 Discover new issues from live failures, propose one falsifiable improvement, run
 paired ablations, retain failed outcomes, and promote only verified improvements.
