@@ -569,6 +569,7 @@ def judge_case(answer, *, args, profile, constants, host, variant_dir):
 
 def execute(args) -> dict:
     from bridge import LocalCodex
+    from index_import import IndexOrigin, origin_declaration
     profile = profiles.resolve(args)
     index_host_concurrency = getattr(args, "index_host_concurrency", 64)
     reader_concurrency, judge_concurrency = getattr(args, "reader_concurrency", 5), getattr(args, "judge_concurrency", 5)
@@ -587,7 +588,7 @@ def execute(args) -> dict:
     rows = [{"source_row": index, **questions[index]} for index in selected]
     filenames = list(dict.fromkeys(row["doc_id"] for row in rows))
     variants = ["raw", "full"] if args.variant == "both" else [args.variant]
-    adapter_files = {name: locks.digest(HERE / name) for name in ("locks.py", "bridge.py", "transports.py", "run.py", "capability.py", "profiles.py", "role_hosts.py", "cohorts.py", "qualification.py", "index_admission.py")}
+    adapter_files = {name: locks.digest(HERE / name) for name in ("locks.py", "bridge.py", "transports.py", "run.py", "capability.py", "profiles.py", "role_hosts.py", "cohorts.py", "qualification.py", "index_admission.py", "index_import.py", "index_replay.py", "reconcile_index.py")}
     binary = args.binary.expanduser().resolve()
     historical_capability = None
     if args.capability_receipt is not None:
@@ -626,13 +627,14 @@ def execute(args) -> dict:
         "retry_failed": args.retry_failed,
         "historical_upstream_results_reproduced": False,
     }
+    plan["index_origin"] = origin_declaration(args, plan)
     private_directory(run_dir)
     with (run_dir / ".owner.lock").open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         initial_plan = run_dir / "plan.json"
         if initial_plan.exists():
             prior = locks.read_json(initial_plan)
-            for key in ("variants", "source_rows", "source_hashes", "question_sha256", "cohort_manifest_sha256", "source_and_dependencies", "adapter_files", "model", "reasoning_effort", "profile", "host_input_cap", "host_binary_sha256", "sdk_max_turns", "host_timeout_secs", "host_concurrency_by_role", "qa_stage_strategy"):
+            for key in ("variants", "source_rows", "source_hashes", "question_sha256", "cohort_manifest_sha256", "source_and_dependencies", "adapter_files", "model", "reasoning_effort", "profile", "host_input_cap", "host_binary_sha256", "sdk_max_turns", "host_timeout_secs", "host_concurrency_by_role", "qa_stage_strategy", "index_origin"):
                 if prior.get(key) != plan.get(key):
                     raise ValueError("Run identity changed; use a new private directory without rewriting prior evidence")
         else:
@@ -652,6 +654,7 @@ def execute(args) -> dict:
                           reader_concurrency=reader_concurrency, judge_concurrency=judge_concurrency)
         index_host = RoleHost(host, "index", profile["roles"]["index"])
         chat_host = RoleHost(host, "chat", profile["roles"]["chat"])
+        origin = None
         task_intervals = locks.read_json(run_dir / "task-intervals.json") if (run_dir / "task-intervals.json").exists() else []
         before_cwd = Path.cwd()
         previous_signals = {}
@@ -664,6 +667,16 @@ def execute(args) -> dict:
                 previous_signals[signum] = signal.signal(signum, interrupted)
         os.chdir(run_dir)
         try:
+            if plan["index_origin"] is not None:
+                origin = IndexOrigin(plan["index_origin"], plan)
+                origin_summary = origin.summary()
+                origin_manifest = run_dir / "index-origin.json"
+                if origin_manifest.exists():
+                    if locks.read_json(origin_manifest) != origin_summary:
+                        raise ValueError("Historical origin lineage changed; use a new declared run")
+                else:
+                    from reconcile_index import immutable_json
+                    immutable_json(origin_manifest, origin_summary)
             locks.import_upstream(upstream)
             from transports import PROVIDER, INDEX_ALIAS, ResponsesTransport, chat_backend, register_index_provider
             from pageindex import PageIndexClient
@@ -695,7 +708,12 @@ def execute(args) -> dict:
                                                      "adapter": adapter_files, "dependencies": verified["dependencies"],
                                                      "all_role_profiles": profile,
                                                      "host_concurrency_by_role": plan["host_concurrency_by_role"],
-                                                     "host_binary_sha256": plan["host_binary_sha256"]})
+                                                     "host_binary_sha256": plan["host_binary_sha256"],
+                                                     "index_origin": plan["index_origin"]})
+                            if origin is not None and variant == "full" and not cache_path.exists() and args.stage in ("index", "run"):
+                                imported = origin.import_completed(name, benchmark / "documents" / name, metadata[name]["pages"], run_dir, cache_key)
+                                if imported is not None:
+                                    checkpoint_attempt(cache_path, imported)
                             if cache_path.exists():
                                 record = locks.read_json(cache_path)
                                 if record.get("cache_key") != cache_key:
@@ -711,21 +729,30 @@ def execute(args) -> dict:
                                     index_records.append({key: value for key, value in record.items() if key != "tree"})
                                     continue
                                 index_host.phase = f"index:{variant}:{name}"
+                                replay_resume = record["status"] != "not_indexed"
+                                replay = None
                                 before_calls, before_rejections = len(host.calls), len(host.rejections)
                                 started = time.perf_counter()
                                 record.pop("error", None)
                                 record.update(status="started", host_call_start=before_calls + 1)
                                 checkpoint_attempt(cache_path, record)
                                 try:
-                                    try:
-                                        doc = client.submit_document(str(benchmark / "documents" / name), mode="flash", wait=True)
-                                    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-                                        host.cancel()
-                                        raise
-                                    finally:
-                                        # SDK cancellation drains per-call owned-process cleanup and receipts
-                                        # before another document can change the phase or ordinal slice.
-                                        host.drain()
+                                    if origin is not None and variant == "full" and origin.phase_calls(name):
+                                        from index_replay import IndexReplayHost, load_index_replay_source
+                                        source = load_index_replay_source(origin.run_dir, name,
+                                            expected_plan_sha256=origin.declaration["plan_sha256"], calls=origin.phase_calls(name))
+                                        replay = IndexReplayHost(index_host, consumer_dir=run_dir, source_name=name,
+                                            expected_plan_sha256=locks.digest(initial_plan), sources=[source], resume=replay_resume)
+                                    with replay if replay is not None else contextlib.nullcontext(index_host) as active_index_host:
+                                        register_index_provider(active_index_host)
+                                        try:
+                                            doc = client.submit_document(str(benchmark / "documents" / name), mode="flash", wait=True)
+                                        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+                                            host.cancel()
+                                            raise
+                                        finally:
+                                            # All original SDK and host tasks drain before changing document scope.
+                                            host.drain()
                                     tree = client.get_document_structure(doc["doc_id"])
                                     pages = client.get_ocr(doc["doc_id"], format="page")["result"]
                                     if len(pages) != metadata[name]["pages"]:
@@ -743,6 +770,9 @@ def execute(args) -> dict:
                                                   tree=tree)
                                 except Exception as error:
                                     record.update(status="failed", error=str(error))
+                                finally:
+                                    if replay is not None:
+                                        record["index_replay"] = replay.summary()
                                 record.update(elapsed_ms=(time.perf_counter() - started) * 1000,
                                               host_invocations=len(host.calls) - before_calls,
                                               host_call_ordinals=[call["ordinal"] for call in host.calls[before_calls:]],
@@ -829,6 +859,9 @@ def execute(args) -> dict:
                       "achieved_host_concurrency": host.concurrency_report(),
                       "achieved_task_concurrency": task_concurrency_report(task_intervals),
                       "qa_stage_timings": qa_stage_summary(run_dir),
+                      "historical_index_origin": origin.summary() if origin is not None else None,
+                      "imported_index_count": sum("index_import" in record for record in index_records),
+                      "replayed_index_count": sum("index_replay" in record for record in index_records),
                       **outer_timing, **inner_timing,
                       "reported_host_timing_missing": inner_timing["reported_host_wall_ms_missing"],
                       "host_elapsed_aggregation": "Sum of per-invocation durations, not elapsed concurrent benchmark wall time; measured process overlap is separate",
@@ -847,6 +880,8 @@ def execute(args) -> dict:
                 write_json(run_dir / "qa-stage-timings.json", qa_stage_summary(run_dir))
                 write_json(run_dir / "adapter-rejections.json", host.rejections)
             finally:
+                if origin is not None:
+                    origin.close()
                 for signum, previous in previous_signals.items():
                     signal.signal(signum, previous)
                 os.chdir(before_cwd)
@@ -869,6 +904,10 @@ def main() -> int:
     profiles.add_arguments(parser)
     parser.add_argument("--max-model-calls", type=int, default=0, help="Cap total local host invocations for this run;0 forbids model calls")
     parser.add_argument("--index-host-concurrency", type=int, default=64, help="Owned index-host upper ceiling1..64; upstream summary64/expansion32 scheduling still applies")
+    parser.add_argument("--index-origin-run", type=Path, help="Declared immutable origin for full SDK index import/exact successful-request replay; never QA/judge reuse")
+    parser.add_argument("--index-origin-plan-sha256")
+    parser.add_argument("--index-origin-frozen-adapter-dir", type=Path)
+    parser.add_argument("--index-origin-binary", type=Path)
     parser.add_argument("--reader-concurrency", type=int, default=5, help="Bounded reader-case and reader-host ceiling1..64; drained before judging")
     parser.add_argument("--judge-concurrency", type=int, default=5, help="Bounded judge-case and judge-host ceiling1..64")
     parser.add_argument("--max-input-bytes", type=int, default=262144)
