@@ -12,12 +12,15 @@ const MAX_DESCRIPTORS: usize = 32;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryPlanConfig {
     pub planner_timeout_secs: u64,
+    #[serde(default)]
+    pub evidence_roles: bool,
 }
 
 impl Default for QueryPlanConfig {
     fn default() -> Self {
         Self {
             planner_timeout_secs: 45,
+            evidence_roles: false,
         }
     }
 }

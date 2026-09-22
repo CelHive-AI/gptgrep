@@ -1,6 +1,7 @@
 //! Local, ephemeral Codex workflows over source-bound GPTgrep evidence.
 mod codex_error;
 mod completion;
+mod evidence_roles;
 pub use codex_error::{
     CodexErrorInfo, HostProtocolError, HostProtocolErrorKind, ToolBudgetDiagnostics,
 };

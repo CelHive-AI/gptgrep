@@ -30,8 +30,19 @@ from native_models import PLANNER_PROFILE, attempts_from_report, usage_summary
 from run import checkpoint_attempt, fingerprint, judge_constants, private_directory, run_case_pool, task_concurrency_report, write_json
 
 
+def query_strategy_flags(args) -> tuple[bool, bool]:
+    planned = getattr(args, "experimental_query_plan", False)
+    evidence_roles = getattr(args, "experimental_evidence_roles", False)
+    if type(planned) is not bool or type(evidence_roles) is not bool:
+        raise ValueError("Experimental strategy flags must be booleans")
+    if evidence_roles and not planned:
+        raise ValueError("Evidence-role selection requires experimental query planning")
+    return planned, evidence_roles
+
+
 def ask_arguments(binary: Path, root: Path, row: dict, args) -> list[str]:
     # Only original question and known-document scope enter retrieval; gold stays in the evaluator.
+    planned, evidence_roles = query_strategy_flags(args)
     return [str(binary), "ask", "--document=" + row["doc_id"],
             "--jev-model", args.jev_model, "--codex-bin", args.codex_bin,
             "--codex-home", str(args.codex_home.expanduser().resolve()), "--model", args.model,
@@ -39,8 +50,9 @@ def ask_arguments(binary: Path, root: Path, row: dict, args) -> list[str]:
             "--timeout", str(args.timeout),
             "--max-tool-calls", str(args.max_tool_calls),
             "--max-input-bytes", str(getattr(args, "max_input_bytes", 262144))] + (
-                ["--experimental-query-plan"] if getattr(args, "experimental_query_plan", False) else []
-            ) + ["--json", "--", row["question"], str(root)]
+                ["--experimental-query-plan"] if planned else []
+            ) + (["--experimental-evidence-roles"] if evidence_roles else []) + [
+                "--json", "--", row["question"], str(root)]
 
 
 def build_arguments(binary: Path, corpus: Path, optimize_merge: bool) -> list[str]:
@@ -144,6 +156,42 @@ def native_metrics(report: dict, doc_id: str, gold_pages: set[int]) -> dict:
     }
 
 
+def evidence_role_policy(report: dict, payload: dict) -> dict | None:
+    """Qualify the executed strategy, separately from the requested command flag."""
+    searches = (report.get("jev") or {}).get("searches", [])
+    observed = [(search, (search.get("plan") or {}).get("evidence_roles"))
+                for search in searches if (search.get("plan") or {}).get("evidence_roles") is not None]
+    if payload.get("experimental_evidence_roles") is not True:
+        if observed:
+            raise ValueError("Native workflow enabled an unrequested evidence-role strategy")
+        return None
+    if len(observed) != 1 or observed[0][0].get("required_initial") is not True:
+        raise ValueError("Native workflow did not execute the requested initial evidence-role strategy")
+    search, role = observed[0]
+    if not isinstance(role, dict) or role.get("strategy") != "jev-evidence-role-v1":
+        raise ValueError("Native evidence-role policy differs")
+    for field in ("original_question_sha256", "decision_contract_sha256", "request_sha256"):
+        if not isinstance(role.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", role[field]):
+            raise ValueError("Native evidence-role request/rubric identity is unavailable")
+    if role["original_question_sha256"] != hashlib.sha256(payload["question"].encode()).hexdigest():
+        raise ValueError("Native evidence-role question differs")
+    counts = [role.get(field) for field in ("score_question_count", "choice_question_count", "question_count")]
+    if not all(type(value) is int for value in counts):
+        raise ValueError("Native evidence-role question accounting is unavailable")
+    scores, choices, total = counts
+    if not 1 <= scores == choices <= 24 or total != scores + choices:
+        raise ValueError("Native evidence-role question accounting differs")
+    if scores != (search["plan"].get("coverage") or {}).get("union_candidates"):
+        raise ValueError("Native evidence-role candidate count differs from union coverage")
+    if type(role.get("request_bytes")) is not int or not 0 < role["request_bytes"] <= 65536:
+        raise ValueError("Native evidence-role encoded request bound differs")
+    if role.get("delivered_set_sufficiency") != "unassessed":
+        raise ValueError("Native evidence-role strategy makes an unsupported sufficiency claim")
+    return {field: role[field] for field in (
+        "strategy", "original_question_sha256", "decision_contract_sha256", "request_sha256",
+        "request_bytes", "question_count", "score_question_count", "choice_question_count", "delivered_set_sufficiency")}
+
+
 def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeout: int,
                   on_reserved=None) -> tuple[dict, dict]:
     with shared.external_attempt(payload, phase=payload["phase"], model=payload["model"],
@@ -188,6 +236,9 @@ def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeo
                 raise ValueError("Native reader acknowledged a different service tier")
             if report.get("auth_mode") != "chatgpt" or report.get("model_provider") != "openai" or not report.get("thread_id") or not report.get("turn_id"):
                 raise ValueError("Native reader identity is unavailable")
+            role_policy = evidence_role_policy(report, payload)
+            if role_policy is not None:
+                receipt["evidence_role_policy"] = role_policy
             receipt.update(status="completed", model=report["model"], model_provider=report["model_provider"],
                            thread_id=report["thread_id"], turn_id=report["turn_id"], usage=report.get("usage"),
                            reported_host_elapsed_ms=report.get("elapsed_ms"))
@@ -539,6 +590,8 @@ def completed_host_response(ordinal: int, request: dict, model: str, effort: str
                                              required=request.get("experimental_query_plan") is True)
         if model_records is not None and call.get("model_attempts") != model_records:
             raise ValueError("Retained nested model accounting differs from its bound response")
+        if call.get("evidence_role_policy") != evidence_role_policy(report, request):
+            raise ValueError("Retained evidence-role qualification differs from its bound response")
     return report, call
 
 
@@ -564,12 +617,15 @@ def validate_cached_reader(case: dict, row: dict, args, run_dir: Path, shared: L
 
 
 def reader_payload(row: dict, args) -> dict:
+    planned, evidence_roles = query_strategy_flags(args)
     payload = {"operation": "ask", "phase": f"answer:native:row-{row['source_row']}",
             "question": row["question"], "document": row["doc_id"],
             "model": args.model, "reasoning_effort": args.reasoning_effort, "service_tier": args.service_tier}
-    if getattr(args, "experimental_query_plan", False):
+    if planned:
         payload["experimental_query_plan"] = True
         payload["max_input_bytes"] = getattr(args, "max_input_bytes", 262144)
+    if evidence_roles:
+        payload["experimental_evidence_roles"] = True
     return payload
 
 
@@ -730,8 +786,8 @@ def verify_native_evidence(report: dict, corpus: Path, sources: dict, text: dict
 
 
 def execute(args) -> dict:
+    planned, evidence_roles = query_strategy_flags(args)
     profile = profiles.resolve(args)
-    planned = getattr(args, "experimental_query_plan", False)
     if planned:
         profile["roles"]["query_planner"] = dict(PLANNER_PROFILE)
     profile["roles"]["index"] = {"engine": "deterministic_native", "model": None, "reasoning_effort": None, "service_tier": None}
@@ -785,6 +841,22 @@ def execute(args) -> dict:
             "model_turn_admission_upper_bound": 2 * args.max_model_calls,
             "budget_note": "max_host_invocations caps outer processes; each native ask admits at most two model steps. Nested attempts are reported separately; this is not a provider request count.",
         }
+        if evidence_roles:
+            manifest["query_strategy"]["experimental_evidence_roles"] = True
+            manifest["query_strategy"]["evidence_role_selection"] = {
+                "policy": "jev-evidence-role-v1",
+                "score_questions_per_candidate": 1, "choice_questions_per_candidate": 1,
+                "maximum_final_questions": 48, "complete_request_byte_cap": 65536,
+                "shared_role_definition_byte_cap": 2048,
+                "private_diagnostic_block_byte_cap": 24576,
+                "ordering": "original literal anchor, evidence role, relevance, source coordinates",
+                "roles": ["direct_support", "source_local_incomplete", "background", "no_support"],
+                "eligibility_and_score_floor": "unchanged",
+                "initial_jev_operation_cap": 4,
+                "delivered_set_sufficiency": "unassessed",
+                "scope_changes": "invalidate the delivered role hint",
+                "cost_note": "Extra judgments and request bytes are measured within the existing union call; request count alone does not establish cost neutrality.",
+            }
     with (run_dir / ".owner.lock").open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         binding = reuse_manifest(run_dir / "manifest.json", manifest)
@@ -1123,6 +1195,8 @@ def main() -> int:
     parser.add_argument("--retry-failed", action="store_true", help="Retry failed/interrupted work; completed reader/judge outcomes are always reused")
     parser.add_argument("--experimental-query-plan", action="store_true",
                         help="Evaluate the explicit additional Luna planner and bounded multi-query initial retrieval; all nested model steps are accounted separately")
+    parser.add_argument("--experimental-evidence-roles", action="store_true",
+                        help="Add bounded Jev evidence-role judgments to the planned union request; requires --experimental-query-plan")
     args = parser.parse_args()
     if min(args.timeout, args.build_timeout, args.max_tool_calls, args.max_input_bytes) <= 0 or args.max_model_calls < 0:
         parser.error("Invalid execution bounds")

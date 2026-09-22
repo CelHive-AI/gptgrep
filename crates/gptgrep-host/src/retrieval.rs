@@ -88,6 +88,7 @@ pub(crate) struct Evidence {
     last_search: Option<crate::SearchTelemetry>,
     last_search_fatal: bool,
     current_call_id: String,
+    evidence_roles: bool,
 }
 
 impl Evidence {
@@ -121,6 +122,7 @@ impl Evidence {
             last_search: None,
             last_search_fatal: false,
             current_call_id: String::new(),
+            evidence_roles: false,
         })
     }
 
@@ -130,6 +132,10 @@ impl Evidence {
         accounting: Accounting,
         client: Option<JevClient>,
     ) -> Result<()> {
+        self.evidence_roles = config
+            .query_plan
+            .as_ref()
+            .is_some_and(|plan| plan.evidence_roles);
         self.accounting = Some(accounting);
         self.client = client;
         self.jev_model = config.jev_model.clone();
@@ -245,7 +251,10 @@ impl Evidence {
         let call_id = "host-initial-jev";
         let index =
             accounting.start_search(call_id, question, "hybrid", self.document.as_deref(), true)?;
-        let args = json!({"query":question,"alternate_queries":alternatives,"mode":"hybrid","limit":SEARCH_MAX,"strategy":"luna_queries_v1"});
+        let mut args = json!({"query":question,"alternate_queries":alternatives,"mode":"hybrid","limit":SEARCH_MAX,"strategy":"luna_queries_v1"});
+        if self.evidence_roles {
+            args["evidence_roles"] = json!(true);
+        }
         let prior_nodes = self.known_nodes.clone();
         let prior_issued = self.issued.clone();
         let prior_receipts = self.receipts.len();
@@ -258,13 +267,14 @@ impl Evidence {
                 ..Default::default()
             };
             let observer = |event: &gptgrep_core::PlannedSearchEvent| accounting.plan_event(index, event);
-            let mut found = gptgrep_core::search_planned_with_client_and_observer(
+            let mut found = gptgrep_core::search_planned_with_policy_and_observer(
                 &self.root,
                 question,
                 alternatives,
                 &options,
                 &self.generation,
                 self.client.as_ref().expect("initialized client"),
+                if self.evidence_roles { gptgrep_core::PlannedScoringPolicy::EvidenceRoles } else { gptgrep_core::PlannedScoringPolicy::Relevance },
                 &observer,
             ).await?;
             self.ensure_generation()?;
@@ -273,17 +283,29 @@ impl Evidence {
             ensure!(found.query == question, "host_query_plan_question_changed");
             ensure!(found.coverage.indexed_files > 0, "host_jev_empty_corpus");
             ensure!(found.coverage.reranked_candidates > 0 && found.metrics.jev_requests > 0, "host_jev_no_candidates");
+            ensure!(found.evidence_roles.is_some() == self.evidence_roles, "host_evidence_role_policy_mismatch");
+            if let Some(diagnostics) = &found.evidence_roles {
+                crate::evidence_roles::validate_policy(diagnostics, &self.generation, question)?;
+            }
             let mut search = accounting.planned_success(index, &found)?;
             let original_hits = found.hits.len();
+            let assessed_hits = found.hits.clone();
             let (value, payload) = loop {
                 let mut value = serde_json::to_value(&found)?;
                 // Full operation/provenance receipts remain in the private ledger/report.
                 // The reader receives coverage counts and only delivered source windows.
                 value.as_object_mut().expect("report object").remove("operations");
+                value.as_object_mut().expect("report object").remove("evidence_roles");
                 if let Some(coverage) = value["coverage"].as_object_mut() {
                     coverage.remove("selected_spans");
                 }
                 value["host_delivery"] = json!({"omitted_hits":original_hits-found.hits.len()});
+                if let Some(diagnostics) = &found.evidence_roles {
+                    for (index, hit) in found.hits.iter().enumerate() {
+                        value["hits"][index] = crate::evidence_roles::delivered_hit(diagnostics, &self.generation, &assessed_hits[index], hit)?;
+                    }
+                    value["host_delivery"]["delivered_set_sufficiency"] = json!("unassessed");
+                }
                 let payload = json!({"contentItems":[{"type":"inputText","text":value.to_string()}],"success":true});
                 if serde_json::to_vec(&payload)?.len() <= MAX_TOOL_BYTES - 256 {
                     break (value, payload);
@@ -292,6 +314,16 @@ impl Evidence {
                 found.hits.pop();
             };
             ensure!(original_hits == 0 || !found.hits.is_empty(), "host_jev_seed_delivery_failed");
+            if let Some(diagnostics) = &mut found.evidence_roles {
+                // Packing currently drops trailing whole hits. Keep each assessed
+                // original paired explicitly with its retained window or omission.
+                for (index, assessed) in assessed_hits.iter().enumerate() {
+                    diagnostics.record_delivery(assessed, found.hits.get(index))?;
+                }
+                diagnostics.delivery_packet_sha256 = Some(hash(&serde_json::to_vec(&payload)?));
+                diagnostics.validate_bound()?;
+                search = accounting.role_delivery(index, diagnostics)?;
+            }
             let mut evidence = vec![];
             for hit in &found.hits {
                 self.known_nodes.insert(hit.node_id.clone());
@@ -353,6 +385,10 @@ impl Evidence {
     }
     pub fn document_scope(&self) -> Option<&str> {
         self.document.as_deref()
+    }
+    pub fn evidence_role_guidance(&self) -> Option<&'static str> {
+        self.evidence_roles
+            .then_some(crate::evidence_roles::READER_GUIDANCE)
     }
 
     pub async fn call(&mut self, call_id: &str, tool: &str, args: Value) -> Result<Value> {

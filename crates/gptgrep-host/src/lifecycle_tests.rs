@@ -313,6 +313,7 @@ async fn query_plan_is_rejected_before_nonask_operations_or_invalid_timeout() {
         let config = HostConfig {
             query_plan: Some(QueryPlanConfig {
                 planner_timeout_secs: timeout,
+                ..QueryPlanConfig::default()
             }),
             ..HostConfig::default()
         };
@@ -1117,5 +1118,70 @@ async fn integrated_budget_cancellation_retains_bound_partial_observations() {
             .is_empty()
     );
     assert!(raw.contains("tool_budget"));
+    assert_budget_denied_without_new_turn(home.path());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn evidence_roles_preserve_two_turns_budget_finalization_and_treatment_only_guidance() {
+    let (root, citation) = planner_corpus().await;
+    let home = tempfile::tempdir().unwrap();
+    let mut config =
+        two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some("completed"));
+    config.query_plan.as_mut().unwrap().evidence_roles = true;
+    config.max_tool_calls = 1;
+    let (client, server) = crate::evidence_roles::tests::mock_roles(4).await;
+    let report = execute_with_client(
+        root.path(),
+        "Explain ember storage.",
+        None,
+        &config,
+        Some(client),
+    )
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        (
+            report.model_usage.attempted_calls,
+            report.model_usage.observed_turns
+        ),
+        (2, 2)
+    );
+    assert_eq!(report.model_usage.known_totals.total_tokens, Some(54));
+    assert_eq!(report.jev.requests, 4);
+    let roles = report.jev.searches[0]
+        .plan
+        .as_ref()
+        .unwrap()
+        .evidence_roles
+        .as_ref()
+        .unwrap();
+    assert_eq!(roles.strategy, "jev-evidence-role-v1");
+    assert_eq!(
+        roles.delivered_set_sufficiency,
+        gptgrep_core::DeliveredSetSufficiency::Unassessed
+    );
+    let reader: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("reader.thread.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        reader["params"]["baseInstructions"]
+            .as_str()
+            .unwrap()
+            .contains(crate::evidence_roles::READER_GUIDANCE)
+    );
+    let planner: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("planner.thread.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !planner["params"]["baseInstructions"]
+            .as_str()
+            .unwrap()
+            .contains(crate::evidence_roles::READER_GUIDANCE)
+    );
     assert_budget_denied_without_new_turn(home.path());
 }

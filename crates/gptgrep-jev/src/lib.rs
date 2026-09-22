@@ -3,7 +3,12 @@
 //! No implicit retries, provider fallback, credential-file discovery, or text generation.
 //! See the crate README for the supported request contract and score normalization.
 
+mod roles;
 mod validation;
+pub use roles::{
+    EvidenceRole, EvidenceRoleCandidate, EvidenceRoleResponse, MAX_ROLE_CANDIDATES,
+    MAX_ROLE_DEFINITION_BYTES, PreparedEvidenceRoles, evidence_role_contract,
+};
 
 use anyhow::{Result, anyhow, ensure};
 use reqwest::{
@@ -174,6 +179,10 @@ impl JevClient {
     /// converted into a successful empty answer or an artificial relevance score.
     pub async fn decide(&self, state: Value, questions: Value) -> Result<DecisionResponse> {
         let body = self.request_body(state, &questions)?;
+        self.decide_body(body, &questions).await
+    }
+
+    async fn decide_body(&self, body: Vec<u8>, questions: &Value) -> Result<DecisionResponse> {
         let mut response = self
             .http
             .post(self.endpoint.clone())
@@ -202,7 +211,7 @@ impl JevClient {
             );
             bytes.extend_from_slice(&chunk);
         }
-        validation::response(&bytes, &questions)
+        validation::response(&bytes, questions)
     }
 
     /// Score each candidate on the same relevance rubric and sort deterministically.

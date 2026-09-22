@@ -245,11 +245,17 @@ pub(crate) async fn run_observed<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>
     let max_output_bytes = options
         .max_output_bytes
         .map_or(max_output_bytes, |limit| limit.min(max_output_bytes));
-    let instructions = if is_completion {
+    let mut instructions = if is_completion {
         instructions
     } else {
         format!("{instructions}\n\n{}", retrieval::limits_guidance())
     };
+    if let Workflow::Retrieval { evidence, .. } = &workflow
+        && let Some(guidance) = evidence.evidence_role_guidance()
+    {
+        instructions.push('\n');
+        instructions.push_str(guidance);
+    }
     let thread = rpc
         .request(
             3,

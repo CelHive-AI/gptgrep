@@ -4,6 +4,13 @@ use futures_util::{StreamExt, stream};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlannedScoringPolicy {
+    #[default]
+    Relevance,
+    EvidenceRoles,
+}
+
 /// Per-view counts are separate observations, not unique-document totals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedViewCoverage {
@@ -73,6 +80,8 @@ pub struct PlannedSearchEvent {
     /// Whether all admitted logical calls returned validated replies. Optional
     /// provider usage remains null when unavailable; no physical/billing claim.
     pub accounting_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_roles: Option<EvidenceRoleDiagnostics>,
 }
 
 pub type PlannedSearchObserver<'a> = dyn Fn(&PlannedSearchEvent) -> Result<()> + Send + Sync + 'a;
@@ -93,6 +102,8 @@ pub struct PlannedSearchReport {
     pub metrics: Metrics,
     pub warnings: Vec<String>,
     pub operations: Vec<PlannedSearchEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_roles: Option<EvidenceRoleDiagnostics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +181,7 @@ impl<'a, 'b> Operation<'a, 'b> {
                 provider: None,
                 cause: None,
                 accounting_complete: false,
+                evidence_roles: None,
             },
             started: Instant::now(),
         }
@@ -255,7 +267,10 @@ fn sanitized_cause(error: &anyhow::Error) -> String {
         | "planned search accepts at most two alternate queries"
         | "alternate queries must contain 1..1024 UTF-8 bytes and a word"
         | "query views must be distinct after trimming"
-        | "Planned search observer failed; no further calls admitted" => text,
+        | "Planned search observer failed; no further calls admitted"
+        | "evidence role metadata exceeded the byte limit before provider admission"
+        | "evidence role metadata exceeded its reserved byte limit"
+        | "Jev request exceeded the byte limit" => text,
         _ => "Planned search validation failed; no fallback or partial delivery".into(),
     }
 }
@@ -305,6 +320,31 @@ pub async fn search_planned_with_client_and_observer(
     client: &JevClient,
     observer: &PlannedSearchObserver<'_>,
 ) -> Result<PlannedSearchReport> {
+    search_planned_with_policy_and_observer(
+        root,
+        original_question,
+        alternate_queries,
+        options,
+        expected_generation,
+        client,
+        PlannedScoringPolicy::Relevance,
+        observer,
+    )
+    .await
+}
+
+/// Explicit planned union policy; default entrypoints retain Score-only requests.
+#[allow(clippy::too_many_arguments)]
+pub async fn search_planned_with_policy_and_observer(
+    root: &Path,
+    original_question: &str,
+    alternate_queries: &[String],
+    options: &SearchOptions,
+    expected_generation: &str,
+    client: &JevClient,
+    policy: PlannedScoringPolicy,
+    observer: &PlannedSearchObserver<'_>,
+) -> Result<PlannedSearchReport> {
     let started = Instant::now();
     let recorder = Recorder {
         observer,
@@ -313,6 +353,7 @@ pub async fn search_planned_with_client_and_observer(
     let mut coverage = PlannedCoverage::default();
     let mut stage = "initialization";
     let mut generation = None;
+    let mut evidence_roles = None;
     let result = async {
         validate_search_options(original_question, options)?;
         ensure!(
@@ -413,20 +454,41 @@ pub async fn search_planned_with_client_and_observer(
                 !union.hits.is_empty(),
                 "planned search has no candidates for required evidence reranking"
             );
-            let observer = |progress: &JevSearchProgress| operation.progress(progress);
             let mut metrics = Metrics::default();
-            score_candidates(
-                &snapshot,
-                original_question,
-                options,
-                client,
-                Some(&observer),
-                &mut union,
-                &mut metrics,
-                operation.started,
-            )
-            .await?;
-            operation.finish(metrics, None)
+            if policy == PlannedScoringPolicy::EvidenceRoles {
+                let diagnostic = score_evidence_roles(
+                    &snapshot,
+                    original_question,
+                    options,
+                    client,
+                    &operation,
+                    &mut union,
+                    &mut metrics,
+                )
+                .await?;
+                let mut event = operation.current();
+                event.evidence_roles = Some(diagnostic.clone());
+                event.event = "finished".into();
+                event.accounting_complete = metrics.jev_calls_attempted == metrics.jev_requests;
+                event.metrics = metrics;
+                operation.emit(event)?;
+                evidence_roles = Some(diagnostic);
+                Ok(())
+            } else {
+                let observer = |progress: &JevSearchProgress| operation.progress(progress);
+                score_candidates(
+                    &snapshot,
+                    original_question,
+                    options,
+                    client,
+                    Some(&observer),
+                    &mut union,
+                    &mut metrics,
+                    operation.started,
+                )
+                .await?;
+                operation.finish(metrics, None)
+            }
         }
         .await;
         // Preserve observed scoring counts even if reply persistence or a later
@@ -443,6 +505,12 @@ pub async fn search_planned_with_client_and_observer(
         // The final source reads above are synchronous; check the pointer again
         // after them so a concurrently published generation cannot be delivered.
         ensure_generation(&snapshot)?;
+        if let Some(diagnostic) = &mut evidence_roles {
+            diagnostic.finish_freshness(&union.hits)?;
+            let mut event = operation.current();
+            event.evidence_roles = Some(diagnostic.clone());
+            operation.emit(event)?;
+        }
         coverage.reranked_candidates = union.coverage.reranked_candidates;
         coverage.filtered_candidates = union.coverage.filtered_candidates;
         coverage.retained_literal_anchors = union.coverage.retained_literal_anchors;
@@ -469,6 +537,7 @@ pub async fn search_planned_with_client_and_observer(
             metrics,
             warnings: union.warnings,
             operations,
+            evidence_roles: evidence_roles.clone(),
         })
     }
     .await;
@@ -494,6 +563,62 @@ pub async fn search_planned_with_client_and_observer(
             accounting_complete: false,
         })
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn score_evidence_roles(
+    snapshot: &Snapshot,
+    query: &str,
+    options: &SearchOptions,
+    client: &JevClient,
+    operation: &Operation<'_, '_>,
+    batch: &mut CandidateBatch,
+    metrics: &mut Metrics,
+) -> Result<EvidenceRoleDiagnostics> {
+    let (prepared, mut diagnostic) = EvidenceRoleDiagnostics::prepare(
+        &snapshot.manifest.generation,
+        query,
+        &batch.hits,
+        client,
+    )?;
+    metrics.jev_candidate_bytes = prepared.candidate_bytes();
+    metrics.jev_calls_attempted = 1;
+    let mut before = operation.current();
+    before.event = "before_call".into();
+    before.metrics = metrics.clone();
+    before.evidence_roles = Some(diagnostic.clone());
+    operation.emit(before)?;
+    let response = client
+        .decide_evidence_roles(prepared)
+        .await
+        .map_err(|error| {
+            jev_search_error(
+                "evidence_reranking",
+                error,
+                metrics,
+                &batch.coverage,
+                options.document.as_deref(),
+                Some(&snapshot.manifest.generation),
+                operation.started,
+            )
+        })?;
+    metrics.jev_requests = 1;
+    metrics.jev_models.push(response.model.clone());
+    metrics.jev_usage.push(response.usage.clone());
+    batch.coverage.reranked_candidates = response.candidates.len();
+    let observed = diagnostic.observe(&response);
+    let mut reply = operation.current();
+    reply.event = "after_reply".into();
+    reply.metrics = metrics.clone();
+    reply.provider_response_id = response.provider_response_id;
+    reply.provider = response.provider;
+    reply.evidence_roles = Some(diagnostic.clone());
+    // Persist validated response metrics/partial judgments before policy work or
+    // any subsequent await, including if metadata validation has failed.
+    operation.emit(reply)?;
+    observed?;
+    diagnostic.order(batch, options)?;
+    Ok(diagnostic)
 }
 
 #[allow(clippy::too_many_arguments)]

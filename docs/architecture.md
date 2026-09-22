@@ -204,3 +204,38 @@ model-attempt records retain identities, usage and unknowns on failures. Parent
 totals do not add nested totals twice; legacy `usage` covers only the final reader.
 Extra planning/routing work and candidate displacement are measured treatment
 costs. This feature makes no indexing, multi-reader voting or quality claim.
+
+## Experimental evidence roles
+
+The ask-only `--experimental-evidence-roles` flag requires query planning and is
+off by default. The planned union uses one unchanged relevance Score and one
+four-way Choice per exact source window in the same mandatory Jev request. The
+24-candidate cap allows at most 48 questions; the hard limits remain 64 questions
+and 65,536 encoded request bytes. Shared role definitions are bounded to 2,048
+bytes. Admission measures the complete request, including escaping and metadata,
+and rejects overflow explicitly.
+
+Eligibility and the original literal-anchor bypass are unchanged. Eligible
+windows sort by original anchor group, role (`direct_support`,
+`source_local_incomplete`, `background`, `no_support`), descending relevance, then
+stable source coordinates. Direct support covers at least one requested fact;
+it does not certify every constraint or the reader's later answer. The delivered
+set always reports sufficiency as unassessed. Existing bounded reads can resolve
+local fragments; no hidden read or extra model step is introduced.
+
+Assessments bind generation, path, source digest, byte interval, text digest and
+original-question/decision hashes. The host issues evidence after whole-hit
+packing. A changed interval or text digest invalidates the delivered role hint;
+the original and delivered scopes remain distinct. Role confidence and optional
+distributions remain diagnostic metadata and do not replace relevance confidence.
+Unseen bytes remain uncitable.
+
+Up to 24 private judged-candidate records retain eligibility, score, role, rank
+and actual omission/delivery disposition, with a shared source table and no source
+text. Their encoded block is bounded to 24 KiB within the existing ledger entry,
+event and total-byte limits. Reservation/persistence failures remain explicit.
+Rejected-candidate records never enter reader context or issue citations. Final
+question counts, request/rubric hashes, usage and cost belong to one union
+operation. Extra questions can increase token use and latency even when request
+count is unchanged. The normal relevance path remains available as the declared
+control; mandatory Jev and all caller budgets are preserved.

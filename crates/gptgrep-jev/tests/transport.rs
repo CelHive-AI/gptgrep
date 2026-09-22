@@ -201,3 +201,73 @@ async fn absent_provider_metadata_and_usage_remain_unavailable() {
     assert!(old_report.provider_response_id.is_none());
     assert!(old_report.provider.is_none());
 }
+
+#[tokio::test]
+async fn mixed_roles_use_one_prepared_request_and_preserve_optional_unknowns() {
+    use gptgrep_jev::EvidenceRole;
+    let response = json!({"model":"typesafe/invented-role-model","answers":{
+        "relevance_0":{"type":"score","score":2.4},
+        "role_0":{"type":"choice","choice":"source_local_incomplete"}
+    }});
+    let (endpoint, server) = serve_once("200 OK", response.to_string(), "").await;
+    let client = JevClient::with_endpoint("invented-key", None, &endpoint).unwrap();
+    let prepared = client
+        .prepare_evidence_roles(
+            "Which link is described?",
+            &[Candidate {
+                id: "window".into(),
+                text: "The second device transmits to it...".into(),
+            }],
+        )
+        .unwrap();
+    let expected = prepared.encoded_request().to_vec();
+    let result = client.decide_evidence_roles(prepared).await.unwrap();
+    assert_eq!(result.candidates.len(), 1);
+    assert_eq!(
+        result.candidates[0].role,
+        EvidenceRole::SourceLocalIncomplete
+    );
+    assert!(result.candidates[0].role_confidence.is_none());
+    assert!(result.candidates[0].role_probabilities.is_none());
+    assert!(result.candidates[0].relevance.confidence.is_none());
+    assert!(
+        result.provider_response_id.is_none()
+            && result.provider.is_none()
+            && result.usage.is_null()
+    );
+    let request = server.await.unwrap();
+    let offset = request
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    assert_eq!(&request[offset..], expected);
+}
+
+#[tokio::test]
+async fn missing_wrong_type_or_unknown_role_is_an_explicit_failure() {
+    for answers in [
+        json!({"relevance_0":{"type":"score","score":3}}),
+        json!({"relevance_0":{"type":"score","score":3},"role_0":{"type":"score","score":3}}),
+        json!({"relevance_0":{"type":"score","score":3},"role_0":{"type":"choice","choice":"invented_unknown"}}),
+    ] {
+        let (endpoint, server) = serve_once(
+            "200 OK",
+            json!({"model":"typesafe/invented","answers":answers}).to_string(),
+            "",
+        )
+        .await;
+        let client = JevClient::with_endpoint("invented-key", None, &endpoint).unwrap();
+        let prepared = client
+            .prepare_evidence_roles(
+                "relation",
+                &[Candidate {
+                    id: "x".into(),
+                    text: "maple leads to cedar".into(),
+                }],
+            )
+            .unwrap();
+        assert!(client.decide_evidence_roles(prepared).await.is_err());
+        server.await.unwrap();
+    }
+}

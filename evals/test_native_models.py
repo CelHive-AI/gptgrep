@@ -207,6 +207,64 @@ class NativeModelAccountingTests(unittest.TestCase):
         self.assertNotIn("experimental_query_plan", system.reader_payload(row, args))
         self.assertNotIn("--experimental-query-plan", system.ask_arguments(Path("tool"), Path("/synthetic/corpus"), row, args))
 
+    def test_evidence_roles_are_explicit_bound_reader_inputs_without_gold(self):
+        args = argparse.Namespace(jev_model="typesafe/jev-1.13", codex_bin="codex",
+                                  codex_home=Path("/synthetic/runtime"), model="gpt-5.6-luna",
+                                  reasoning_effort="max", service_tier="fast", timeout=180,
+                                  max_tool_calls=12, experimental_query_plan=True,
+                                  experimental_evidence_roles=False)
+        row = {"source_row": 2, "question": "Which invented component owns the relation?",
+               "doc_id": "invented.md", "answer": "PRIVATE_GOLD", "evidence_pages": "[999]"}
+        altered = {**row, "answer": "CHANGED_GOLD", "evidence_pages": "[1]", "task_type": "private"}
+        ordinary = system.reader_payload(row, args)
+        self.assertNotIn("experimental_evidence_roles", ordinary)
+        self.assertNotIn("--experimental-evidence-roles", system.ask_arguments(Path("tool"), Path("/synthetic/corpus"), row, args))
+        args.experimental_evidence_roles = True
+        selected = system.reader_payload(row, args)
+        self.assertTrue(selected["experimental_evidence_roles"])
+        self.assertNotEqual(system.fingerprint(selected), system.fingerprint(ordinary))
+        self.assertEqual(selected, system.reader_payload(altered, args))
+        command = system.ask_arguments(Path("tool"), Path("/synthetic/corpus"), row, args)
+        self.assertEqual(command, system.ask_arguments(Path("tool"), Path("/synthetic/corpus"), altered, args))
+        self.assertLess(command.index("--experimental-evidence-roles"), command.index("--"))
+        self.assertNotIn("PRIVATE_GOLD", repr(selected))
+        args.experimental_query_plan = False
+        with self.assertRaisesRegex(ValueError, "requires"):
+            system.reader_payload(row, args)
+        with self.assertRaisesRegex(ValueError, "requires"):
+            system.ask_arguments(Path("tool"), Path("/synthetic/corpus"), row, args)
+
+    def test_requested_role_policy_requires_observed_bound_decisions(self):
+        question = "Which invented component owns the relation?"
+        payload = {"question": question, "experimental_evidence_roles": True}
+        role = {
+            "strategy": "jev-evidence-role-v1",
+            "original_question_sha256": hashlib.sha256(question.encode()).hexdigest(),
+            "decision_contract_sha256": "a" * 64, "request_sha256": "b" * 64,
+            "request_bytes": 2048, "question_count": 4,
+            "score_question_count": 2, "choice_question_count": 2,
+            "delivered_set_sufficiency": "unassessed",
+        }
+        def report(block):
+            return {"jev": {"searches": [{"required_initial": True, "plan": {
+                "coverage": {"union_candidates": 2}, "evidence_roles": block,
+            }}]}}
+        self.assertEqual(system.evidence_role_policy(report(role), payload), role)
+        self.assertIsNone(system.evidence_role_policy(report(None), {"question": question}))
+        with self.assertRaisesRegex(ValueError, "did not execute"):
+            system.evidence_role_policy(report(None), payload)
+        with self.assertRaisesRegex(ValueError, "unrequested"):
+            system.evidence_role_policy(report(role), {"question": question})
+        for changed in (
+            {"original_question_sha256": "c" * 64},
+            {"choice_question_count": 1}, {"question_count": 5},
+            {"request_bytes": 65537}, {"request_bytes": True},
+            {"decision_contract_sha256": None},
+            {"delivered_set_sufficiency": "sufficient"},
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                system.evidence_role_policy(report({**role, **changed}), payload)
+
     def test_planner_usage_is_recovered_before_any_jev_request_with_original_workflow_binding(self):
         question = hashlib.sha256(b"an original synthetic request").hexdigest()
         workflow = {"query_sha256": question, "document_scope": "invented.md", "generation": "g-synthetic"}

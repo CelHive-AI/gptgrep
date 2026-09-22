@@ -38,7 +38,8 @@ fn planner_output_is_bounded_phrase_data_with_explicit_empty_and_duplicate_plans
     for planner_timeout_secs in [0, 46, u64::MAX] {
         assert!(
             QueryPlanConfig {
-                planner_timeout_secs
+                planner_timeout_secs,
+                ..QueryPlanConfig::default()
             }
             .validate()
             .is_err()

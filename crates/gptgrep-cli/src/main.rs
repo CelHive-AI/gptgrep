@@ -196,6 +196,12 @@ enum Command {
             help = "Experimental: one extra Luna query-planning turn before bounded parallel retrieval; Jev remains required"
         )]
         experimental_query_plan: bool,
+        #[arg(
+            long,
+            requires = "experimental_query_plan",
+            help = "Experimental: add source-bound Jev evidence-role judgments to planned retrieval"
+        )]
+        experimental_evidence_roles: bool,
         #[command(flatten)]
         host: HostArgs,
     },
@@ -241,12 +247,12 @@ fn contract() -> Value {
             "status":{"usage":"gptgrep status ROOT --json","scope":"existing indexed files; index discovers new files"},
             "parse":{"usage":"gptgrep parse FILE --json","effect":"local parser"},
             "judge":{"usage":"gptgrep judge --input FILE [--model MODEL] --json","input":{"state":"JSON","questions":"Choice/Noul/Score map"},"effect":"explicit remote Decisions call"},
-            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] [--experimental-query-plan] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"jev-model":{"type":"string","default":"typesafe/jev-1.13"},"document":{"type":"string"},"experimental-query-plan":{"type":"boolean","default":false,"effect":"one extra no-tools Luna planner turn; up to two alternate retrieval queries; bounded parallel routes and final Jev reranking against the original question","limits":{"alternate_queries":2,"routing_concurrency":2,"union_candidates":24,"planner_timeout_seconds":45},"accounting":"model_attempts reports planner and reader separately; legacy usage is reader-only; overall timeout is shared"}},"defaults":{"model":"gpt-5.6-luna","reasoning_effort":"max","service_tier":"fast","timeout_seconds":180,"max_tool_calls":12}},
+            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] [--experimental-query-plan] [--experimental-evidence-roles] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"jev-model":{"type":"string","default":"typesafe/jev-1.13"},"document":{"type":"string"},"experimental-query-plan":{"type":"boolean","default":false,"effect":"one extra no-tools Luna planner turn; up to two alternate retrieval queries; bounded parallel routes and final Jev reranking against the original question","limits":{"alternate_queries":2,"routing_concurrency":2,"union_candidates":24,"planner_timeout_seconds":45},"accounting":"model_attempts reports planner and reader separately; legacy usage is reader-only; overall timeout is shared"},"experimental-evidence-roles":{"type":"boolean","default":false,"requires":"experimental-query-plan","effect":"one additional Choice per union candidate in the same mandatory Jev decision; source-bound role ordering and continuation hints","limits":{"union_candidates":24,"final_questions":48,"complete_request_bytes":65536},"sufficiency":"unassessed","accounting":"extra judgments and tokens are measured within the existing request; discarded-candidate metadata stays private and is not citable"}},"defaults":{"model":"gpt-5.6-luna","reasoning_effort":"max","service_tier":"fast","timeout_seconds":180,"max_tool_calls":12}},
             "summarize":{"usage":"gptgrep summarize DOCUMENT_ID:NODE_ID --root ROOT [host options] --json","effect":"required Jev retrieval in the selected document, then model-written summary with issued evidence citations"},
             "host-complete":{"usage":"gptgrep host-complete --input FILE_OR_DASH [host options] --json","input":{"instructions":"string","state":"JSON","schema":"JSON Schema object"},"effect":"explicit schema-validated local Codex completion; no citation assertion","defaults":{"max_input_bytes":262144,"service_tier":"fast"},"hard_max_input_bytes":1048576},
             "doctor":{"usage":"gptgrep doctor --json","effect":"local capability probe"}
         },
-        "search_output":{"fields":["schema_version","query","mode","document_scope","root","generation","index_used","source_fresh","minimum_relevance_score","hits","coverage","metrics","warnings"],"hit_fields":["path","node_id","title","line_start","line_end","page_start","page_end","match_line","match_column","byte_start","byte_end","column_start","node_offset","next_offset","coordinate_system","text","text_truncated","score","confidence","literal_anchor","source_sha256","source_fresh","citation"]},
+        "search_output":{"fields":["schema_version","query","mode","document_scope","root","generation","index_used","source_fresh","minimum_relevance_score","hits","coverage","metrics","warnings"],"hit_fields":["path","node_id","title","line_start","line_end","page_start","page_end","match_line","match_column","byte_start","byte_end","column_start","node_offset","next_offset","node_coverage","coordinate_system","text","text_truncated","score","confidence","literal_anchor","source_sha256","source_fresh","citation"]},
         "bounds":{"source_file_bytes":67108864,"jev_candidates":24,"semantic_routing_documents":32},
         "limitations":["No full PageIndex Flash parity claim", "No OCR in the initial native build", "Office conversion requires LibreOffice", "Semantic routing and evidence snippets have explicit budgets", "Generative synthesis requires explicit local Codex host mode", "Relevance floor is operational policy, not calibrated confidence; hybrid exact-token anchors are retained"]
     })
@@ -416,12 +422,15 @@ async fn run(cli: Cli) -> Result<i32> {
             jev_model,
             document,
             experimental_query_plan,
+            experimental_evidence_roles,
         } => {
             let mut config = host.config();
             config.jev_model = jev_model;
             config.document = document;
-            config.query_plan =
-                experimental_query_plan.then(gptgrep_host::QueryPlanConfig::default);
+            config.query_plan = experimental_query_plan.then(|| gptgrep_host::QueryPlanConfig {
+                evidence_roles: experimental_evidence_roles,
+                ..gptgrep_host::QueryPlanConfig::default()
+            });
             emit(&serde_json::to_value(
                 gptgrep_host::ask(&root, &question, &config).await?,
             )?)?;
@@ -619,6 +628,75 @@ mod query_plan_cli_tests {
         assert_eq!(
             schema["commands"]["ask"]["options"]["experimental-query-plan"]["default"],
             false
+        );
+    }
+
+    #[test]
+    fn evidence_roles_require_explicit_ask_planning() {
+        let ordinary =
+            Cli::try_parse_from(["gptgrep", "ask", "find the rule", "."]).expect("ordinary ask");
+        assert!(matches!(
+            ordinary.command,
+            Some(Command::Ask {
+                experimental_evidence_roles: false,
+                ..
+            })
+        ));
+        let selected = Cli::try_parse_from([
+            "gptgrep",
+            "ask",
+            "find the rule",
+            ".",
+            "--experimental-query-plan",
+            "--experimental-evidence-roles",
+        ])
+        .expect("explicit planned evidence-role selection");
+        assert!(matches!(
+            selected.command,
+            Some(Command::Ask {
+                experimental_query_plan: true,
+                experimental_evidence_roles: true,
+                ..
+            })
+        ));
+        for arguments in [
+            vec![
+                "gptgrep",
+                "ask",
+                "find the rule",
+                ".",
+                "--experimental-evidence-roles",
+            ],
+            vec![
+                "gptgrep",
+                "search",
+                "rule",
+                ".",
+                "--experimental-evidence-roles",
+            ],
+            vec![
+                "gptgrep",
+                "summarize",
+                "doc:node",
+                "--experimental-evidence-roles",
+            ],
+            vec![
+                "gptgrep",
+                "host-complete",
+                "-",
+                "--experimental-evidence-roles",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+        let schema = contract();
+        assert_eq!(
+            schema["commands"]["ask"]["options"]["experimental-evidence-roles"]["default"],
+            false
+        );
+        assert_eq!(
+            schema["commands"]["ask"]["options"]["experimental-evidence-roles"]["requires"],
+            "experimental-query-plan"
         );
     }
 }

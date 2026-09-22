@@ -166,6 +166,22 @@ gptgrep ask 'How are offline exports recovered?' ./documents \
   --experimental-query-plan --json
 ```
 
+Add `--experimental-evidence-roles` to that command to test the default-off
+`jev-evidence-role-v1` selection policy. Jev keeps the relevance Score and adds one
+Choice per candidate: direct support, incomplete local evidence, background, or
+no support. The original anchor precedence, score floor and three-hit limit stay
+fixed. Role ordering and exact-window hints help the reader choose evidence and
+source-local continuation; delivered-set sufficiency remains unassessed. A role
+can support one requested fact without covering the whole question. If packing
+changes the assessed bytes, the delivered role hint is unavailable. Discarded
+candidate diagnostics carry no rejected text or citation authority.
+
+At most 24 candidates produce 48 questions in the same union Decisions request,
+whose complete encoded body must fit 64 KiB. Extra judgments can increase usage
+and latency; subsequent reader work remains budgeted and measured. This option
+adds no initial Jev operation or Codex step by itself. It requires
+`--experimental-query-plan` and never enables a fallback on failure.
+
 At the retrieval tool budget, the reader finalizes within its existing Codex turn and original deadline. Denied requests issue no new evidence and perform no Jev work; their diagnostics remain separate from model-turn counts. `node_coverage` describes each delivered excerpt, not cumulative reading: EOF can still leave a prefix outside that excerpt.
 
 `host-complete --input FILE_OR_DASH` supplies the same isolated local model as a

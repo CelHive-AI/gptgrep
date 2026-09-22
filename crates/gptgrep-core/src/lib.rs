@@ -3,12 +3,18 @@ use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use gptgrep_jev::{Candidate, JevClient, RerankResponse};
 
+mod evidence_roles;
+pub use evidence_roles::{
+    CandidateDisposition, CandidateEligibility, DeliveredSetSufficiency, EvidenceRole,
+    EvidenceRoleCandidateDecision, EvidenceRoleDiagnostics, EvidenceRoleHint, EvidenceRoleSource,
+    EvidenceRoleSpan, MAX_EVIDENCE_ROLE_METADATA_BYTES,
+};
 mod planned;
 use gptgrep_pageindex::TreeNode;
 pub use planned::{
-    PlannedCoverage, PlannedSearchError, PlannedSearchEvent, PlannedSearchObserver,
-    PlannedSearchReport, PlannedSpanProvenance, PlannedViewCoverage,
-    search_planned_with_client_and_observer,
+    PlannedCoverage, PlannedScoringPolicy, PlannedSearchError, PlannedSearchEvent,
+    PlannedSearchObserver, PlannedSearchReport, PlannedSpanProvenance, PlannedViewCoverage,
+    search_planned_with_client_and_observer, search_planned_with_policy_and_observer,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

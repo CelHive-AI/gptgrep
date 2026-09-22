@@ -143,6 +143,19 @@ gptgrep ask 'How are offline exports recovered?' ./documents \
   --experimental-query-plan --json
 ```
 
+在上述命令中增加 `--experimental-evidence-roles`，可以测试默认关闭的
+`jev-evidence-role-v1` 选择策略。Jev 保留相关性 Score，并为每个候选增加一次 Choice：
+直接支持、局部证据不完整、背景或无支持。原查询 literal anchor 的优先级、相关性下限和
+最多三个初始结果保持不变。角色排序及绑定到确切窗口的提示帮助回答 worker 选择证据、
+在来源附近续读；实际交付证据集的充分性仍未评估。一个角色可以支持问题中的某项事实，
+但不代表覆盖整个问题。打包若改变被评估的字节，交付窗口的角色提示就不可用。
+被舍弃候选的诊断不携带被拒绝的正文，也不会使其获得引用权限。
+
+最多 24 个候选在同一次统一 Decisions 请求中产生 48 个结构化问题，完整编码请求体必须
+满足 64 KiB 上限。额外判断可能增加用量和延迟；后续回答 worker 的工作仍受预算约束并计量。
+该选项本身不增加初始 Jev 操作或 Codex 步骤，必须与 `--experimental-query-plan` 一起使用，
+失败时不会启用降级方案。
+
 检索工具预算耗尽后，回答 worker 在原 Codex 轮次和原截止时间内完成回答。被拒绝的请求不会提供新证据，也不会执行 Jev；其诊断计数与模型轮次计数分开记录。`node_coverage` 只描述当前返回片段，不能代表累计阅读范围：到达 EOF 时，该片段仍可能未包含前缀。
 
 `host-complete --input FILE_OR_DASH` 将同一个隔离的本地模型提供为强类型工作流基础操作。

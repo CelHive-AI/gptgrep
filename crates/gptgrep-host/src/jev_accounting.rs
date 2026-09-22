@@ -12,8 +12,8 @@ impl std::fmt::Display for InitializationError {
 impl std::error::Error for InitializationError {}
 use anyhow::{Result, anyhow, ensure};
 use gptgrep_core::{
-    Coverage, JevSearchProgress, Metrics, PlannedCoverage, PlannedSearchEvent, PlannedSearchReport,
-    SearchReport,
+    Coverage, EvidenceRoleDiagnostics, JevSearchProgress, Metrics, PlannedCoverage,
+    PlannedSearchEvent, PlannedSearchReport, SearchReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -33,6 +33,8 @@ use std::{
 pub struct PlannedSearchTelemetry {
     pub coverage: Option<PlannedCoverage>,
     pub operations: BTreeMap<String, PlannedSearchEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_roles: Option<EvidenceRoleDiagnostics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,18 +382,46 @@ impl Accounting {
                 "host_jev_plan_event_regressed"
             );
         }
+        let mut operation = event.clone();
+        let diagnostics = operation.evidence_roles.take();
         plan.operations
-            .insert(event.operation_id.clone(), event.clone());
+            .insert(event.operation_id.clone(), operation);
         search.metrics = plan_metrics(&plan.operations, elapsed_ms);
         search.coverage = None;
         search.stage = event.operation_id.clone();
         search.accounting_complete = false;
-        append_locked(
-            &mut state,
-            "plan_progress",
-            Some(index),
-            Some(json!({"operation_id":event.operation_id,"event":event.event})),
-        )
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.validate_bound()?;
+            ensure!(
+                diagnostics.original_question_sha256 == search.query_sha256,
+                "host_evidence_role_question_changed"
+            );
+            search.plan.as_mut().expect("planned search").evidence_roles = Some(diagnostics);
+        }
+        let detail = json!({"operation_id":event.operation_id,"event":event.event});
+        if event.event == "before_call"
+            && let Some(diagnostics) = state.searches[index]
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.evidence_roles.as_ref())
+        {
+            let actual = serde_json::to_vec(diagnostics)?.len();
+            let extra = diagnostics
+                .reserved_metadata_bytes
+                .checked_sub(actual)
+                .ok_or_else(|| anyhow!("host_evidence_role_reservation_invalid"))?;
+            let reserved = entry_bytes(&state, "plan_progress", Some(index), Some(&detail))?
+                .len()
+                .checked_add(extra)
+                .ok_or_else(|| anyhow!("host_evidence_role_reservation_invalid"))?;
+            ensure!(
+                state.events < 1024
+                    && reserved <= 65536
+                    && state.bytes + reserved <= 4 * 1024 * 1024,
+                "host_evidence_role_ledger_reservation"
+            );
+        }
+        append_locked(&mut state, "plan_progress", Some(index), Some(detail))
     }
     pub fn planned_success(
         &self,
@@ -407,9 +437,15 @@ impl Accounting {
             .plan
             .get_or_insert_with(PlannedSearchTelemetry::default);
         for event in &report.operations {
+            let mut operation = event.clone();
+            operation.evidence_roles = None;
             plan.operations
-                .insert(event.operation_id.clone(), event.clone());
+                .insert(event.operation_id.clone(), operation);
         }
+        if let Some(diagnostics) = &report.evidence_roles {
+            diagnostics.validate_bound()?;
+        }
+        plan.evidence_roles = report.evidence_roles.clone();
         let observed = plan_metrics(&plan.operations, report.metrics.elapsed_ms);
         ensure!(
             observed.jev_calls_attempted == report.metrics.jev_calls_attempted
@@ -426,6 +462,81 @@ impl Accounting {
         search.accounting_complete = false;
         let result = search.clone();
         append_locked(&mut state, "plan_fused", Some(index), None)?;
+        Ok(result)
+    }
+    pub fn role_delivery(
+        &self,
+        index: usize,
+        diagnostics: &EvidenceRoleDiagnostics,
+    ) -> Result<SearchTelemetry> {
+        diagnostics.validate_bound()?;
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
+        ensure!(!state.terminal, "host_jev_ledger_closed");
+        let search = &mut state.searches[index];
+        ensure!(
+            search.status == "awaiting_delivery",
+            "host_evidence_role_delivery_state"
+        );
+        let plan = search
+            .plan
+            .as_mut()
+            .ok_or_else(|| anyhow!("host_evidence_role_assessment_missing"))?;
+        let prior = plan
+            .evidence_roles
+            .as_ref()
+            .ok_or_else(|| anyhow!("host_evidence_role_assessment_missing"))?;
+        // Delivery may update dispositions and actual spans, never the judgments
+        // or their original identity. Keep all <=24 rows, including exclusions.
+        let strip_delivery = |value: &EvidenceRoleDiagnostics| -> Result<Value> {
+            let mut value = serde_json::to_value(value)?;
+            value
+                .as_object_mut()
+                .expect("diagnostics object")
+                .remove("delivery_packet_sha256");
+            for candidate in value["candidates"].as_array_mut().expect("candidate array") {
+                candidate
+                    .as_object_mut()
+                    .expect("candidate object")
+                    .remove("disposition");
+                candidate
+                    .as_object_mut()
+                    .expect("candidate object")
+                    .remove("delivered_span");
+            }
+            Ok(value)
+        };
+        ensure!(
+            strip_delivery(prior)? == strip_delivery(diagnostics)?,
+            "host_evidence_role_assessment_changed"
+        );
+        let previous = search.clone();
+        let mut result = previous.clone();
+        result.plan.as_mut().expect("planned search").evidence_roles = Some(diagnostics.clone());
+        // Reserve the exact future delivery entry, but keep durable dispositions
+        // pending until issue succeeds. A prepared packet is not yet delivered.
+        state.searches[index] = result.clone();
+        let projected = entry_bytes(&state, "delivery", Some(index), None);
+        state.searches[index] = previous;
+        let projected = projected?.len();
+        let detail = json!({"delivery_packet_sha256":diagnostics.delivery_packet_sha256});
+        let marker =
+            entry_bytes(&state, "role_delivery_prepared", Some(index), Some(&detail))?.len();
+        ensure!(
+            state.events + 2 <= 1024
+                && projected <= 65536
+                && marker <= 65536
+                && state.bytes + projected + marker <= 4 * 1024 * 1024,
+            "host_evidence_role_ledger_reservation"
+        );
+        append_locked(
+            &mut state,
+            "role_delivery_prepared",
+            Some(index),
+            Some(detail),
+        )?;
         Ok(result)
     }
     pub fn success(
@@ -496,6 +607,13 @@ impl Accounting {
                 .get_or_insert_with(PlannedSearchTelemetry::default)
                 .coverage = Some(error.coverage.clone());
         }
+        if let Some(diagnostics) = search
+            .plan
+            .as_mut()
+            .and_then(|plan| plan.evidence_roles.as_mut())
+        {
+            diagnostics.mark_delivery_failure();
+        }
         let result = search.clone();
         append_locked(&mut state, "search_failed", Some(index), None)?;
         Ok(result)
@@ -545,6 +663,13 @@ impl Accounting {
                 if matches!(search.status.as_str(), "running" | "awaiting_delivery") {
                     search.status = "failed".into();
                     search.accounting_complete = false;
+                    if let Some(diagnostics) = search
+                        .plan
+                        .as_mut()
+                        .and_then(|plan| plan.evidence_roles.as_mut())
+                    {
+                        diagnostics.mark_delivery_failure();
+                    }
                 }
             }
             for attempt in &mut state.model_attempts {
@@ -634,20 +759,7 @@ fn append_locked(
     index: Option<usize>,
     detail: Option<Value>,
 ) -> Result<()> {
-    let summary = summarize(&state.searches);
-    let entry = json!({
-        "schema_version":"gptgrep.jev-attempt.v1","event":event,"generation":state.generation,
-        "observed_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
-        "accounting_complete":event=="completed" && summary.accounting_complete,
-        "initial_status":summary.initial_status,"requests":summary.requests,
-        "attempted_calls":summary.attempted_calls,"unobserved_attempts":summary.unobserved_attempts,
-        "search":index.map(|index|&state.searches[index]),"receipt":detail,
-        "model_attempt_limit":state.model_attempt_limit,"model_attempts":state.model_attempts,
-        "model_usage":crate::model_attempts::summarize(&state.model_attempts),
-        "workflow":state.workflow,
-    });
-    let mut bytes = serde_json::to_vec(&entry)?;
-    bytes.push(b'\n');
+    let bytes = entry_bytes(state, event, index, detail.as_ref())?;
     ensure!(
         state.events < 1024 && bytes.len() <= 65536 && state.bytes + bytes.len() <= 4 * 1024 * 1024,
         "host_jev_ledger_limit"
@@ -663,6 +775,29 @@ fn append_locked(
         .sync_data()
         .map_err(|_| anyhow!("host_jev_ledger_sync_failed"))?;
     Ok(())
+}
+
+fn entry_bytes(
+    state: &State,
+    event: &str,
+    index: Option<usize>,
+    detail: Option<&Value>,
+) -> Result<Vec<u8>> {
+    let summary = summarize(&state.searches);
+    let entry = json!({
+        "schema_version":"gptgrep.jev-attempt.v1","event":event,"generation":state.generation,
+        "observed_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+        "accounting_complete":event=="completed" && summary.accounting_complete,
+        "initial_status":summary.initial_status,"requests":summary.requests,
+        "attempted_calls":summary.attempted_calls,"unobserved_attempts":summary.unobserved_attempts,
+        "search":index.map(|index|&state.searches[index]),"receipt":detail,
+        "model_attempt_limit":state.model_attempt_limit,"model_attempts":state.model_attempts,
+        "model_usage":crate::model_attempts::summarize(&state.model_attempts),
+        "workflow":state.workflow,
+    });
+    let mut bytes = serde_json::to_vec(&entry)?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 fn create_ledger(root: &Path) -> Result<(File, PathBuf)> {
@@ -739,5 +874,187 @@ fn create_ledger(root: &Path) -> Result<(File, PathBuf)> {
                 .open(&path)?,
             path,
         ))
+    }
+}
+
+#[cfg(test)]
+mod evidence_role_storage_tests {
+    use super::*;
+    use crate::evidence_roles::tests::{QUESTION, diagnostics, mock_roles, source_hit};
+    use gptgrep_core::{CandidateDisposition, PlannedScoringPolicy, SearchOptions};
+
+    #[tokio::test]
+    async fn source_bound_reservation_fails_before_mixed_provider_call() {
+        let (root, generation, _) = source_hit("Copper container has a ceramic liner.\n").await;
+        let accounting = Accounting::create(root.path(), &generation).unwrap();
+        let index = accounting
+            .start_search("initial", QUESTION, "hybrid", None, true)
+            .unwrap();
+        let (client, server) = mock_roles(1).await;
+        let observer = |event: &PlannedSearchEvent| {
+            if event.evidence_roles.is_some() && event.event == "before_call" {
+                accounting.0.lock().unwrap().bytes = 4 * 1024 * 1024 - 4096;
+            }
+            accounting.plan_event(index, event)
+        };
+        let error = gptgrep_core::search_planned_with_policy_and_observer(
+            root.path(),
+            QUESTION,
+            &[],
+            &SearchOptions::default(),
+            &generation,
+            &client,
+            PlannedScoringPolicy::EvidenceRoles,
+            &observer,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(server.await.unwrap().len(), 1);
+        let failure = error
+            .downcast_ref::<gptgrep_core::PlannedSearchError>()
+            .unwrap();
+        assert!(failure.cause.contains("observer"));
+        assert_eq!(failure.metrics.jev_requests, 1);
+        assert_eq!(accounting.summary().requests, 1);
+        assert!(!accounting.summary().accounting_complete);
+    }
+
+    #[tokio::test]
+    async fn reply_storage_failure_preserves_observed_usage_and_judgments() {
+        let (root, generation, _) = source_hit("Copper container has a ceramic liner.\n").await;
+        let accounting = Accounting::create(root.path(), &generation).unwrap();
+        let index = accounting
+            .start_search("initial", QUESTION, "hybrid", None, true)
+            .unwrap();
+        let ledger = accounting.path();
+        let (client, server) = mock_roles(2).await;
+        let observer = |event: &PlannedSearchEvent| {
+            if event.evidence_roles.is_some() && event.event == "after_reply" {
+                accounting.0.lock().unwrap().file = File::open(&ledger).unwrap();
+            }
+            accounting.plan_event(index, event)
+        };
+        let error = gptgrep_core::search_planned_with_policy_and_observer(
+            root.path(),
+            QUESTION,
+            &[],
+            &SearchOptions::default(),
+            &generation,
+            &client,
+            PlannedScoringPolicy::EvidenceRoles,
+            &observer,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(server.await.unwrap().len(), 2);
+        assert!(
+            error
+                .downcast_ref::<gptgrep_core::PlannedSearchError>()
+                .unwrap()
+                .cause
+                .contains("observer")
+        );
+        let summary = accounting.summary();
+        assert_eq!(summary.requests, 2);
+        assert_eq!(summary.usage.len(), 2);
+        assert!(!summary.accounting_complete);
+        let plan = summary.searches[0].plan.as_ref().unwrap();
+        assert!(
+            plan.operations
+                .values()
+                .all(|operation| operation.evidence_roles.is_none())
+        );
+        assert!(
+            plan.evidence_roles
+                .as_ref()
+                .unwrap()
+                .candidates
+                .iter()
+                .all(|candidate| candidate.role.is_some() && candidate.relevance_score.is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_packet_does_not_promote_delivery_and_failure_clears_scope() {
+        let (root, generation, hit) = source_hit("Copper container has a ceramic liner.\n").await;
+        let accounting = Accounting::create(root.path(), &generation).unwrap();
+        let index = accounting
+            .start_search("initial", QUESTION, "hybrid", None, true)
+            .unwrap();
+        let original = diagnostics(&generation, std::slice::from_ref(&hit));
+        {
+            let mut state = accounting.0.lock().unwrap();
+            state.searches[index].status = "awaiting_delivery".into();
+            state.searches[index].plan = Some(PlannedSearchTelemetry {
+                evidence_roles: Some(original.clone()),
+                ..Default::default()
+            });
+        }
+        let mut delivered = original.clone();
+        delivered.record_delivery(&hit, Some(&hit)).unwrap();
+        delivered.delivery_packet_sha256 = Some("d".repeat(64));
+        let prepared = accounting.role_delivery(index, &delivered).unwrap();
+        assert_eq!(
+            prepared
+                .plan
+                .as_ref()
+                .unwrap()
+                .evidence_roles
+                .as_ref()
+                .unwrap()
+                .candidates[0]
+                .disposition,
+            CandidateDisposition::Delivered
+        );
+        let retained = accounting.summary();
+        assert_eq!(
+            retained.searches[0]
+                .plan
+                .as_ref()
+                .unwrap()
+                .evidence_roles
+                .as_ref()
+                .unwrap()
+                .candidates[0]
+                .disposition,
+            CandidateDisposition::AwaitingDelivery
+        );
+        let ledger = std::fs::read_to_string(accounting.path()).unwrap();
+        let last: Value = serde_json::from_str(ledger.lines().last().unwrap()).unwrap();
+        assert_eq!(last["event"], "role_delivery_prepared");
+        assert_eq!(
+            last["search"]["plan"]["evidence_roles"]["candidates"][0]["disposition"],
+            "awaiting_delivery"
+        );
+        assert!(
+            last["search"]["plan"]["evidence_roles"]["candidates"][0]["delivered_span"].is_null()
+        );
+        let mut changed = original;
+        changed.candidates[0].role_confidence = Some(0.99);
+        assert!(
+            accounting
+                .role_delivery(index, &changed)
+                .unwrap_err()
+                .to_string()
+                .contains("assessment_changed")
+        );
+        let failed = accounting
+            .failure(index, &anyhow!("host_test_delivery_failed"))
+            .unwrap();
+        let roles = failed.plan.unwrap().evidence_roles.unwrap();
+        assert_eq!(
+            roles.candidates[0].disposition,
+            CandidateDisposition::DeliveryFailed
+        );
+        assert!(
+            roles.candidates[0].delivered_span.is_none() && roles.delivery_packet_sha256.is_none()
+        );
+        assert!(
+            accounting
+                .role_delivery(index, &changed)
+                .unwrap_err()
+                .to_string()
+                .contains("delivery_state")
+        );
     }
 }
