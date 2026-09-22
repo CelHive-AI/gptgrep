@@ -286,7 +286,7 @@ def run_case_pool(items, worker, concurrency, host, role, intervals):
         stage.update(elapsed_ms=(time.perf_counter() - started) * 1000,
                      finished_unix_ns=time.time_ns(), queued_tasks_not_started=len(items) - len(selected),
                      task_dispositions={name: sum(item.get("disposition") == name for item in selected)
-                                        for name in ("new_attempt", "reused", "unavailable", "task_failed", "interrupted", "unknown")},
+                                        for name in ("new_attempt", "reused", "carried", "unavailable", "task_failed", "interrupted", "unknown")},
                      task_outcomes={name: sum(item.get("task_status") == name for item in selected)
                                     for name in ("completed", "failed", "interrupted", "budget_blocked", "index_unavailable", "not_answered", "unavailable", "unknown")})
         checkpoint_attempt(stage_path, stage)
@@ -570,6 +570,7 @@ def judge_case(answer, *, args, profile, constants, host, variant_dir):
 def execute(args) -> dict:
     from bridge import LocalCodex
     from index_import import IndexOrigin, origin_declaration
+    from outcome_import import CompletedOutcomes, outcome_declaration
     profile = profiles.resolve(args)
     index_host_concurrency = getattr(args, "index_host_concurrency", 64)
     reader_concurrency, judge_concurrency = getattr(args, "reader_concurrency", 5), getattr(args, "judge_concurrency", 5)
@@ -588,7 +589,7 @@ def execute(args) -> dict:
     rows = [{"source_row": index, **questions[index]} for index in selected]
     filenames = list(dict.fromkeys(row["doc_id"] for row in rows))
     variants = ["raw", "full"] if args.variant == "both" else [args.variant]
-    adapter_files = {name: locks.digest(HERE / name) for name in ("locks.py", "bridge.py", "transports.py", "run.py", "capability.py", "profiles.py", "role_hosts.py", "cohorts.py", "qualification.py", "index_admission.py", "index_import.py", "index_replay.py", "reconcile_index.py")}
+    adapter_files = {name: locks.digest(HERE / name) for name in ("locks.py", "bridge.py", "transports.py", "run.py", "capability.py", "profiles.py", "role_hosts.py", "cohorts.py", "qualification.py", "index_admission.py", "index_import.py", "index_replay.py", "reconcile_index.py", "outcome_import.py")}
     binary = args.binary.expanduser().resolve()
     historical_capability = None
     if args.capability_receipt is not None:
@@ -628,13 +629,19 @@ def execute(args) -> dict:
         "historical_upstream_results_reproduced": False,
     }
     plan["index_origin"] = origin_declaration(args, plan)
+    plan["completed_outcome_origin"] = outcome_declaration(args, plan)
+    if plan["completed_outcome_origin"] is not None:
+        plan["index_origin"].update(
+            reuse_scope="index_preparation_only",
+            outcome_retention_policy_reference="completed_outcome_origin",
+            declaration="Preparation import and exact index-request replay only; qa_reuse/judge_reuse describe these index wrappers. Completed reader/judge retention is separately declared in completed_outcome_origin")
     private_directory(run_dir)
     with (run_dir / ".owner.lock").open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         initial_plan = run_dir / "plan.json"
         if initial_plan.exists():
             prior = locks.read_json(initial_plan)
-            for key in ("variants", "source_rows", "source_hashes", "question_sha256", "cohort_manifest_sha256", "source_and_dependencies", "adapter_files", "model", "reasoning_effort", "profile", "host_input_cap", "host_binary_sha256", "sdk_max_turns", "host_timeout_secs", "host_concurrency_by_role", "qa_stage_strategy", "index_origin"):
+            for key in ("variants", "source_rows", "source_hashes", "question_sha256", "cohort_manifest_sha256", "source_and_dependencies", "adapter_files", "model", "reasoning_effort", "profile", "host_input_cap", "host_binary_sha256", "sdk_max_turns", "host_timeout_secs", "host_concurrency_by_role", "qa_stage_strategy", "index_origin", "completed_outcome_origin"):
                 if prior.get(key) != plan.get(key):
                     raise ValueError("Run identity changed; use a new private directory without rewriting prior evidence")
         else:
@@ -655,6 +662,7 @@ def execute(args) -> dict:
         index_host = RoleHost(host, "index", profile["roles"]["index"])
         chat_host = RoleHost(host, "chat", profile["roles"]["chat"])
         origin = None
+        outcomes = None
         task_intervals = locks.read_json(run_dir / "task-intervals.json") if (run_dir / "task-intervals.json").exists() else []
         before_cwd = Path.cwd()
         previous_signals = {}
@@ -669,7 +677,12 @@ def execute(args) -> dict:
         try:
             if plan["index_origin"] is not None:
                 origin = IndexOrigin(plan["index_origin"], plan)
+                if plan["completed_outcome_origin"] is not None:
+                    outcomes = CompletedOutcomes(origin, plan, rows)
                 origin_summary = origin.summary()
+                if outcomes is not None:
+                    origin_summary.update(reuse_scope="index_preparation_only",
+                                          outcome_retention_report_reference="completed_outcome_carry_forward")
                 origin_manifest = run_dir / "index-origin.json"
                 if origin_manifest.exists():
                     if locks.read_json(origin_manifest) != origin_summary:
@@ -787,6 +800,9 @@ def execute(args) -> dict:
                                     raise ValueError("Cached SDK reading-text digest changed")
                         indexes = {record["source"]: record for record in index_records if record["variant"] == variant}
                         if args.stage in ("answer", "judge", "run"):
+                            constants = judge_constants(judge_source) if args.stage in ("judge", "run") or outcomes is not None else None
+                            if outcomes is not None:
+                                outcomes.prepare(indexes, metadata, benchmark, run_dir, client, constants)
                             def reader_client(role_host):
                                 case_transport = ResponsesTransport(role_host)
                                 case_backend = chat_backend(case_transport)
@@ -796,20 +812,23 @@ def execute(args) -> dict:
                                     chat_backend=case_backend,
                                 )
                                 return case_client, case_transport, case_backend
-                            def reader(row):
+                            def fresh_reader(row):
                                 return read_case(row, args=args, plan=plan, indexes=indexes, metadata=metadata,
                                                  variant=variant, variant_dir=variant_dir, benchmark=benchmark,
                                                  host=host, client_factory=reader_client)
+                            def reader(row):
+                                return outcomes.reader(row, fresh_reader) if outcomes is not None else fresh_reader(row)
                             reads = run_case_pool(rows, reader, reader_concurrency, host, "reader", task_intervals)
                             answers = [answer for answer, _receipts in reads]
                             for _answer, receipts in reads:
                                 wire.extend(receipts)
                             write_json(run_dir / "wire-receipts.json", wire)
                             if args.stage in ("judge", "run"):
-                                constants = judge_constants(judge_source)
-                                def judge(answer):
+                                def fresh_judge(answer):
                                     return judge_case(answer, args=args, profile=profile, constants=constants,
                                                       host=host, variant_dir=variant_dir)
+                                def judge(answer):
+                                    return outcomes.judge(answer, fresh_judge) if outcomes is not None else fresh_judge(answer)
                                 answers = run_case_pool(answers, judge, judge_concurrency, host, "judge", task_intervals)
                             for answer in answers:
                                 answer.update(answer_evidence(answer))
@@ -859,7 +878,8 @@ def execute(args) -> dict:
                       "achieved_host_concurrency": host.concurrency_report(),
                       "achieved_task_concurrency": task_concurrency_report(task_intervals),
                       "qa_stage_timings": qa_stage_summary(run_dir),
-                      "historical_index_origin": origin.summary() if origin is not None else None,
+                      "historical_index_origin": origin_summary if origin is not None else None,
+                      "completed_outcome_carry_forward": outcomes.summary(host.calls) if outcomes is not None else None,
                       "imported_index_count": sum("index_import" in record for record in index_records),
                       "replayed_index_count": sum("index_replay" in record for record in index_records),
                       **outer_timing, **inner_timing,
@@ -869,6 +889,8 @@ def execute(args) -> dict:
                       "gptgrep_comparison_complete": False, "provider_request_count": None, "billing_usd": None,
                       "usage_source": "private host-calls.jsonl; SDK aggregate usage is not authoritative",
                       "tools_interface_parity_claimed": False}
+            if outcomes is not None:
+                outcomes.assert_unchanged()
             write_json(run_dir / "summary.json", result)
             return result
         finally:
@@ -904,10 +926,11 @@ def main() -> int:
     profiles.add_arguments(parser)
     parser.add_argument("--max-model-calls", type=int, default=0, help="Cap total local host invocations for this run;0 forbids model calls")
     parser.add_argument("--index-host-concurrency", type=int, default=64, help="Owned index-host upper ceiling1..64; upstream summary64/expansion32 scheduling still applies")
-    parser.add_argument("--index-origin-run", type=Path, help="Declared immutable origin for full SDK index import/exact successful-request replay; never QA/judge reuse")
+    parser.add_argument("--index-origin-run", type=Path, help="Declared immutable origin for index-only import/replay; completed outcomes require separate --carry-completed-outcomes")
     parser.add_argument("--index-origin-plan-sha256")
     parser.add_argument("--index-origin-frozen-adapter-dir", type=Path)
     parser.add_argument("--index-origin-binary", type=Path)
+    parser.add_argument("--carry-completed-outcomes", action="store_true", help="Retain validated immutable origin reader/judge pairs, including wrong or abstained outcomes; full variant and declared origin required")
     parser.add_argument("--reader-concurrency", type=int, default=5, help="Bounded reader-case and reader-host ceiling1..64; drained before judging")
     parser.add_argument("--judge-concurrency", type=int, default=5, help="Bounded judge-case and judge-host ceiling1..64")
     parser.add_argument("--max-input-bytes", type=int, default=262144)
