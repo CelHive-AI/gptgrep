@@ -19,7 +19,7 @@ import jsonschema
 INPUT_CAP = 256 * 1024
 OUTPUT_CAP = 128 * 1024
 PROTOCOL_ERROR_KINDS = {"terminal_error", "malformed_error", "identity_mismatch", "failed_turn",
-                        "interrupted_turn", "invalid_turn_status"}
+                        "interrupted_turn", "invalid_turn_status", "tool_budget_exhausted"}
 CODEX_ERROR_INFOS = {"contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded", "rateLimitExceeded",
                      "serverOverloaded", "cyberPolicy", "misalignmentPolicyViolation", "httpConnectionFailed",
                      "responseStreamConnectionFailed", "internalServerError", "unauthorized", "badRequest",
@@ -51,9 +51,47 @@ def _observed_usage(value):
     return result or None
 
 
+def _observed_tool_budget(value):
+    """Retain a complete Rust v1 exhaustion snapshot, never infer counters."""
+    fields = ("max_tool_calls", "admitted_tool_calls", "denied_tool_calls", "max_denied_tool_calls")
+    if not isinstance(value, dict) or not all(_unsigned(value.get(field)) for field in fields):
+        return None
+    selected = {field: value[field] for field in fields}
+    limit = selected["max_tool_calls"]
+    if (not 1 <= limit <= 64 or selected["admitted_tool_calls"] != limit
+            or selected["max_denied_tool_calls"] != limit
+            or not 1 <= selected["denied_tool_calls"] <= limit):
+        return None
+    return selected
+
+
+def _receipt_tool_budget(items):
+    # The Rust host admits <=64 calls, denies <=64, and has one initial receipt.
+    if not isinstance(items, list) or len(items) > 129:
+        return None
+    latest = None
+    for item in items:
+        if (isinstance(item, dict) and item.get("success") is False
+                and item.get("required_initial") is False):
+            observed = _observed_tool_budget(item.get("tool_budget"))
+            if observed is not None:
+                latest = observed
+    return latest
+
+
 def _retain_accounting(receipt: dict, report: dict) -> None:
     receipt["usage"] = _observed_usage(report.get("usage"))
     protocol = report.get("host_protocol")
+    retrieval = report.get("host_retrieval")
+    if not isinstance(protocol, dict) and isinstance(retrieval, dict):
+        cause = retrieval.get("cause")
+        if (isinstance(cause, dict) and isinstance(cause.get("kind"), str)
+                and cause["kind"] in PROTOCOL_ERROR_KINDS):
+            protocol = cause
+    items = report.get("tool_calls")
+    if items is None and isinstance(retrieval, dict):
+        items = retrieval.get("receipts")
+    budget = _receipt_tool_budget(items)
     if isinstance(protocol, dict):
         # A failed protocol envelope never establishes complete accounting.
         selected = {"accounting_complete": False, "usage": _observed_usage(protocol.get("usage"))}
@@ -69,11 +107,16 @@ def _retain_accounting(receipt: dict, report: dict) -> None:
         selected["http_status_code"] = status if type(status) is int and 100 <= status <= 599 else None
         if _unsigned(protocol.get("server_retry_notifications")):
             selected["server_retry_notifications"] = protocol["server_retry_notifications"]
+        observed_budget = _observed_tool_budget(protocol.get("tool_budget"))
+        if observed_budget is not None and selected.get("kind") in PROTOCOL_ERROR_KINDS:
+            selected["tool_budget"] = budget = observed_budget
         receipt["host_protocol"] = selected
         if receipt["usage"] is None:
             receipt["usage"] = selected["usage"]
     if _unsigned(report.get("server_retry_notifications")):
         receipt["server_retry_notifications"] = report["server_retry_notifications"]
+    if budget is not None:
+        receipt["tool_budget"] = budget
 
 
 class AdapterError(RuntimeError):

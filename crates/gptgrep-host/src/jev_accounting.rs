@@ -69,6 +69,8 @@ pub struct ReceiptSummary {
     pub output_sha256: String,
     pub evidence: Vec<Citation>,
     pub search: Option<SearchTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_budget: Option<crate::ToolBudgetDiagnostics>,
 }
 
 impl From<&ToolReceipt> for ReceiptSummary {
@@ -85,6 +87,7 @@ impl From<&ToolReceipt> for ReceiptSummary {
             output_sha256: receipt.output_sha256.clone(),
             evidence: receipt.evidence.clone(),
             search: receipt.search.clone(),
+            tool_budget: receipt.tool_budget,
         }
     }
 }

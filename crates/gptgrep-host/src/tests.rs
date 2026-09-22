@@ -3,6 +3,8 @@ use super::*;
 mod mandatory;
 #[path = "protocol_error_tests.rs"]
 mod protocol_errors;
+#[path = "tool_budget_tests.rs"]
+mod tool_budget;
 use crate::{protocol, retrieval::Evidence};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
 
@@ -1053,54 +1055,6 @@ async fn replacing_current_generation_invalidates_even_an_uncertain_answer() {
         .finish(r#"{"answer":"Insufficient evidence","citations":[],"insufficient_evidence":true}"#)
         .unwrap_err();
     assert!(error.to_string().contains("generation"));
-}
-
-#[tokio::test]
-async fn tool_budget_stops_additional_calls() {
-    let root = fixture().await;
-    let mut evidence = Evidence::open(root.path(), None).unwrap();
-    let (client, server) = tokio::io::duplex(65536);
-    let (reader, writer) = tokio::io::split(client);
-    let (server_reader, mut server_writer) = tokio::io::split(server);
-    let server = tokio::spawn(async move {
-        let mut reader = BufReader::new(server_reader);
-        handshake(&mut reader, &mut server_writer).await;
-        call(
-            &mut reader,
-            &mut server_writer,
-            10,
-            "gptgrep_catalog",
-            json!({}),
-        )
-        .await;
-        send(
-            &mut server_writer,
-            json!({"id":11,"method":"item/tool/call","params":{
-                "threadId":"thread-native","turnId":"turn-native","callId":"second",
-                "namespace":"gptgrep","tool":"gptgrep_catalog","arguments":{}
-            }}),
-        )
-        .await;
-    });
-    let config = HostConfig {
-        max_tool_calls: 1,
-        ..HostConfig::default()
-    };
-    let error = protocol::drive(
-        BufReader::new(reader),
-        writer,
-        root.path(),
-        "query",
-        None,
-        &config,
-        &mut evidence,
-    )
-    .await
-    .err()
-    .unwrap();
-    assert!(error.to_string().contains("tool-call limit"));
-    assert_eq!(evidence.receipts.len(), 1);
-    server.await.unwrap();
 }
 
 #[tokio::test]

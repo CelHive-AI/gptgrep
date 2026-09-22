@@ -1,5 +1,5 @@
 use crate::{
-    HostConfig, HostProtocolError, HostProtocolErrorKind,
+    HostConfig, HostProtocolError, HostProtocolErrorKind, ToolBudgetDiagnostics,
     codex_error::ParsedError,
     final_schema,
     retrieval::{self, Evidence},
@@ -277,6 +277,7 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     let mut usage = None;
     let mut server_retry_notifications = 0;
     let mut calls = BTreeSet::new();
+    let mut tool_budget = None;
     loop {
         let message = rpc.receive().await?;
         let method = message["method"].as_str();
@@ -287,6 +288,7 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 message["params"]["willRetry"].as_bool(),
                 server_retry_notifications,
                 usage.as_ref(),
+                tool_budget,
             )
             .into());
         }
@@ -307,10 +309,6 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 calls.insert(call_id.clone()),
                 "Codex repeated a dynamic call ID"
             );
-            ensure!(
-                calls.len() <= config.max_tool_calls,
-                "Codex host reached its tool-call limit"
-            );
             let tool = params["tool"]
                 .as_str()
                 .ok_or_else(|| anyhow!("Invalid dynamic tool name"))?;
@@ -326,7 +324,35 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 "Dynamic tool arguments exceeded the limit"
             );
             let result = match &mut workflow {
-                Workflow::Retrieval { evidence, .. } => evidence.call(&call_id, tool, args).await?,
+                Workflow::Retrieval { evidence, .. } => {
+                    if calls.len() > config.max_tool_calls {
+                        evidence.validate_budget_request(tool, &args)?;
+                        // At most N denials tolerate parallel requests without
+                        // admitting more retrieval. The original turn and enclosing
+                        // deadline remain unchanged; no client retry is started.
+                        let budget = tool_budget.get_or_insert(ToolBudgetDiagnostics {
+                            max_tool_calls: config.max_tool_calls,
+                            admitted_tool_calls: config.max_tool_calls,
+                            denied_tool_calls: 0,
+                            max_denied_tool_calls: config.max_tool_calls,
+                        });
+                        if budget.denied_tool_calls == budget.max_denied_tool_calls {
+                            return Err(HostProtocolError::new(
+                                HostProtocolErrorKind::ToolBudgetExhausted,
+                                &ParsedError::default(),
+                                None,
+                                server_retry_notifications,
+                                usage.as_ref(),
+                                Some(*budget),
+                            )
+                            .into());
+                        }
+                        budget.denied_tool_calls += 1;
+                        evidence.deny_budget(&call_id, tool, args, *budget)?
+                    } else {
+                        evidence.call(&call_id, tool, args).await?
+                    }
+                }
                 Workflow::Completion { .. } => {
                     rpc.deny(id.clone()).await?;
                     return Err(anyhow!("Pure completion attempted to invoke a tool"));
@@ -381,6 +407,7 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                         None,
                         server_retry_notifications,
                         usage.as_ref(),
+                        tool_budget,
                     )
                 };
                 if same_thread(&message, &thread_id).is_err()
@@ -432,6 +459,7 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                         will_retry,
                         server_retry_notifications,
                         usage.as_ref(),
+                        tool_budget,
                     )
                 };
                 if same_thread(&message, &thread_id).is_err()
@@ -454,6 +482,12 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     }
     if server_retry_notifications > 0 {
         warnings.push(format!("Codex reported {server_retry_notifications} transient retry notifications during this turn. This counts server events, not physical or billed requests."));
+    }
+    if let Some(budget) = tool_budget {
+        warnings.push(format!(
+            "The dynamic tool budget was exhausted after {} admitted calls; {} additional requests were denied without retrieval. The answer uses previously issued evidence.",
+            budget.admitted_tool_calls, budget.denied_tool_calls
+        ));
     }
     Ok(Outcome {
         thread_id,

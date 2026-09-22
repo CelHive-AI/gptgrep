@@ -64,6 +64,8 @@ pub struct ToolReceipt {
     pub required_initial: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<crate::SearchTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_budget: Option<crate::ToolBudgetDiagnostics>,
 }
 
 pub(crate) struct Evidence {
@@ -252,7 +254,7 @@ impl Evidence {
         if let (Some(accounting), Some(search)) = (&self.accounting, &self.last_search) {
             accounting.delivery(search)?;
         }
-        self.receipts.push(ToolReceipt {
+        self.record_receipt(ToolReceipt {
             call_id: call_id.to_owned(),
             tool: tool.to_owned(),
             arguments: args,
@@ -262,13 +264,71 @@ impl Evidence {
             evidence,
             required_initial: self.initial_in_progress,
             search: self.last_search.clone(),
-        });
-        if let Some(accounting) = &self.accounting {
-            accounting.receipt(self.receipts.last().expect("just pushed"))?;
-        }
+            tool_budget: None,
+        })?;
         if let Some(error) = fatal {
             return Err(error);
         }
+        Ok(payload)
+    }
+
+    fn record_receipt(&mut self, receipt: ToolReceipt) -> Result<()> {
+        self.receipts.push(receipt);
+        if let Some(accounting) = &self.accounting {
+            accounting.receipt(self.receipts.last().expect("just pushed"))?;
+        }
+        Ok(())
+    }
+
+    /// Validate the advertised shape without reading sources or invoking Jev.
+    /// Budget exhaustion must not turn an unsupported or malformed request into
+    /// a recoverable tool result. Under-budget argument handling is unchanged.
+    pub fn validate_budget_request(&self, tool: &str, args: &Value) -> Result<()> {
+        let specifications = tools();
+        let schema = specifications[0]["tools"]
+            .as_array()
+            .and_then(|tools| tools.iter().find(|spec| spec["name"] == tool))
+            .map(|spec| &spec["inputSchema"])
+            .ok_or_else(|| anyhow!("Tool is not allowed"))?;
+        ensure!(
+            jsonschema::is_valid(schema, args)
+                && args.as_object().is_some_and(|args| args
+                    .values()
+                    .all(|value| !value.is_number() || value.as_u64().is_some()))
+                && args["query"]
+                    .as_str()
+                    .is_none_or(|query| query.len() <= 2048),
+            "Invalid dynamic tool arguments after tool-budget exhaustion"
+        );
+        Ok(())
+    }
+
+    pub fn deny_budget(
+        &mut self,
+        call_id: &str,
+        tool: &str,
+        args: Value,
+        budget: crate::ToolBudgetDiagnostics,
+    ) -> Result<Value> {
+        let value = json!({
+            "error":"tool_budget_exhausted",
+            "message":"No tool calls remain. Do not request more tools. Finalize now using only evidence already issued in this turn, including initial_retrieval. Preserve the required answer schema and issued citation IDs; if evidence is insufficient, state that and set insufficient_evidence=true.",
+            "tool_budget":budget
+        });
+        let payload =
+            json!({"contentItems":[{"type":"inputText","text":value.to_string()}],"success":false});
+        self.record_receipt(ToolReceipt {
+            call_id: call_id.into(),
+            tool: tool.into(),
+            arguments: args,
+            generation: self.generation.clone(),
+            success: false,
+            output_sha256: hash(&serde_json::to_vec(&payload)?),
+            evidence: vec![],
+            required_initial: false,
+            search: None,
+            tool_budget: Some(budget),
+        })?;
         Ok(payload)
     }
 

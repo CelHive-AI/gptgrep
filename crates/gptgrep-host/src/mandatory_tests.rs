@@ -106,6 +106,124 @@ fn ledger_events(path: &Path) -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn first_excess_request_can_finalize_seed_evidence_without_more_jev_calls() {
+    let root = corpus().await;
+    let (client, server, requests) = mock_jev(vec![(200, 3.0), (200, 3.0)]).await;
+    let config = HostConfig {
+        max_tool_calls: 1,
+        document: Some("pipeline-notes.md".into()),
+        ..HostConfig::default()
+    };
+    let mut evidence = Evidence::open(root.path(), None).unwrap();
+    let accounting = Accounting::create(root.path(), &evidence.generation).unwrap();
+    evidence
+        .configure(&config, accounting.clone(), Some(client))
+        .unwrap();
+    evidence
+        .bootstrap("How are tokens assembled?")
+        .await
+        .unwrap();
+    server.await.unwrap();
+    let id = evidence.initial_payload.as_ref().unwrap()["hits"][0]["node_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (client, wire) = tokio::io::duplex(65536);
+    let (reader, writer) = tokio::io::split(client);
+    let (server_reader, mut server_writer) = tokio::io::split(wire);
+    let rpc = tokio::spawn(async move {
+        let mut reader = BufReader::new(server_reader);
+        handshake(&mut reader, &mut server_writer).await;
+        call(
+            &mut reader,
+            &mut server_writer,
+            10,
+            "gptgrep_catalog",
+            json!({}),
+        )
+        .await;
+        send(
+            &mut server_writer,
+            json!({"id":11,"method":"item/tool/call","params":{
+                "threadId":"thread-native","turnId":"turn-native","callId":"call-11",
+                "namespace":"gptgrep","tool":"gptgrep_search",
+                "arguments":{"query":"How are tokens assembled?","mode":"hybrid"}
+            }}),
+        )
+        .await;
+        let response = receive(&mut reader).await;
+        assert_eq!(response["id"], 11);
+        assert_eq!(response["result"]["success"], false);
+        let payload: Value = serde_json::from_str(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"], "tool_budget_exhausted");
+        assert_eq!(payload["tool_budget"]["admitted_tool_calls"], 1);
+        let answer = json!({"answer":"Empty records are removed before the remaining tokens are joined.",
+            "citations":[id],"insufficient_evidence":false});
+        send(&mut server_writer, json!({"method":"turn/completed","params":{
+            "threadId":"thread-native","turn":{"id":"turn-native","status":"completed",
+                "items":[{"type":"agentMessage","phase":"final_answer","text":answer.to_string()}]}
+        }})).await;
+        let mut tail = String::new();
+        assert_eq!(
+            reader.read_line(&mut tail).await.unwrap(),
+            0,
+            "Unexpected client retry or new turn"
+        );
+    });
+    let outcome = protocol::drive(
+        BufReader::new(reader),
+        writer,
+        root.path(),
+        "How are tokens assembled?",
+        None,
+        &config,
+        &mut evidence,
+    )
+    .await
+    .unwrap();
+    rpc.await.unwrap();
+    let (_, citations, insufficient) = evidence.finish(&outcome.answer).unwrap();
+    assert!(!insufficient);
+    assert!(!citations.is_empty());
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(accounting.summary().requests, 2);
+    assert_eq!(accounting.summary().attempted_calls, 2);
+    assert_eq!(accounting.summary().searches.len(), 1);
+    assert_eq!(evidence.receipts.len(), 3);
+    assert!(evidence.receipts[0].required_initial);
+    assert!(evidence.receipts[1].success);
+    assert!(evidence.receipts[1].tool_budget.is_none());
+    let denied = &evidence.receipts[2];
+    assert!(!denied.success);
+    assert!(denied.evidence.is_empty());
+    assert!(denied.search.is_none());
+    assert_eq!(denied.tool_budget.unwrap().denied_tool_calls, 1);
+    let events = ledger_events(&accounting.path());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "receipt")
+            .count(),
+        3
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["receipt"]["tool_budget"]["denied_tool_calls"] == 1)
+    );
+    let forged =
+        json!({"answer":"Claim", "citations":["never-issued"],"insufficient_evidence":false});
+    assert!(evidence.finish(&forged.to_string()).is_err());
+    std::fs::write(root.path().join("pipeline-notes.md"), "Changed source").unwrap();
+    assert!(evidence.finish(&outcome.answer).is_err());
+}
+
+#[tokio::test]
 async fn initial_jev_pass_is_query_bound_scoped_and_delivered_to_codex() {
     let root = corpus().await;
     let (client, server, _) = mock_jev(vec![(200, 3.0), (200, 3.0)]).await;

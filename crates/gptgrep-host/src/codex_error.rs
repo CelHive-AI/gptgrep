@@ -46,6 +46,18 @@ pub enum HostProtocolErrorKind {
     FailedTurn,
     InterruptedTurn,
     InvalidTurnStatus,
+    ToolBudgetExhausted,
+}
+
+/// Dynamic retrieval budget only; the required initial Jev pass is separate.
+/// Denied calls count recoverable responses, never additional tool execution.
+/// Admitted calls include handlers returning recoverable argument errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBudgetDiagnostics {
+    pub max_tool_calls: usize,
+    pub admitted_tool_calls: usize,
+    pub denied_tool_calls: usize,
+    pub max_denied_tool_calls: usize,
 }
 
 /// A bounded, sanitized failure from an active Codex turn.
@@ -61,6 +73,8 @@ pub struct HostProtocolError {
     pub server_retry_notifications: usize,
     pub usage: Option<Value>,
     pub accounting_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_budget: Option<ToolBudgetDiagnostics>,
 }
 impl HostProtocolError {
     pub fn code(&self) -> &'static str {
@@ -71,6 +85,7 @@ impl HostProtocolError {
             HostProtocolErrorKind::FailedTurn => "host_codex_failed_turn",
             HostProtocolErrorKind::InterruptedTurn => "host_codex_interrupted_turn",
             HostProtocolErrorKind::InvalidTurnStatus => "host_codex_invalid_turn_status",
+            HostProtocolErrorKind::ToolBudgetExhausted => "host_tool_budget_exhausted",
         }
     }
 
@@ -80,6 +95,7 @@ impl HostProtocolError {
         will_retry: Option<bool>,
         server_retry_notifications: usize,
         usage: Option<&Value>,
+        tool_budget: Option<ToolBudgetDiagnostics>,
     ) -> Self {
         Self {
             kind,
@@ -89,6 +105,7 @@ impl HostProtocolError {
             server_retry_notifications,
             usage: usage.and_then(observed_usage),
             accounting_complete: false,
+            tool_budget,
         }
     }
 }
