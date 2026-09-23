@@ -9,8 +9,18 @@ pub use evidence_roles::{
     EvidenceRoleCandidateDecision, EvidenceRoleDiagnostics, EvidenceRoleHint, EvidenceRoleSource,
     EvidenceRoleSpan, MAX_EVIDENCE_ROLE_METADATA_BYTES,
 };
+mod navigation_overlay;
 mod planned;
 use gptgrep_pageindex::TreeNode;
+pub use navigation_overlay::{
+    BoundNavigationOverlay, MAX_NAVIGATION_HINT_BYTES, MAX_NAVIGATION_OVERLAY_BYTES,
+    NavigationDocumentCursor, NavigationDocumentHints, NavigationDocumentIdentity,
+    NavigationDocumentWindow, NavigationHint, NavigationHintOrigin, NavigationHintTarget,
+    NavigationJevIdentity, NavigationOverlay, NavigationOverlayBinding, NavigationOverlayCoverage,
+    NavigationOverlayProducer, NavigationOverlayPublication, NavigationWindowBinding,
+    navigation_overlay_binding, open_navigation_document, publish_navigation_overlay,
+    read_document_window, read_navigation_overlay,
+};
 pub use planned::{
     PlannedCoverage, PlannedScoringPolicy, PlannedSearchError, PlannedSearchEvent,
     PlannedSearchObserver, PlannedSearchReport, PlannedSpanProvenance, PlannedViewCoverage,
