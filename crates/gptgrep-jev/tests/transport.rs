@@ -1,5 +1,6 @@
 use gptgrep_jev::{Candidate, JevClient, MAX_RESPONSE_BYTES};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -55,6 +56,70 @@ async fn serve_once(
         request
     });
     (endpoint, server)
+}
+
+#[tokio::test]
+async fn prepared_decision_binds_exact_bytes_model_and_endpoint() {
+    let response = json!({"model":"typesafe/jev-1.13-20260917",
+        "answers":{"support":{"type":"choice","choice":"supported"}},
+        "usage":{"input_tokens":9,"output_tokens":2}});
+    let (endpoint, server) = serve_once("200 OK", response.to_string(), "").await;
+    let client = JevClient::with_endpoint("synthetic-test-key", None, &endpoint).unwrap();
+    let state = json!({"source":"A ceramic chamber stores the item."});
+    let questions = json!({"support":{"type":"choice","instructions":"Does the source support this hint?",
+        "criteria":{"supported":"Directly supported","unsupported":"Not supported"}}});
+    let wrong = client
+        .prepare_decision(state.clone(), questions.clone())
+        .unwrap();
+    let other =
+        JevClient::with_endpoint("synthetic-test-key", Some("typesafe/other"), &endpoint).unwrap();
+    assert!(
+        other
+            .submit_prepared(wrong)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("different client")
+    );
+    let wrong_client = client
+        .prepare_decision(state.clone(), questions.clone())
+        .unwrap();
+    let other_same_model = JevClient::with_endpoint("synthetic-test-key", None, &endpoint).unwrap();
+    assert!(
+        other_same_model
+            .submit_prepared(wrong_client)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("different client")
+    );
+    let prepared = client.prepare_decision(state, questions).unwrap();
+    let bytes = prepared.body_bytes();
+    let sha = prepared.body_sha256().to_owned();
+    assert_eq!(prepared.requested_model(), "typesafe/jev-1.13");
+    let result = client.submit_prepared(prepared).await.unwrap();
+    assert_eq!(
+        result.answers["support"],
+        gptgrep_jev::DecisionAnswer::Choice {
+            choice: "supported".into(),
+            confidence: None,
+            probabilities: None
+        }
+    );
+    let request = server.await.unwrap();
+    let offset = request
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    assert_eq!(request.len() - offset, bytes);
+    let actual: String = Sha256::digest(&request[offset..])
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(actual, sha);
+    let body: Value = serde_json::from_slice(&request[offset..]).unwrap();
+    assert_eq!(body["provider"]["allow_fallbacks"], false);
 }
 
 #[tokio::test]

@@ -18,7 +18,8 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, net::IpAddr, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, net::IpAddr, sync::Arc, time::Duration};
 
 pub const DEFAULT_MODEL: &str = "typesafe/jev-1.13";
 pub const DEFAULT_ENDPOINT: &str = "https://openrouter.ai/api/alpha/decisions";
@@ -110,6 +111,32 @@ pub struct JevClient {
     endpoint: Url,
     model: String,
     authorization: HeaderValue,
+    identity: Arc<()>,
+}
+
+/// One exact validated Decisions request reserved before network admission.
+/// Raw state, questions and credentials are never exposed through Debug or serde.
+pub struct PreparedDecision {
+    body: Vec<u8>,
+    questions: Value,
+    requested_model: String,
+    endpoint: Url,
+    body_sha256: String,
+    identity: Arc<()>,
+}
+
+impl PreparedDecision {
+    pub fn body_bytes(&self) -> usize {
+        self.body.len()
+    }
+
+    pub fn body_sha256(&self) -> &str {
+        &self.body_sha256
+    }
+
+    pub fn requested_model(&self) -> &str {
+        &self.requested_model
+    }
 }
 
 impl JevClient {
@@ -170,6 +197,7 @@ impl JevClient {
             endpoint,
             model: model.to_owned(),
             authorization,
+            identity: Arc::new(()),
         })
     }
 
@@ -178,8 +206,38 @@ impl JevClient {
     /// Invalid input is rejected before network I/O. A transport or validation error is never
     /// converted into a successful empty answer or an artificial relevance score.
     pub async fn decide(&self, state: Value, questions: Value) -> Result<DecisionResponse> {
+        let prepared = self.prepare_decision(state, questions)?;
+        self.submit_prepared(prepared).await
+    }
+
+    /// Validate and serialize once, so a caller can durably reserve the exact
+    /// encoded request size and digest before sending it. Oversized requests
+    /// fail before network I/O; callers own any explicit splitting policy.
+    pub fn prepare_decision(&self, state: Value, questions: Value) -> Result<PreparedDecision> {
         let body = self.request_body(state, &questions)?;
-        self.decide_body(body, &questions).await
+        let body_sha256 = Sha256::digest(&body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(PreparedDecision {
+            body,
+            questions,
+            requested_model: self.model.clone(),
+            endpoint: self.endpoint.clone(),
+            body_sha256,
+            identity: Arc::clone(&self.identity),
+        })
+    }
+
+    /// Send exactly the prepared request once and validate the typed response.
+    pub async fn submit_prepared(&self, prepared: PreparedDecision) -> Result<DecisionResponse> {
+        ensure!(
+            prepared.requested_model == self.model
+                && prepared.endpoint == self.endpoint
+                && Arc::ptr_eq(&prepared.identity, &self.identity),
+            "Prepared Jev decision belongs to a different client, model or endpoint"
+        );
+        self.decide_body(prepared.body, &prepared.questions).await
     }
 
     async fn decide_body(&self, body: Vec<u8>, questions: &Value) -> Result<DecisionResponse> {
