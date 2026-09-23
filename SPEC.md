@@ -70,9 +70,15 @@ model-training/research experiments are outside this repository's routine author
 The research-preview program must demonstrate a useful measured advantage over a
 live PageIndex Flash baseline on the pinned PageIndex-OSS-Benchmark tasks. A source
 release, passing process, synthetic smoke or GPTgrep-only corpus run does not meet
-this goal. The same corpus/task cohort, model/effort, source revisions, prompt and
-tool budgets, judge and failure denominators must be retained for each comparison.
-Provider/backend substitutions and harness differences must be explicit.
+this goal. Retain the same corpus/task cohort, pinned source revisions, declared prompt
+and tool budgets, judge and failure denominators for each comparison. The
+GPTgrep 5.6-versus-6 Luna ablation changes only the declared Codex builder and
+retrieval-worker model between its arms. For the user-selected first-release
+target, GPTgrep 6 Luna is compared with the frozen PageIndex Flash plus GPT-5.6
+Luna baseline; disclose that model difference and report the internal GPTgrep
+model ablation separately. A cross-model whole-system gain cannot be attributed
+to retrieval alone. Provider/backend substitutions and harness differences must
+also be explicit.
 
 A named, pinned conventional embedding-RAG comparator is deferred to the version
 after the first accepted research-preview release. Its preparation, experiments

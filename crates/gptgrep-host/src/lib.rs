@@ -188,12 +188,7 @@ async fn execute_with_client(
             instructions_sha256: retrieval::hash(input.instructions.as_bytes()),
             schema_sha256: retrieval::hash(&serde_json::to_vec(&input.schema)?),
         });
-        let mut planner_config = config.clone();
-        planner_config.model = DEFAULT_MODEL.into();
-        planner_config.reasoning_effort = DEFAULT_REASONING_EFFORT.into();
-        planner_config.service_tier = DEFAULT_SERVICE_TIER.into();
-        planner_config.max_input_bytes = config.max_input_bytes.min(query_plan::MAX_PLAN_INPUT_BYTES);
-        planner_config.query_plan = None;
+        let mut planner_config = planner_runtime_config(config, query_config);
         planner_config.trace_path = config.trace_path.as_ref().map(|path| {
             let mut name = path.as_os_str().to_os_string();
             name.push(".planner-");
@@ -346,6 +341,10 @@ async fn execute_with_client(
                     error
                         .downcast_ref::<jev_accounting::InitializationError>()
                         .map(|error| json!({"stage":"initialization","cause":error.cause}))
+                })
+                .or_else(|| {
+                    (stage == "citation_validation")
+                        .then(|| json!({"code": retrieval::citation_validation_code(&error)}))
                 });
             Err(HostRetrievalError {
                 code,
@@ -364,6 +363,16 @@ async fn execute_with_client(
             .into())
         }
     }
+}
+
+fn planner_runtime_config(config: &HostConfig, query_config: &QueryPlanConfig) -> HostConfig {
+    let mut planner = config.clone();
+    planner.model = query_config.planner_model.clone();
+    planner.reasoning_effort = DEFAULT_REASONING_EFFORT.into();
+    planner.service_tier = DEFAULT_SERVICE_TIER.into();
+    planner.max_input_bytes = config.max_input_bytes.min(query_plan::MAX_PLAN_INPUT_BYTES);
+    planner.query_plan = None;
+    planner
 }
 
 struct ProcessOutcome {

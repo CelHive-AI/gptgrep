@@ -6,6 +6,7 @@
   "authority": "User project ownership mandate; routine implementation, harness, CI and releases authorized within the agreed direction",
   "host_defaults": {
     "model": "gpt-5.6-luna",
+    "experimental_query_planner_model": "gpt-6-luna",
     "model_reasoning_effort": "max",
     "service_tier": "fast"
   },
@@ -16,6 +17,7 @@
     "task_count": 62,
     "document_count": 34,
     "baseline": "Actual pinned PageIndex Flash/local SDK execution; local Codex backend substitution explicitly identified",
+    "first_release_external_model_policy": "Keep the frozen actual PageIndex Flash + gpt-5.6-luna baseline. GPTgrep gpt-6-luna versus this baseline is a disclosed cross-model whole-system comparison, not a retrieval-only causal comparison.",
     "historical_readme_scores_are_acceptance": false,
     "gptgrep_only_subset_run_is_baseline": false,
     "index_reasoning_effort": "medium (documented API default, explicit through adapted runtime)",
@@ -114,8 +116,10 @@
   },
   "first_release_gate": {
     "required": "G5",
-    "baseline": "PageIndex Flash + GPT-5.6, exact role profiles recorded",
+    "baseline": "PageIndex Flash + GPT-5.6, exact role profiles recorded and unchanged for the first-release target",
     "system": "RAW documents -> LiteParse/Rust PageIndex/tgrep build -> required Jev routing/reranking -> local Codex Luna/max reasoning",
+    "model_ablation": "Before any GPTgrep 6-versus-PageIndex 5.6 release claim, run predeclared complete GPTgrep 5.6-versus-6 full-cohort A/B on the same source with builder, planner and reader model as the only declared intervention and an unchanged judge. Current GPTgrep build is deterministic and must gain a separately reviewed raw-only reasoning-index stage before it can claim a builder-model ablation.",
+    "interpretation": "Cross-model results measure whole-system advantage against the user-selected PageIndex baseline; disclose model and adapter effects, and do not claim model-independent retrieval superiority.",
     "method": "General improvements from clean development signals; complete62-task live A/B, report historical8/54 split separately, no smoke substitution",
     "partial_source_delivery_is_release": false
   },

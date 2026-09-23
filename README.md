@@ -152,7 +152,9 @@ Citation identity checks do not independently prove semantic entailment.
 
 
 The ask-only `--experimental-query-plan` option first runs a separate no-tools
-`gpt-5.6-luna` / `max` / `fast` planner. It retains the original question and
+`gpt-6-luna` / `max` / `fast` planner by default. Use `--planner-model` to select
+another planner model explicitly, including `gpt-5.6-luna` for a controlled run.
+It retains the original question and
 proposes at most two alternate retrieval phrases. Up to two routing operations
 run concurrently; exact source spans are combined within the existing candidate
 budget and Jev reranks them against the original question before the reader starts.

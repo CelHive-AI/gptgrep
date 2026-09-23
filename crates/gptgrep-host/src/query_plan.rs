@@ -14,6 +14,12 @@ pub struct QueryPlanConfig {
     pub planner_timeout_secs: u64,
     #[serde(default)]
     pub evidence_roles: bool,
+    #[serde(default = "default_planner_model")]
+    pub planner_model: String,
+}
+
+fn default_planner_model() -> String {
+    "gpt-6-luna".into()
 }
 
 impl Default for QueryPlanConfig {
@@ -21,6 +27,7 @@ impl Default for QueryPlanConfig {
         Self {
             planner_timeout_secs: 45,
             evidence_roles: false,
+            planner_model: default_planner_model(),
         }
     }
 }
@@ -30,6 +37,13 @@ impl QueryPlanConfig {
         ensure!(
             (1..=45).contains(&self.planner_timeout_secs),
             "host_query_plan_timeout_invalid"
+        );
+        ensure!(
+            !self.planner_model.trim().is_empty()
+                && self.planner_model == self.planner_model.trim()
+                && self.planner_model.len() <= 128
+                && !self.planner_model.chars().any(char::is_control),
+            "host_query_plan_model_invalid"
         );
         Ok(())
     }

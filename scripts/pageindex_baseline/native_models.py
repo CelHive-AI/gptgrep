@@ -18,7 +18,10 @@ TOKEN_FIELDS = {
 }
 STATUSES = {"reserved", "running", "process_completed", "completed", "failed", "interrupted"}
 ROLES = {"query_planner", "final_reader"}
+# A missing planner binding belongs to the historical fixed-profile protocol.
+# New runs resolve and bind DEFAULT_PLANNER_MODEL explicitly instead.
 PLANNER_PROFILE = {"model": "gpt-5.6-luna", "reasoning_effort": "max", "service_tier": "fast"}
+DEFAULT_PLANNER_MODEL = "gpt-6-luna"
 
 
 def _label(value, *, optional=False):
@@ -33,8 +36,31 @@ def _tier(value):
     return "priority" if value in ("priority", "fast") else value
 
 
-def attempts_from_report(report, reader_profile, *, required=False):
+def planner_profile(model=DEFAULT_PLANNER_MODEL):
+    model = _label(model)
+    if model != model.strip():
+        raise ValueError("Planner model must not contain surrounding whitespace")
+    return {"model": model, "reasoning_effort": "max", "service_tier": "fast"}
+
+
+def planner_profile_from_payload(payload):
+    """Resolve a hash-bound request; absence preserves the historical profile."""
+    if payload.get("experimental_query_plan") is not True:
+        if "planner_model" in payload:
+            raise ValueError("Planner model requires experimental query planning")
+        return None
+    return planner_profile(payload.get("planner_model", PLANNER_PROFILE["model"]))
+
+
+def attempts_from_report(report, reader_profile, *, required=False, planner_profile=None):
     """Validate explicit native records; do not infer an absent planner receipt."""
+    expected_planner = PLANNER_PROFILE if planner_profile is None else planner_profile
+    if not isinstance(expected_planner, dict) or set(expected_planner) != {"model", "reasoning_effort", "service_tier"}:
+        raise ValueError("Native planner profile must explicitly bind model, effort and tier")
+    if (_label(expected_planner["model"]) != expected_planner["model"].strip()
+            or expected_planner["reasoning_effort"] != "max"
+            or expected_planner["service_tier"] != "fast"):
+        raise ValueError("Native planner profile differs from its fixed effort/tier contract")
     if not isinstance(report, dict):
         raise ValueError("Native model accounting envelope must be an object")
     envelope = report
@@ -59,7 +85,7 @@ def attempts_from_report(report, reader_profile, *, required=False):
         if identifier in identities:
             raise ValueError("Duplicate native model-attempt identity")
         identities.add(identifier)
-        expected = PLANNER_PROFILE if role == "query_planner" else reader_profile
+        expected = expected_planner if role == "query_planner" else reader_profile
         for key in ("model", "reasoning_effort", "service_tier"):
             requested = _label(record.get("requested_" + key))
             if requested != expected[key]:

@@ -321,6 +321,43 @@ async fn query_plan_is_rejected_before_nonask_operations_or_invalid_timeout() {
     }
 }
 
+#[test]
+fn planner_model_override_is_bound_independently_from_reader() {
+    let reader = HostConfig {
+        model: "gpt-5.6-luna".into(),
+        max_input_bytes: 64 * 1024,
+        query_plan: Some(QueryPlanConfig {
+            planner_model: "gpt-6-luna".into(),
+            ..QueryPlanConfig::default()
+        }),
+        ..HostConfig::default()
+    };
+    let selected = planner_runtime_config(&reader, reader.query_plan.as_ref().unwrap());
+    assert_eq!(reader.model, "gpt-5.6-luna");
+    assert_eq!(selected.model, "gpt-6-luna");
+    assert_eq!(selected.reasoning_effort, "max");
+    assert_eq!(selected.service_tier, "fast");
+    assert_eq!(selected.max_input_bytes, query_plan::MAX_PLAN_INPUT_BYTES);
+    assert!(selected.query_plan.is_none());
+    let control = QueryPlanConfig {
+        planner_model: "gpt-5.6-luna".into(),
+        ..QueryPlanConfig::default()
+    };
+    assert_eq!(
+        planner_runtime_config(&reader, &control).model,
+        "gpt-5.6-luna"
+    );
+    assert_eq!(QueryPlanConfig::default().planner_model, "gpt-6-luna");
+    assert!(
+        QueryPlanConfig {
+            planner_model: " gpt-6-luna".into(),
+            ..QueryPlanConfig::default()
+        }
+        .validate()
+        .is_err()
+    );
+}
+
 #[cfg(unix)]
 fn mock_process(directory: &Path, answer: Option<&str>) -> HostConfig {
     use std::os::unix::fs::PermissionsExt;
@@ -610,7 +647,7 @@ fn two_process_mock_with_budget(
             ("config", json!({"id":2,"result":{"config":{}}})),
             (
                 "thread",
-                json!({"id":3,"result":{"thread":{"id":thread_id},"model":DEFAULT_MODEL,
+                json!({"id":3,"result":{"thread":{"id":thread_id},"model":if role == "planner" { "gpt-6-luna" } else { DEFAULT_MODEL },
                 "modelProvider":"openai","reasoningEffort":"max","serviceTier":"priority",
                 "approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}}}),
             ),
@@ -827,7 +864,14 @@ async fn planned_ask_runs_two_distinct_turns_with_original_question_and_summed_u
             &std::fs::read(home.path().join(format!("{role}.thread.json"))).unwrap(),
         )
         .unwrap();
-        assert_eq!(thread["params"]["model"], DEFAULT_MODEL);
+        assert_eq!(
+            thread["params"]["model"],
+            if role == "planner" {
+                "gpt-6-luna"
+            } else {
+                DEFAULT_MODEL
+            }
+        );
         assert_eq!(thread["params"]["serviceTier"], "fast");
         if role == "planner" {
             assert_eq!(thread["params"]["dynamicTools"], json!([]));

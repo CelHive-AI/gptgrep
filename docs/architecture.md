@@ -185,7 +185,9 @@ crate notices for implemented stages and remaining differences.
 ## Experimental query planning
 
 The default-off ask option `--experimental-query-plan` inserts one separate
-Luna/max/fast completion before initial retrieval. The planner receives only the
+`gpt-6-luna`/max/fast completion by default before initial retrieval. The
+planner model can be selected explicitly with `--planner-model`; the final
+reader retains its separately selected profile. The planner receives only the
 original question, fixed scope and bounded source-derived descriptors. It can
 propose zero to two retrieval phrases, never a new scope or citable evidence.
 The original question remains unchanged.

@@ -26,7 +26,7 @@ import profiles
 import cohorts
 from bridge import AdapterError, LocalCodex, json_bytes, owned_process, _retain_accounting, _receipt_tool_budget
 from role_hosts import RoleHost
-from native_models import PLANNER_PROFILE, attempts_from_report, usage_summary
+from native_models import DEFAULT_PLANNER_MODEL, attempts_from_report, planner_profile, planner_profile_from_payload, usage_summary
 from run import checkpoint_attempt, fingerprint, judge_constants, private_directory, run_case_pool, task_concurrency_report, write_json
 
 
@@ -37,7 +37,14 @@ def query_strategy_flags(args) -> tuple[bool, bool]:
         raise ValueError("Experimental strategy flags must be booleans")
     if evidence_roles and not planned:
         raise ValueError("Evidence-role selection requires experimental query planning")
+    if getattr(args, "planner_model", None) is not None and not planned:
+        raise ValueError("Planner model requires experimental query planning")
     return planned, evidence_roles
+
+
+def selected_planner_profile(args) -> dict:
+    model = getattr(args, "planner_model", None)
+    return planner_profile(DEFAULT_PLANNER_MODEL if model is None else model)
 
 
 def ask_arguments(binary: Path, root: Path, row: dict, args) -> list[str]:
@@ -50,7 +57,7 @@ def ask_arguments(binary: Path, root: Path, row: dict, args) -> list[str]:
             "--timeout", str(args.timeout),
             "--max-tool-calls", str(args.max_tool_calls),
             "--max-input-bytes", str(getattr(args, "max_input_bytes", 262144))] + (
-                ["--experimental-query-plan"] if planned else []
+                ["--experimental-query-plan", "--planner-model", selected_planner_profile(args)["model"]] if planned else []
             ) + (["--experimental-evidence-roles"] if evidence_roles else []) + [
                 "--json", "--", row["question"], str(root)]
 
@@ -219,6 +226,7 @@ def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeo
                 report, {"model": payload["model"], "reasoning_effort": payload["reasoning_effort"],
                          "service_tier": payload["service_tier"]},
                 required=payload.get("experimental_query_plan") is True,
+                planner_profile=planner_profile_from_payload(payload),
             )
             if model_records is not None:
                 receipt["model_attempts"] = model_records
@@ -250,7 +258,7 @@ def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeo
 
 
 def ledger_recovery(path: Path, *, generation=None, query_sha256=None, document=None,
-                    reader_profile=None, planned=False) -> dict:
+                    reader_profile=None, planned=False, planner_profile=None) -> dict:
     """Retain cumulative latest-per-search evidence when the final CLI JSON is absent."""
     data = path.read_bytes()
     if len(data) > 4 * 1024 * 1024:
@@ -319,7 +327,8 @@ def ledger_recovery(path: Path, *, generation=None, query_sha256=None, document=
         if not workflow_verified:
             raise ValueError("Native model snapshot has no workflow binding")
         if reader_profile is not None:
-            model_records = attempts_from_report({"model_attempts": model_snapshot}, reader_profile, required=planned)
+            model_records = attempts_from_report({"model_attempts": model_snapshot}, reader_profile,
+                                                  required=planned, planner_profile=planner_profile)
     return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
             "complete_events": len(events), "torn_trailing_record": torn,
             "terminal_event": last.get("event"), "source": "durable_host_ledger", "case_identity_verified": identity_verified, "jev": jev,
@@ -587,7 +596,8 @@ def completed_host_response(ordinal: int, request: dict, model: str, effort: str
         raise ValueError("Retained host native session differs")
     if request.get("operation") == "ask":
         model_records = attempts_from_report(report, {"model": model, "reasoning_effort": effort, "service_tier": service_tier},
-                                             required=request.get("experimental_query_plan") is True)
+                                             required=request.get("experimental_query_plan") is True,
+                                             planner_profile=planner_profile_from_payload(request))
         if model_records is not None and call.get("model_attempts") != model_records:
             raise ValueError("Retained nested model accounting differs from its bound response")
         if call.get("evidence_role_policy") != evidence_role_policy(report, request):
@@ -623,6 +633,7 @@ def reader_payload(row: dict, args) -> dict:
             "model": args.model, "reasoning_effort": args.reasoning_effort, "service_tier": args.service_tier}
     if planned:
         payload["experimental_query_plan"] = True
+        payload["planner_model"] = selected_planner_profile(args)["model"]
         payload["max_input_bytes"] = getattr(args, "max_input_bytes", 262144)
     if evidence_roles:
         payload["experimental_evidence_roles"] = True
@@ -694,6 +705,7 @@ def cumulative_accounting(shared: LocalCodex, run_dir: Path) -> dict:
                         {"model": payload["model"], "reasoning_effort": payload["reasoning_effort"],
                          "service_tier": payload["service_tier"]},
                         required=payload.get("experimental_query_plan") is True,
+                        planner_profile=planner_profile_from_payload(payload),
                     )
                     if model_records is not None:
                         model_source = "bound_native_response"
@@ -788,8 +800,9 @@ def verify_native_evidence(report: dict, corpus: Path, sources: dict, text: dict
 def execute(args) -> dict:
     planned, evidence_roles = query_strategy_flags(args)
     profile = profiles.resolve(args)
+    planner = selected_planner_profile(args) if planned else None
     if planned:
-        profile["roles"]["query_planner"] = dict(PLANNER_PROFILE)
+        profile["roles"]["query_planner"] = dict(planner)
     profile["roles"]["index"] = {"engine": "deterministic_native", "model": None, "reasoning_effort": None, "service_tier": None}
     profile["index_effort_note"] = "Native build is deterministic; no Jev or generative indexing stage is claimed."
     if not 1 <= args.reader_concurrency <= 64 or not 1 <= args.judge_concurrency <= 64:
@@ -831,7 +844,7 @@ def execute(args) -> dict:
     }
     if planned:
         manifest["query_strategy"] = {
-            "experimental_query_plan": True, "planner": dict(PLANNER_PROFILE),
+            "experimental_query_plan": True, "planner": dict(planner),
             "max_planner_turns_per_native_ask": 1, "max_native_model_attempts_per_ask": 2,
             "planner_input_cap": min(args.max_input_bytes, 32768), "planner_output_cap": 4096,
             "planner_timeout_secs": min(args.timeout, 45),
@@ -964,7 +977,8 @@ def execute(args) -> dict:
                             recovered = locks.read_json(recovery_path) if recovery_path.exists() else [ledger_recovery(
                                 path, generation=build["generation_binding"]["generation"],
                                 query_sha256=hashlib.sha256(row["question"].encode()).hexdigest(), document=row["doc_id"],
-                                reader_profile=profile["roles"]["chat"], planned=planned) for path in fresh]
+                                reader_profile=profile["roles"]["chat"], planned=planned,
+                                planner_profile=planner) for path in fresh]
                             if not recovery_path.exists():
                                 write_json(recovery_path, recovered)
                             write_json(accounting_path, {"ordinal": start["host_ordinal"],
@@ -1008,7 +1022,8 @@ def execute(args) -> dict:
                     start = locks.read_json(attempt_dir / "start.json")
                     recovered = [ledger_recovery(path, generation=build["generation_binding"]["generation"],
                                  query_sha256=hashlib.sha256(row["question"].encode()).hexdigest(), document=row["doc_id"],
-                                 reader_profile=profile["roles"]["chat"], planned=planned)
+                                 reader_profile=profile["roles"]["chat"], planned=planned,
+                                 planner_profile=planner)
                                  for path in owned_ledger_paths(corpus, receipt, start["prior_ledgers"],
                                  not_before_unix_ns=start["reservation_observed_unix_ns"])]
                     write_json(attempt_dir / "ledger-recovery.json", recovered)
@@ -1195,6 +1210,7 @@ def main() -> int:
     parser.add_argument("--retry-failed", action="store_true", help="Retry failed/interrupted work; completed reader/judge outcomes are always reused")
     parser.add_argument("--experimental-query-plan", action="store_true",
                         help="Evaluate the explicit additional Luna planner and bounded multi-query initial retrieval; all nested model steps are accounted separately")
+    parser.add_argument("--planner-model", help=f"Query-planner model, independent of reader and judge; defaults to {DEFAULT_PLANNER_MODEL} for new planned runs. Requires --experimental-query-plan.")
     parser.add_argument("--experimental-evidence-roles", action="store_true",
                         help="Add bounded Jev evidence-role judgments to the planned union request; requires --experimental-query-plan")
     args = parser.parse_args()

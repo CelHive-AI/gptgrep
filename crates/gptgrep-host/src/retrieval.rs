@@ -911,6 +911,26 @@ impl Evidence {
     }
 }
 
+/// Public failure telemetry is a fixed code, never the model's answer or source text.
+pub(crate) fn citation_validation_code(error: &anyhow::Error) -> &'static str {
+    match error.to_string().as_str() {
+        "Host final response exceeded its byte limit" => "final_response_byte_limit",
+        "Codex final answer did not match the structured evidence contract" => {
+            "final_response_schema"
+        }
+        "Host answer length is invalid" => "answer_length",
+        "Too many final citations" => "citation_count",
+        "Answer contains no issued evidence citations" => "missing_citations",
+        "Repeated final citation" => "duplicate_citation",
+        "Final citation was not issued as evidence" => "unissued_citation",
+        "Invalid issued evidence window" => "invalid_issued_window",
+        "Cited source changed during the workflow" => "stale_cited_source",
+        "Cited evidence window no longer matches the issued bytes" => "changed_cited_window",
+        _ if error.downcast_ref::<crate::HostCapabilityError>().is_some() => "no_evidence_tools",
+        _ => "unclassified_citation_validation",
+    }
+}
+
 fn integer(value: &Value, key: &str, default: usize) -> Result<usize> {
     value
         .get(key)
@@ -1012,4 +1032,29 @@ pub(crate) fn allowed(tool: &str) -> bool {
         tool,
         "gptgrep_catalog" | "gptgrep_tree" | "gptgrep_read" | "gptgrep_search"
     )
+}
+
+#[cfg(test)]
+mod citation_code_tests {
+    use super::citation_validation_code;
+
+    #[test]
+    fn citation_failure_telemetry_is_bounded_and_redacted() {
+        assert_eq!(
+            citation_validation_code(&anyhow::anyhow!(
+                "Final citation was not issued as evidence"
+            )),
+            "unissued_citation"
+        );
+        assert_eq!(
+            citation_validation_code(&anyhow::anyhow!(
+                "Codex final answer did not match the structured evidence contract"
+            )),
+            "final_response_schema"
+        );
+        assert_eq!(
+            citation_validation_code(&anyhow::anyhow!("Unrecognized source detail: private text")),
+            "unclassified_citation_validation"
+        );
+    }
 }
