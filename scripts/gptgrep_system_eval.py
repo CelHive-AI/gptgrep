@@ -48,6 +48,18 @@ def selected_planner_profile(args) -> dict:
                            getattr(args, "reasoning_effort", None) or "max")
 
 
+def normalize_codex_launcher(value: str) -> str:
+    """Bind explicit launcher paths before host calls change working directory."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("codex_launcher_invalid")
+    if os.sep not in value and (os.altsep is None or os.altsep not in value):
+        return value  # A bare command remains a normal PATH lookup.
+    launcher = Path(value).expanduser().resolve()
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+        raise ValueError("codex_launcher_path_unavailable")
+    return str(launcher)
+
+
 def _builder_models():
     # The legacy branch does not import or depend on the enrichment validator.
     import native_builder_models
@@ -1186,6 +1198,7 @@ def verify_native_evidence(report: dict, corpus: Path, sources: dict, text: dict
 
 
 def execute(args) -> dict:
+    args.codex_bin = normalize_codex_launcher(args.codex_bin)
     planned, evidence_roles = query_strategy_flags(args)
     profile = profiles.resolve(args)
     planner = selected_planner_profile(args) if planned else None

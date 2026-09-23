@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 from subprocess import CompletedProcess
 import unittest
@@ -252,6 +253,22 @@ class EnrichmentExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "navigation_cli_contract_unavailable_zero_model"):
             self.plan()
         self.assertEqual(self.counts, {"index": 0, "ask": 0, "judge": 0, "plan": 0, "enrich": 0})
+
+    def test_relative_launcher_is_bound_before_run_directory_changes(self):
+        launcher = self.fixture.root / "synthetic-launcher"
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o700)
+        self.args.codex_bin = os.path.relpath(launcher, Path.cwd())
+        result = self.plan()
+        self.assertEqual(result["codex_bin"], str(launcher.resolve()))
+        self.assertEqual(self.args.codex_bin, str(launcher.resolve()))
+        self.assertEqual(self.counts["ask"], 0)
+
+    def test_missing_explicit_launcher_rejects_before_index(self):
+        self.args.codex_bin = "missing/synthetic-launcher"
+        with self.assertRaisesRegex(ValueError, "codex_launcher_path_unavailable"):
+            self.plan()
+        self.assertEqual(self.counts["index"], 0)
 
     def test_zero_model_full_plan_and_strict_caps_are_immutable(self):
         result = self.plan()
