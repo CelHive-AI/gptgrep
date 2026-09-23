@@ -25,8 +25,10 @@ live 対照は Luna/max で 60/62 です。モデル、バックエンド、証�
 `--plan-only` は正規化文書全体を走査して上限付きの作業計画を固定し、モデルを呼びません。
 完了した live 構築では Codex（builder の標準モデルは `gpt-6-luna`）と Jev の支持判定で、
 ソースに結び付いた独立のナビゲーション層を公開できます。生成したヒントは引用できません。
-未完了の作業は台帳に残り、既存の索引は変わりません。通常の `ask` はまだこの層を使用せず、
-問い合わせ時のナビゲーションは別の実験的な統合ゲートです。
+未完了の作業は台帳に残り、既存の索引は変わりません。文書を限定した計画付き `ask` では、
+完了した `enrich` 応答の `artifact_sha256` を `--navigation-overlay-sha256` に渡して明示的に
+有効化できます。Jev がソースに結び付いたヒントを全件走査してから計画 worker と回答 worker
+へ渡します。通常の `ask` の動作は維持され、品質とベンチマーク上の効果は live 検証が必要です。
 
 ## ビルドと使い方
 
@@ -162,7 +164,8 @@ GPTgrep の catalog/tree/search/read ツールを提供します。実際に適�
 
 
 `ask` 専用の `--experimental-query-plan` は、ツールを持たない独立した
-`gpt-6-luna` / `max` / `fast` の計画 worker を標準で先に実行します。
+`gpt-6-luna` / 呼び出し側が選んだ推論強度 / `fast` の計画 worker を標準で先に実行します
+（推論強度の標準値は引き続き `max`）。
 `--planner-model` で別のモデルを明示でき、比較実験では `gpt-5.6-luna` を選べます。元の質問を保持し、
 検索表現を最大2件追加します。ルーティングは最大2件を並行実行し、同じソース範囲を
 重複除去して既存の候補数上限内にまとめます。その後、Jev が元の質問に対して再評価し、
@@ -174,6 +177,11 @@ GPTgrep の catalog/tree/search/read ツールを提供します。実際に適�
 ```sh
 gptgrep ask 'How are offline exports recovered?' ./documents \
   --experimental-query-plan --json
+
+# enrich 完了後、その artifact_sha256 と正確な文書パスを渡します。
+gptgrep ask 'How are offline exports recovered?' ./documents \
+  --document manual.pdf --experimental-query-plan \
+  --navigation-overlay-sha256 "$OVERLAY_SHA" --json
 ```
 
 上のコマンドに `--experimental-evidence-roles` を追加すると、初期状態で無効の

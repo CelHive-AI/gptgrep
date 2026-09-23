@@ -1,4 +1,25 @@
 use super::*;
+
+#[test]
+fn planner_effort_inherits_ask_effort_for_comparable_profiles() {
+    for effort in ["high", "xhigh", "max"] {
+        let reader = crate::HostConfig {
+            reasoning_effort: effort.into(),
+            ..Default::default()
+        };
+        let planner = crate::planner_runtime_config(&reader, &QueryPlanConfig::default());
+        assert_eq!(planner.reasoning_effort, effort);
+        assert_eq!(reader.reasoning_effort, effort);
+        assert_eq!(planner.model, "gpt-6-luna");
+        assert_eq!(planner.service_tier, "fast");
+        assert!(planner.navigation.is_none());
+    }
+    assert_eq!(
+        crate::planner_runtime_config(&crate::HostConfig::default(), &QueryPlanConfig::default())
+            .reasoning_effort,
+        "max"
+    );
+}
 use crate::{HostConfig, jev_accounting::Accounting, retrieval::Evidence};
 use gptgrep_jev::JevClient;
 use std::time::Duration;

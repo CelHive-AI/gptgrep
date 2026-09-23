@@ -89,6 +89,7 @@ pub(crate) struct Evidence {
     last_search_fatal: bool,
     current_call_id: String,
     evidence_roles: bool,
+    navigation: Option<crate::navigation::BoundNavigation>,
 }
 
 impl Evidence {
@@ -123,6 +124,7 @@ impl Evidence {
             last_search_fatal: false,
             current_call_id: String::new(),
             evidence_roles: false,
+            navigation: None,
         })
     }
 
@@ -210,13 +212,82 @@ impl Evidence {
         ensure!(self.selected_document.is_none(), "host_query_plan_ask_only");
         self.ensure_generation()?;
         self.ensure_jev_client()?;
-        crate::query_plan::planner_input(
+        let mut input = crate::query_plan::planner_input(
             &self.root,
             &self.catalog,
             &self.generation,
             self.document.as_deref(),
             question,
-        )
+        )?;
+        if let Some(packet) = self.navigation_packet()? {
+            input.state["navigation"] = packet.clone();
+            input.instructions.push('\n');
+            input.instructions.push_str(crate::navigation::GUIDANCE);
+        }
+        Ok(input)
+    }
+
+    pub async fn prepare_navigation(
+        &mut self,
+        question: &str,
+        config: &crate::NavigationConfig,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        ensure!(
+            self.selected_document.is_none() && self.navigation.is_none(),
+            "host_navigation_ask_only"
+        );
+        self.ensure_generation()?;
+        self.ensure_jev_client()?;
+        let document = self
+            .document
+            .as_deref()
+            .ok_or_else(|| anyhow!("host_navigation_document_required"))?;
+        let accounting = self
+            .accounting
+            .as_ref()
+            .ok_or_else(|| anyhow!("host_navigation_accounting_required"))?;
+        self.navigation = Some(
+            crate::navigation::run(
+                crate::navigation::NavigationRequest {
+                    root: &self.root,
+                    question,
+                    generation: &self.generation,
+                    document,
+                    config,
+                    deadline,
+                },
+                self.client.as_ref().expect("initialized client"),
+                accounting,
+            )
+            .await?,
+        );
+        Ok(())
+    }
+
+    pub fn navigation_packet(&self) -> Result<Option<&Value>> {
+        if let Some(navigation) = &self.navigation {
+            navigation.verify(&self.root)?;
+        }
+        Ok(self
+            .navigation
+            .as_ref()
+            .map(|navigation| &navigation.packet))
+    }
+
+    pub fn reader_state(&self, question: &str, node_id: Option<&str>) -> Result<Value> {
+        let mut state = json!({"question":question,"selected_node_id":node_id,"snapshot_generation":self.generation,
+            "initial_retrieval":self.initial_payload,"document_scope":self.document_scope(),"jev_required":true});
+        if let Some(packet) = self.navigation_packet()? {
+            state["navigation"] = packet.clone();
+        }
+        Ok(state)
+    }
+
+    pub fn navigation_guidance(&self) -> Option<&'static str> {
+        self.navigation
+            .as_ref()
+            .map(|_| crate::navigation::GUIDANCE)
     }
 
     fn ensure_jev_client(&mut self) -> Result<()> {
@@ -381,6 +452,9 @@ impl Evidence {
             gptgrep_core::catalog(&self.root)?["generation"] == self.generation,
             "Index generation changed during the host workflow"
         );
+        if let Some(navigation) = &self.navigation {
+            navigation.verify(&self.root)?;
+        }
         Ok(())
     }
     pub fn document_scope(&self) -> Option<&str> {

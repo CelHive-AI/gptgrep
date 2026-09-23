@@ -118,6 +118,8 @@ pub struct HostRetrievalError {
     pub usage_scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_plan: Option<QueryPlanReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigation: Option<crate::NavigationQueryReport>,
     pub model_attempts: Vec<ModelAttempt>,
     pub model_usage: ModelUsage,
 }
@@ -139,6 +141,7 @@ struct State {
     model_attempt_limit: usize,
     model_attempts: Vec<ModelAttempt>,
     workflow: Option<Value>,
+    navigation: Option<crate::NavigationQueryReport>,
     bytes: usize,
     events: usize,
     terminal: bool,
@@ -165,6 +168,7 @@ impl Accounting {
             model_attempt_limit: 1,
             model_attempts: vec![],
             workflow: None,
+            navigation: None,
             bytes: 0,
             events: 0,
             terminal: false,
@@ -176,7 +180,119 @@ impl Accounting {
         self.0.lock().expect("accounting mutex").path.clone()
     }
     pub fn summary(&self) -> JevReport {
-        summarize(&self.0.lock().expect("accounting mutex").searches)
+        summarize_state(&self.0.lock().expect("accounting mutex"))
+    }
+    pub fn navigation(&self) -> Option<crate::NavigationQueryReport> {
+        self.0.lock().expect("accounting mutex").navigation.clone()
+    }
+    pub fn navigation_admit(&self, report: &crate::NavigationQueryReport) -> Result<()> {
+        let state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
+        // Simulate the largest bounded metadata/score receipt before any request
+        // is admitted. Existing event/record/ledger caps remain unchanged.
+        let mut worst = report.clone();
+        worst.status = "completed_empty".into();
+        worst.error_code = Some("x".repeat(96));
+        worst.packet_sha256 = Some("f".repeat(64));
+        worst.packet_bytes = Some(8192);
+        worst.selected = (0..8)
+            .map(|_| crate::NavigationSelection {
+                hint_id: "f".repeat(64),
+                score: 1.2345678901234567e-300,
+            })
+            .collect();
+        let compact = worst.compact()?;
+        let terminal = entry_bytes(
+            &state,
+            "navigation_completed",
+            None,
+            Some(&json!({"navigation":compact})),
+        )?
+        .len()
+            + 2048;
+        let mut required_bytes = terminal * 2;
+        for batch in &report.batches {
+            let mut batch = batch.clone();
+            batch.status = "reply_received".into();
+            batch.model = Some("\"".repeat(256));
+            batch.provider = batch.model.clone();
+            batch.provider_response_id = batch.model.clone();
+            batch.error_code = Some("x".repeat(96));
+            batch.elapsed_ms = Some(u64::MAX);
+            batch.scores_sha256 = Some("f".repeat(64));
+            batch.usage = Some(
+                json!({"input_tokens":u64::MAX,"output_tokens":u64::MAX,"prompt_tokens":u64::MAX,"completion_tokens":u64::MAX,"total_tokens":u64::MAX,"cost":1.2345678901234567e300}),
+            );
+            let scores: BTreeMap<_, _> = (0..batch.candidates)
+                .map(|index| (format!("{index:064x}"), 1.2345678901234567e-300))
+                .collect();
+            let detail = json!({"navigation":compact,"batch":batch,"scores":scores});
+            let bytes =
+                entry_bytes(&state, "navigation_after_call", None, Some(&detail))?.len() + 2048;
+            ensure!(bytes <= 65536, "host_navigation_ledger_record_admission");
+            required_bytes = required_bytes
+                .checked_add(bytes * 3)
+                .ok_or_else(|| anyhow!("host_navigation_ledger_admission"))?;
+        }
+        ensure!(
+            state.events + report.batches.len() * 3 + 2 < 1024
+                && state.bytes + required_bytes <= 4 * 1024 * 1024,
+            "host_navigation_ledger_admission"
+        );
+        drop(state);
+        self.navigation_update("navigation_admitted", report, None, None)
+    }
+    pub fn navigation_update(
+        &self,
+        event: &str,
+        report: &crate::NavigationQueryReport,
+        batch: Option<usize>,
+        scores: Option<Value>,
+    ) -> Result<()> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
+        ensure!(
+            !state.terminal
+                && report.generation == state.generation
+                && report.batches.len() <= crate::navigation::MAX_BATCHES
+                && report.requests <= report.attempted_calls
+                && report.attempted_calls <= report.batches.len(),
+            "host_navigation_accounting_invalid"
+        );
+        let workflow = state
+            .workflow
+            .as_ref()
+            .ok_or_else(|| anyhow!("host_navigation_workflow_unbound"))?;
+        ensure!(
+            workflow["query_sha256"] == report.query_sha256
+                && workflow["document_scope"] == report.document_scope,
+            "host_navigation_workflow_changed"
+        );
+        if let Some(prior) = &state.navigation {
+            ensure!(
+                prior.artifact_sha256 == report.artifact_sha256
+                    && prior.query_sha256 == report.query_sha256
+                    && prior.attempted_calls <= report.attempted_calls
+                    && prior.requests <= report.requests,
+                "host_navigation_accounting_regressed"
+            );
+        }
+        let row = batch
+            .map(|index| {
+                report
+                    .batches
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("host_navigation_batch_invalid"))
+            })
+            .transpose()?;
+        let detail = json!({"navigation":report.compact()?,"batch":row,"scores":scores});
+        state.navigation = Some(report.clone());
+        append_locked(&mut state, event, None, Some(detail))
     }
     pub fn bind_workflow(&self, question: &str, document_scope: Option<&str>) -> Result<()> {
         let mut state = self
@@ -659,6 +775,13 @@ impl Accounting {
             return Ok(());
         }
         if status != "completed" {
+            if let Some(navigation) = &mut state.navigation {
+                navigation.interrupt(if status == "interrupted" {
+                    "host_navigation_interrupted"
+                } else {
+                    "host_navigation_failed"
+                });
+            }
             for search in &mut state.searches {
                 if matches!(search.status.as_str(), "running" | "awaiting_delivery") {
                     search.status = "failed".into();
@@ -753,6 +876,28 @@ fn summarize(searches: &[SearchTelemetry]) -> JevReport {
         searches: searches.to_vec(),
     }
 }
+fn summarize_state(state: &State) -> JevReport {
+    let mut summary = summarize(&state.searches);
+    if let Some(navigation) = &state.navigation {
+        summary.attempted_calls += navigation.attempted_calls;
+        summary.requests += navigation.requests;
+        summary.unobserved_attempts += navigation
+            .attempted_calls
+            .saturating_sub(navigation.requests);
+        let mut models: BTreeSet<_> = summary.models.into_iter().collect();
+        for batch in &navigation.batches {
+            if let Some(model) = &batch.model {
+                models.insert(model.clone());
+                summary
+                    .usage
+                    .push(batch.usage.clone().unwrap_or(Value::Null));
+            }
+        }
+        summary.models = models.into_iter().collect();
+        summary.accounting_complete &= navigation.accounting_complete();
+    }
+    summary
+}
 fn append_locked(
     state: &mut State,
     event: &str,
@@ -783,8 +928,8 @@ fn entry_bytes(
     index: Option<usize>,
     detail: Option<&Value>,
 ) -> Result<Vec<u8>> {
-    let summary = summarize(&state.searches);
-    let entry = json!({
+    let summary = summarize_state(state);
+    let mut entry = json!({
         "schema_version":"gptgrep.jev-attempt.v1","event":event,"generation":state.generation,
         "observed_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
         "accounting_complete":event=="completed" && summary.accounting_complete,
@@ -795,6 +940,9 @@ fn entry_bytes(
         "model_usage":crate::model_attempts::summarize(&state.model_attempts),
         "workflow":state.workflow,
     });
+    if let Some(navigation) = &state.navigation {
+        entry["navigation"] = navigation.compact()?;
+    }
     let mut bytes = serde_json::to_vec(&entry)?;
     bytes.push(b'\n');
     Ok(bytes)

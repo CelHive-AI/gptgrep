@@ -36,20 +36,23 @@ def _tier(value):
     return "priority" if value in ("priority", "fast") else value
 
 
-def planner_profile(model=DEFAULT_PLANNER_MODEL):
+def planner_profile(model=DEFAULT_PLANNER_MODEL, reasoning_effort="max"):
     model = _label(model)
     if model != model.strip():
         raise ValueError("Planner model must not contain surrounding whitespace")
-    return {"model": model, "reasoning_effort": "max", "service_tier": "fast"}
+    if reasoning_effort not in {"high", "xhigh", "max"}:
+        raise ValueError("Planner reasoning effort is outside the declared experiment")
+    return {"model": model, "reasoning_effort": reasoning_effort, "service_tier": "fast"}
 
 
 def planner_profile_from_payload(payload):
     """Resolve a hash-bound request; absence preserves the historical profile."""
     if payload.get("experimental_query_plan") is not True:
-        if "planner_model" in payload:
-            raise ValueError("Planner model requires experimental query planning")
+        if "planner_model" in payload or "planner_reasoning_effort" in payload:
+            raise ValueError("Planner profile requires experimental query planning")
         return None
-    return planner_profile(payload.get("planner_model", PLANNER_PROFILE["model"]))
+    return planner_profile(payload.get("planner_model", PLANNER_PROFILE["model"]),
+                           payload.get("planner_reasoning_effort", "max"))
 
 
 def attempts_from_report(report, reader_profile, *, required=False, planner_profile=None):
@@ -58,9 +61,9 @@ def attempts_from_report(report, reader_profile, *, required=False, planner_prof
     if not isinstance(expected_planner, dict) or set(expected_planner) != {"model", "reasoning_effort", "service_tier"}:
         raise ValueError("Native planner profile must explicitly bind model, effort and tier")
     if (_label(expected_planner["model"]) != expected_planner["model"].strip()
-            or expected_planner["reasoning_effort"] != "max"
+            or expected_planner["reasoning_effort"] not in {"high", "xhigh", "max"}
             or expected_planner["service_tier"] != "fast"):
-        raise ValueError("Native planner profile differs from its fixed effort/tier contract")
+        raise ValueError("Native planner profile differs from its declared effort/tier contract")
     if not isinstance(report, dict):
         raise ValueError("Native model accounting envelope must be an object")
     envelope = report

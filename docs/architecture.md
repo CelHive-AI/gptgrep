@@ -193,14 +193,22 @@ windows can be reused after a safe budget pause. Incomplete work does not
 publish an active overlay. A complete overlay has its own atomic pointer bound
 to the original generation and source bytes. Hints are navigation-only data:
 they neither rewrite tree coordinates nor grant citation authority. Ordinary
-`ask` does not yet consume this overlay; opt-in Jev navigation is a separate
-integration stage before a quality claim.
+`ask` does not consume this overlay. A scoped, planned `ask` can explicitly
+require one overlay SHA. Before any planner call, the host validates the overlay
+and source, scans all eligible Chunk/Node hints, prepares every bounded Jev
+Score batch, and rejects the entire scan if its declared budgets cannot admit
+it. Scores are merged globally into at most eight whole hints (8 KiB total).
+The planner and reader receive the same packet as untrusted navigation data;
+only normal search/read operations can issue citable evidence. Partial Jev
+failure is explicit and retains attempted-call accounting. Live quality benefit
+is not inferred from this integration alone.
 
 
 ## Experimental query planning
 
 The default-off ask option `--experimental-query-plan` inserts one separate
-`gpt-6-luna`/max/fast completion by default before initial retrieval. The
+`gpt-6-luna`/caller-selected-effort/fast completion by default before initial
+retrieval; the normal effort default is max. The
 planner model can be selected explicitly with `--planner-model`; the final
 reader retains its separately selected profile. The planner receives only the
 original question, fixed scope and bounded source-derived descriptors. It can

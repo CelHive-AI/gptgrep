@@ -88,6 +88,7 @@ impl HostArgs {
             max_input_bytes: self.max_input_bytes,
             trace_path: self.protocol_trace,
             query_plan: None,
+            navigation: None,
         }
     }
 }
@@ -276,6 +277,16 @@ enum Command {
         experimental_query_plan: bool,
         #[arg(
             long,
+            requires_all = ["experimental_query_plan", "document"],
+            help = "Require one exact completed navigation overlay for scoped planned retrieval"
+        )]
+        navigation_overlay_sha256: Option<String>,
+        #[arg(long, requires = "navigation_overlay_sha256")]
+        navigation_max_jev_calls: Option<usize>,
+        #[arg(long, requires = "navigation_overlay_sha256")]
+        navigation_max_request_bytes: Option<usize>,
+        #[arg(
+            long,
             requires = "experimental_query_plan",
             help = "Model for the optional query planner; defaults to gpt-6-luna"
         )]
@@ -332,7 +343,7 @@ fn contract() -> Value {
             "status":{"usage":"gptgrep status ROOT --json","scope":"existing indexed files; index discovers new files"},
             "parse":{"usage":"gptgrep parse FILE --json","effect":"local parser"},
             "judge":{"usage":"gptgrep judge --input FILE [--model MODEL] --json","input":{"state":"JSON","questions":"Choice/Noul/Score map"},"effect":"explicit remote Decisions call"},
-            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] [--experimental-query-plan] [--planner-model MODEL] [--experimental-evidence-roles] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"jev-model":{"type":"string","default":"typesafe/jev-1.13"},"document":{"type":"string"},"experimental-query-plan":{"type":"boolean","default":false,"effect":"one extra no-tools Luna planner turn; up to two alternate retrieval queries; bounded parallel routes and final Jev reranking against the original question","limits":{"alternate_queries":2,"routing_concurrency":2,"union_candidates":24,"planner_timeout_seconds":45},"accounting":"model_attempts reports planner and reader separately; legacy usage is reader-only; overall timeout is shared"},"planner-model":{"type":"string","default":"gpt-6-luna","requires":"experimental-query-plan","effect":"select the query-planner Codex model independently from the final reader"},"experimental-evidence-roles":{"type":"boolean","default":false,"requires":"experimental-query-plan","effect":"one additional Choice per union candidate in the same mandatory Jev decision; source-bound role ordering and continuation hints","limits":{"union_candidates":24,"final_questions":48,"complete_request_bytes":65536},"sufficiency":"unassessed","accounting":"extra judgments and tokens are measured within the existing request; discarded-candidate metadata stays private and is not citable"}},"defaults":{"model":"gpt-5.6-luna","reasoning_effort":"max","service_tier":"fast","timeout_seconds":180,"max_tool_calls":12}},
+            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] [--experimental-query-plan] [--planner-model MODEL] [--navigation-overlay-sha256 SHA --navigation-max-jev-calls N --navigation-max-request-bytes BYTES] [--experimental-evidence-roles] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"jev-model":{"type":"string","default":"typesafe/jev-1.13"},"document":{"type":"string"},"navigation-overlay-sha256":{"type":"string","requires":["experimental-query-plan","document"],"effect":"require exact completed source-bound overlay and full Jev hint scan before planned retrieval","report_schema":"gptgrep.navigation-query.v1","citation_authority":false},"navigation-max-jev-calls":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":128,"default":32},"navigation-max-request-bytes":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":8388608,"default":2097152},"experimental-query-plan":{"type":"boolean","default":false,"effect":"one extra no-tools Luna planner turn; up to two alternate retrieval queries; bounded parallel routes and final Jev reranking against the original question","limits":{"alternate_queries":2,"routing_concurrency":2,"union_candidates":24,"planner_timeout_seconds":45},"accounting":"model_attempts reports planner and reader separately; legacy usage is reader-only; overall timeout is shared"},"planner-model":{"type":"string","default":"gpt-6-luna","requires":"experimental-query-plan","effect":"select the query-planner Codex model independently from the final reader"},"experimental-evidence-roles":{"type":"boolean","default":false,"requires":"experimental-query-plan","effect":"one additional Choice per union candidate in the same mandatory Jev decision; source-bound role ordering and continuation hints","limits":{"union_candidates":24,"final_questions":48,"complete_request_bytes":65536},"sufficiency":"unassessed","accounting":"extra judgments and tokens are measured within the existing request; discarded-candidate metadata stays private and is not citable"}},"defaults":{"model":"gpt-5.6-luna","reasoning_effort":"max","service_tier":"fast","timeout_seconds":180,"max_tool_calls":12}},
             "summarize":{"usage":"gptgrep summarize DOCUMENT_ID:NODE_ID --root ROOT [host options] --json","effect":"required Jev retrieval in the selected document, then model-written summary with issued evidence citations"},
             "host-complete":{"usage":"gptgrep host-complete --input FILE_OR_DASH [host options] --json","input":{"instructions":"string","state":"JSON","schema":"JSON Schema object"},"effect":"explicit schema-validated local Codex completion; no citation assertion","defaults":{"max_input_bytes":262144,"service_tier":"fast"},"hard_max_input_bytes":1048576},
             "doctor":{"usage":"gptgrep doctor --json","effect":"local capability probe"}
@@ -605,12 +616,22 @@ async fn run(cli: Cli) -> Result<i32> {
             jev_model,
             document,
             experimental_query_plan,
+            navigation_overlay_sha256,
+            navigation_max_jev_calls,
+            navigation_max_request_bytes,
             planner_model,
             experimental_evidence_roles,
         } => {
             let mut config = host.config();
             config.jev_model = jev_model;
             config.document = document;
+            config.navigation = navigation_overlay_sha256.map(|expected_overlay_sha256| {
+                gptgrep_host::NavigationConfig {
+                    expected_overlay_sha256,
+                    max_jev_calls: navigation_max_jev_calls.unwrap_or(32),
+                    max_jev_request_bytes: navigation_max_request_bytes.unwrap_or(2 * 1024 * 1024),
+                }
+            });
             config.query_plan = experimental_query_plan.then(|| gptgrep_host::QueryPlanConfig {
                 evidence_roles: experimental_evidence_roles,
                 planner_model: planner_model.unwrap_or_else(|| "gpt-6-luna".into()),
@@ -910,6 +931,89 @@ mod query_plan_cli_tests {
         assert_eq!(
             schema["commands"]["ask"]["options"]["experimental-evidence-roles"]["requires"],
             "experimental-query-plan"
+        );
+    }
+
+    #[test]
+    fn navigation_overlay_requires_scoped_planned_ask() {
+        let digest = "a".repeat(64);
+        let selected = Cli::try_parse_from([
+            "gptgrep",
+            "ask",
+            "find the rule",
+            ".",
+            "--document",
+            "guide.md",
+            "--experimental-query-plan",
+            "--navigation-overlay-sha256",
+            digest.as_str(),
+        ])
+        .expect("explicit bound navigation");
+        assert!(matches!(selected.command, Some(Command::Ask {
+            navigation_overlay_sha256: Some(value), experimental_query_plan: true,
+            document: Some(document), ..
+        }) if value == digest && document == "guide.md"));
+        let bounded = Cli::try_parse_from([
+            "gptgrep",
+            "ask",
+            "find the rule",
+            ".",
+            "--document",
+            "guide.md",
+            "--experimental-query-plan",
+            "--navigation-overlay-sha256",
+            digest.as_str(),
+            "--navigation-max-jev-calls",
+            "64",
+            "--navigation-max-request-bytes",
+            "1048576",
+        ])
+        .expect("explicit bounded navigation");
+        assert!(matches!(
+            bounded.command,
+            Some(Command::Ask {
+                navigation_max_jev_calls: Some(64),
+                navigation_max_request_bytes: Some(1048576),
+                ..
+            })
+        ));
+        for arguments in [
+            vec![
+                "gptgrep",
+                "ask",
+                "find the rule",
+                ".",
+                "--navigation-overlay-sha256",
+                digest.as_str(),
+            ],
+            vec![
+                "gptgrep",
+                "ask",
+                "find the rule",
+                ".",
+                "--experimental-query-plan",
+                "--navigation-overlay-sha256",
+                digest.as_str(),
+            ],
+            vec![
+                "gptgrep",
+                "ask",
+                "find the rule",
+                ".",
+                "--navigation-max-jev-calls",
+                "64",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+        let schema = contract();
+        assert_eq!(
+            schema["commands"]["ask"]["options"]["navigation-overlay-sha256"]["report_schema"],
+            "gptgrep.navigation-query.v1"
+        );
+        assert_eq!(
+            schema["commands"]["ask"]["options"]["navigation-max-jev-calls"]["default"],
+            32
         );
     }
 

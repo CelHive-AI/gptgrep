@@ -20,11 +20,15 @@ pub use completion::{
 };
 mod jev_accounting;
 mod model_attempts;
+mod navigation;
 mod query_plan;
 mod retrieval;
 mod trace;
 pub use jev_accounting::{HostRetrievalError, JevReport, ReceiptSummary, SearchTelemetry};
 pub use model_attempts::{ModelAttempt, ModelTokenMissingCounts, ModelTokenTotals, ModelUsage};
+pub use navigation::{
+    NavigationBatchReport, NavigationConfig, NavigationQueryReport, NavigationSelection,
+};
 pub use query_plan::{QueryPlanConfig, QueryPlanReport};
 
 use anyhow::{Result, anyhow, ensure};
@@ -68,6 +72,7 @@ pub struct HostConfig {
     pub jev_model: Option<String>,
     pub document: Option<String>,
     pub query_plan: Option<QueryPlanConfig>,
+    pub navigation: Option<NavigationConfig>,
 }
 
 impl Default for HostConfig {
@@ -89,6 +94,7 @@ impl Default for HostConfig {
             jev_model: None,
             document: None,
             query_plan: None,
+            navigation: None,
         }
     }
 }
@@ -119,6 +125,8 @@ pub struct HostReport {
     pub usage_scope: String,
     #[serde(default)]
     pub query_plan: Option<QueryPlanReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation: Option<NavigationQueryReport>,
     #[serde(default)]
     pub model_attempts: Vec<ModelAttempt>,
     #[serde(default)]
@@ -183,6 +191,10 @@ async fn execute_with_client(
     evidence.configure(config,accounting.clone(),client)?;
     accounting.bind_workflow(question, evidence.document_scope())?;
     accounting.set_model_attempt_limit(if config.query_plan.is_some() { 2 } else { 1 })?;
+    if let Some(navigation) = &config.navigation {
+        stage="navigation";
+        evidence.prepare_navigation(question, navigation, deadline).await?;
+    }
     if let Some(query_config) = &config.query_plan {
         stage="query_plan_prepare";
         let input = evidence.prepare_query_plan(question)?;
@@ -208,7 +220,7 @@ async fn execute_with_client(
         stage="query_plan";
         let mut planner = model_attempts::ModelAttemptTracker::reserve(&accounting, "query_planner", &planner_config)?;
         let planned = completion::complete_json_until(
-            input.instructions, input.state, input.schema, &planner_config,
+            &input.instructions, input.state, input.schema, &planner_config,
             Some(planner_deadline), protocol::RunOptions {
                 observer: Some(planner.observer()),
                 max_output_bytes: Some(query_plan::MAX_PLAN_OUTPUT_BYTES),
@@ -295,6 +307,7 @@ async fn execute_with_client(
         usage: result.usage,
         usage_scope: "final_reader".into(),
         query_plan: query_plan_report.clone(),
+        navigation: accounting.navigation(),
         model_usage: model_attempts::summarize(&accounting.model_attempts()),
         model_attempts: accounting.model_attempts(),
         elapsed_ms:started.elapsed().as_millis(),
@@ -364,6 +377,7 @@ async fn execute_with_client(
                 elapsed_ms: started.elapsed().as_millis(),
                 usage_scope: "final_reader".into(),
                 query_plan: query_plan_report,
+                navigation: accounting.navigation(),
                 model_usage: model_attempts::summarize(&accounting.model_attempts()),
                 model_attempts: accounting.model_attempts(),
             }
@@ -374,8 +388,8 @@ async fn execute_with_client(
 
 fn planner_runtime_config(config: &HostConfig, query_config: &QueryPlanConfig) -> HostConfig {
     let mut planner = config.clone();
+    planner.navigation = None;
     planner.model = query_config.planner_model.clone();
-    planner.reasoning_effort = DEFAULT_REASONING_EFFORT.into();
     planner.service_tier = DEFAULT_SERVICE_TIER.into();
     planner.max_input_bytes = config.max_input_bytes.min(query_plan::MAX_PLAN_INPUT_BYTES);
     planner.query_plan = None;
@@ -575,6 +589,17 @@ fn validate_config(config: &HostConfig, question: &str) -> Result<()> {
     ensure!(!config.codex_bin.is_empty(), "Codex binary is empty");
     if let Some(query_plan) = &config.query_plan {
         query_plan.validate()?;
+    }
+    if let Some(navigation) = &config.navigation {
+        navigation.validate()?;
+        ensure!(
+            config.query_plan.is_some()
+                && config
+                    .document
+                    .as_ref()
+                    .is_some_and(|path| !path.is_empty()),
+            "host_navigation_requires_planned_document_ask"
+        );
     }
     Ok(())
 }

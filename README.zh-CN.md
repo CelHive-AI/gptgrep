@@ -20,8 +20,9 @@ GPTgrep 返回可核查的源文档证据。默认 `search` 使用 `hybrid`，�
 `gptgrep enrich` 是本地 `index` 之后显式调用的模型辅助步骤。`--plan-only` 会完整遍历
 规范化文档并固定有上限的工作计划，不调用模型。完成的 live 构建可由 Codex（builder 默认
 `gpt-6-luna`）和 Jev 支持判别发布独立、来源绑定的导航信息层；生成的提示不能作为引用。
-未完成工作保留账本，现有索引不变。普通 `ask` 目前尚未消费该信息层，查询时导航仍是单独的
-实验性集成门槛。
+未完成工作保留账本，现有索引不变。限定文档的规划式 `ask` 可使用完成的 `enrich` 回执中的
+`artifact_sha256`，通过 `--navigation-overlay-sha256` 显式启用：先由 Jev 完整扫描来源绑定的
+提示，再交给规划与回答 worker。普通 `ask` 保持原行为；提示质量及基准收益仍需 live 验证。
 
 ## 构建与使用
 
@@ -140,7 +141,8 @@ Codex 子进程无法访问 Jev 凭据。
 
 
 仅 `ask` 支持的 `--experimental-query-plan` 默认会先运行一个独立、无工具的
-`gpt-6-luna` / `max` / `fast` 规划 worker。可用 `--planner-model` 显式指定其他模型，
+`gpt-6-luna` / 与调用方一致的推理强度 / `fast` 规划 worker（默认推理强度仍为 `max`）。
+可用 `--planner-model` 显式指定其他模型，
 例如在对照实验中使用 `gpt-5.6-luna`。它保留原问题，最多提出两条替代检索表述。
 最多两路文档路由同时执行；候选按真实来源跨度合并，仍受原候选预算限制，随后由 Jev
 按原问题统一重排，再启动回答 worker。该选项默认关闭，所有阶段共享调用方的总截止时间。
@@ -150,6 +152,11 @@ Codex 子进程无法访问 Jev 凭据。
 ```sh
 gptgrep ask 'How are offline exports recovered?' ./documents \
   --experimental-query-plan --json
+
+# enrich 完成后，传入其 artifact_sha256 和精确的文档路径。
+gptgrep ask 'How are offline exports recovered?' ./documents \
+  --document manual.pdf --experimental-query-plan \
+  --navigation-overlay-sha256 "$OVERLAY_SHA" --json
 ```
 
 在上述命令中增加 `--experimental-evidence-roles`，可以测试默认关闭的

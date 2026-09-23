@@ -28,9 +28,11 @@ Maintainer research notes under `docs/research/` are local-only and untracked.
 work plan without model calls. A complete live build can publish a separate,
 source-bound navigation overlay using Codex (builder default `gpt-6-luna`) and
 Jev support judgments; generated hints are never citations. Incomplete work
-retains its ledger and leaves the current index intact. The overlay is not yet
-consumed by the ordinary `ask` path; query-time navigation is a separate
-experimental integration gate.
+retains its ledger and leaves the current index intact. Scoped planned `ask`
+can opt in with `--navigation-overlay-sha256` from the completed `enrich`
+receipt. It scans the source-bound hints with Jev before the planner and reader;
+the ordinary `ask` path remains unchanged. Hint quality and benchmark benefit
+still require live measurement.
 
 ## Build and use
 
@@ -164,7 +166,8 @@ Citation identity checks do not independently prove semantic entailment.
 
 
 The ask-only `--experimental-query-plan` option first runs a separate no-tools
-`gpt-6-luna` / `max` / `fast` planner by default. Use `--planner-model` to select
+`gpt-6-luna` / caller-selected effort / `fast` planner by default (the normal
+effort default is `max`). Use `--planner-model` to select
 another planner model explicitly, including `gpt-5.6-luna` for a controlled run.
 It retains the original question and
 proposes at most two alternate retrieval phrases. Up to two routing operations
@@ -178,6 +181,11 @@ candidates and add latency; no quality gain is guaranteed. `model_attempts` and
 ```sh
 gptgrep ask 'How are offline exports recovered?' ./documents \
   --experimental-query-plan --json
+
+# After a completed enrich run, pass its artifact_sha256 and exact document path.
+gptgrep ask 'How are offline exports recovered?' ./documents \
+  --document manual.pdf --experimental-query-plan \
+  --navigation-overlay-sha256 "$OVERLAY_SHA" --json
 ```
 
 Add `--experimental-evidence-roles` to that command to test the default-off
