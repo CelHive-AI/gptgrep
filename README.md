@@ -15,10 +15,22 @@ searches, inspect trees and read bounded nodes before answering.
 
 This is development source. The first experimental release requires a verified
 minimum live advantage over PageIndex Flash plus GPT-5.6 on PageIndex-OSS-Benchmark.
+The original local PageIndex OSS `results.json` reports 60/62 with Luna/high;
+our separately qualified live SDK/Codex control also reports 60/62 with Luna/max.
+These runs have distinct model/backend and evidence provenance.
 See [architecture](docs/architecture.md)
 and the explicit
 [Flash stage coverage](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md).
 Maintainer research notes under `docs/research/` are local-only and untracked.
+
+`gptgrep enrich` is an explicit, model-assisted step after local `index`. Its
+`--plan-only` mode walks the full canonical document corpus and fixes a bounded
+work plan without model calls. A complete live build can publish a separate,
+source-bound navigation overlay using Codex (builder default `gpt-6-luna`) and
+Jev support judgments; generated hints are never citations. Incomplete work
+retains its ledger and leaves the current index intact. The overlay is not yet
+consumed by the ordinary `ask` path; query-time navigation is a separate
+experimental integration gate.
 
 ## Build and use
 

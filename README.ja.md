@@ -15,9 +15,18 @@ Jev によるルーティングと再ランキングを必須とします。`ask
 
 これは開発中のソースです。最初の実験版を公開するには、PageIndex-OSS-Benchmark の実測で、
 PageIndex Flash と GPT-5.6 の組み合わせに対する最小限の優位性を確認する必要があります。
+元のローカル PageIndex OSS `results.json` は Luna/high で 60/62、別途検証した SDK/Codex の
+live 対照は Luna/max で 60/62 です。モデル、バックエンド、証拠の来歴は別々に記録します。
 [アーキテクチャ](docs/architecture.ja.md)と、
 [Flash の各段階の対応範囲](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md)を参照してください。
 `docs/research/` にあるメンテナーの調査ノートはローカル専用で、Git の追跡対象外です。
+
+`gptgrep enrich` はローカル `index` 後に明示的に実行するモデル補助段階です。
+`--plan-only` は正規化文書全体を走査して上限付きの作業計画を固定し、モデルを呼びません。
+完了した live 構築では Codex（builder の標準モデルは `gpt-6-luna`）と Jev の支持判定で、
+ソースに結び付いた独立のナビゲーション層を公開できます。生成したヒントは引用できません。
+未完了の作業は台帳に残り、既存の索引は変わりません。通常の `ask` はまだこの層を使用せず、
+問い合わせ時のナビゲーションは別の実験的な統合ゲートです。
 
 ## ビルドと使い方
 

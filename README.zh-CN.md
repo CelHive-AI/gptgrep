@@ -13,7 +13,15 @@ GPTgrep 返回可核查的源文档证据。默认 `search` 使用 `hybrid`，�
 这是开发中的源码。第一个实验版发布前，必须在 PageIndex-OSS-Benchmark 的真实运行中，
 证明相对 PageIndex Flash 加 GPT-5.6 的最小优势。请参阅[架构说明](docs/architecture.zh-CN.md)和明确列出的
 [Flash 阶段覆盖情况](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md)。
+原始本地 PageIndex OSS `results.json` 在 Luna/high 下为 60/62；另行验收的 SDK/Codex live 对照
+在 Luna/max 下同为 60/62。两次运行的模型、后端和证据来源分别记录。
 维护者的研究记录保存在 `docs/research/` 下，仅供本地使用，不纳入版本控制。
+
+`gptgrep enrich` 是本地 `index` 之后显式调用的模型辅助步骤。`--plan-only` 会完整遍历
+规范化文档并固定有上限的工作计划，不调用模型。完成的 live 构建可由 Codex（builder 默认
+`gpt-6-luna`）和 Jev 支持判别发布独立、来源绑定的导航信息层；生成的提示不能作为引用。
+未完成工作保留账本，现有索引不变。普通 `ask` 目前尚未消费该信息层，查询时导航仍是单独的
+实验性集成门槛。
 
 ## 构建与使用
 

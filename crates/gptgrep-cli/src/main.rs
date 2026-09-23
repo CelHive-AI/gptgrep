@@ -92,6 +92,41 @@ impl HostArgs {
     }
 }
 
+#[derive(Debug, Args)]
+struct EnrichHostArgs {
+    #[arg(long, default_value = "codex")]
+    codex_bin: String,
+    #[arg(
+        long,
+        help = "Existing Codex account home; defaults to CODEX_HOME or ~/.codex"
+    )]
+    codex_home: Option<PathBuf>,
+    #[arg(long, default_value = "gpt-6-luna")]
+    builder_model: String,
+    #[arg(long, default_value = "max")]
+    reasoning_effort: String,
+    #[arg(long, default_value = "fast")]
+    service_tier: String,
+    #[arg(long, default_value_t = 180)]
+    timeout: u64,
+    #[arg(long, default_value_t = 262144)]
+    max_input_bytes: usize,
+}
+
+impl EnrichHostArgs {
+    fn config(self) -> gptgrep_host::HostConfig {
+        let mut config = gptgrep_host::HostConfig::default();
+        config.codex_bin = self.codex_bin;
+        config.codex_home = self.codex_home.unwrap_or(config.codex_home);
+        config.model = self.builder_model;
+        config.reasoning_effort = self.reasoning_effort;
+        config.service_tier = self.service_tier;
+        config.timeout_secs = self.timeout;
+        config.max_input_bytes = self.max_input_bytes;
+        config
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Parse documents and publish a complete immutable search generation.
@@ -106,6 +141,49 @@ enum Command {
             help = "Apply PageIndex scan-cost merging to native paginated documents"
         )]
         optimize_merge: bool,
+    },
+    /// Build source-bound, non-citable navigation hints over a published index.
+    Enrich {
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        #[arg(long, help = "Absolute private append-only builder ledger path")]
+        ledger_path: PathBuf,
+        #[arg(
+            long,
+            help = "Resume only validated completed windows in the same ledger"
+        )]
+        resume: bool,
+        #[arg(long, help = "Require the zero-model plan digest before any live call")]
+        expected_plan_sha256: Option<String>,
+        #[arg(
+            long,
+            help = "Compute the complete raw-window plan without model calls"
+        )]
+        plan_only: bool,
+        #[arg(
+            long,
+            requires = "plan_only",
+            help = "Write the full immutable plan once"
+        )]
+        plan_output: Option<PathBuf>,
+        #[arg(long, default_value_t = 8192)]
+        window_bytes: usize,
+        #[arg(long, default_value_t = 4)]
+        max_hints_per_window: usize,
+        #[arg(long, help = "Positive cumulative Codex builder-call cap")]
+        max_builder_calls: usize,
+        #[arg(long, help = "Positive cumulative Jev support-call cap")]
+        max_jev_calls: usize,
+        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        max_ledger_bytes: u64,
+        #[arg(long, default_value_t = 65536)]
+        max_windows_per_run: usize,
+        #[arg(long, default_value_t = 900)]
+        deadline_seconds: u64,
+        #[arg(long, help = "Jev Decisions model; default typesafe/jev-1.13")]
+        jev_model: Option<String>,
+        #[command(flatten)]
+        host: EnrichHostArgs,
     },
     /// Find evidence with Jev hybrid routing/reranking; explicit regex is local.
     Search {
@@ -243,9 +321,10 @@ fn contract() -> Value {
     json!({
         "schema_version":"gptgrep.cli.v1", "name":"gptgrep", "version":env!("CARGO_PKG_VERSION"),
         "transport":"argv/stdout", "mcp":false, "default_output":"text", "machine_output":"--json",
-        "exit_codes":{"0":"success or matches","1":"no matches","2":"error or stale evidence excluded"},
+        "exit_codes":{"0":"success or matches","1":"no matches","2":"error, stale evidence, or incomplete enrichment"},
         "commands":{
             "index":{"usage":"gptgrep index ROOT [--max-files 100000] [--optimize-merge] --json","effect":"write owned .gptgrep immutable generation","network":false},
+            "enrich":{"usage":"gptgrep enrich ROOT --ledger-path ABSOLUTE_PATH --max-builder-calls N --max-jev-calls N [--plan-only] [--expected-plan-sha256 SHA] --json","effect":"explicit raw-only Codex/Jev navigation-overlay build after deterministic index","model_assisted":true,"plan_only_model_calls":0,"defaults":{"builder_model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast","jev_model":"typesafe/jev-1.13","window_bytes":8192,"max_hints_per_window":4},"output":"complete publishes a separate source-bound navigation overlay; incomplete/failed leaves the current index unchanged and exits 2","hint_authority":"non-citable navigation only; not full PageIndex Flash parity","resume":"same absolute ledger and bound plan; pending or failed calls are not automatically retried"},
             "search":{"usage":"gptgrep search QUERY ROOT --mode regex|lexical|hybrid|semantic --json","options":{"mode":{"type":"string","default":"hybrid","enum":["hybrid","semantic","regex","lexical"]},"document":{"type":"string","description":"Exact indexed source-relative path; scope applies before candidate limits"},"limit":{"type":"integer","default":20,"minimum":1,"maximum":1000},"context":{"type":"integer","default":0,"maximum":100},"max-candidates":{"type":"integer","default":24,"maximum":24},"routing-docs":{"type":"integer","default":32,"maximum":32},"ignore-case":{"type":"boolean"},"fixed-strings":{"type":"boolean"},"model":{"type":"string","default":"typesafe/jev-1.13"},"min-score":{"type":"number","minimum":0,"maximum":1,"default":0.5}},"network":"required Jev for default hybrid and semantic; explicit regex/lexical primitives are local","credentials":"OPENROUTER_API_KEY environment only","output_schema":"gptgrep.v1"},
             "tree":{"usage":"gptgrep tree FILE --root ROOT --json","effect":"read"},
             "read":{"usage":"gptgrep read DOCUMENT_ID:NODE_ID --root ROOT --max-bytes 8192 --offset BYTES --json","effect":"read"},
@@ -265,7 +344,7 @@ fn contract() -> Value {
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied; failures never silently downgrade to local retrieval. Explicit regex/lexical remain offline primitives. Use --document RELATIVE_PATH to scope before candidate budgets. Hybrid/semantic and judge send bounded data to OpenRouter Jev. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. Hybrid/semantic and judge send bounded data to OpenRouter Jev. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -307,6 +386,104 @@ async fn run(cli: Cli) -> Result<i32> {
                     "Indexed {} documents ({} bytes) in {} ms; generation {}",
                     report.indexed_files, report.source_bytes, report.elapsed_ms, report.generation
                 );
+            }
+        }
+        Command::Enrich {
+            root,
+            ledger_path,
+            resume,
+            expected_plan_sha256,
+            plan_only,
+            plan_output,
+            window_bytes,
+            max_hints_per_window,
+            max_builder_calls,
+            max_jev_calls,
+            max_ledger_bytes,
+            max_windows_per_run,
+            deadline_seconds,
+            jev_model,
+            host,
+        } => {
+            let mut host = host.config();
+            host.jev_model = jev_model;
+            let config = gptgrep_host::EnrichConfig {
+                host,
+                ledger_path,
+                resume,
+                expected_plan_sha256,
+                window_bytes,
+                max_hints_per_window,
+                max_builder_calls,
+                max_jev_calls,
+                max_ledger_bytes,
+                max_windows_per_run,
+                timeout_secs: deadline_seconds,
+            };
+            if plan_only {
+                let plan = gptgrep_host::plan_enrichment(&root, &config)?;
+                if config
+                    .expected_plan_sha256
+                    .as_ref()
+                    .is_some_and(|expected| expected != &plan.plan_sha256)
+                {
+                    bail!("Enrichment plan digest differs from --expected-plan-sha256");
+                }
+                if let Some(path) = &plan_output {
+                    let mut options = std::fs::OpenOptions::new();
+                    options.write(true).create_new(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        options.mode(0o600);
+                    }
+                    let mut file = options
+                        .open(path)
+                        .context("create immutable enrichment plan")?;
+                    serde_json::to_writer_pretty(&mut file, &plan)?;
+                    file.write_all(b"\n")?;
+                    file.sync_all()?;
+                }
+                let worst_case_within_caps = plan.worst_case_builder_calls
+                    <= config.max_builder_calls
+                    && plan.worst_case_jev_calls <= config.max_jev_calls;
+                let compact = json!({"schema_version":"gptgrep.enrich-plan.v1",
+                    "status":"plan_prepared","plan_sha256":plan.plan_sha256,
+                    "generation":plan.binding.source.generation,
+                    "manifest_sha256":plan.binding.source.manifest_sha256,
+                    "unit_count":plan.unit_count,
+                    "worst_case_builder_calls":plan.worst_case_builder_calls,
+                    "worst_case_jev_calls":plan.worst_case_jev_calls,
+                    "worst_case_within_declared_caps":worst_case_within_caps,
+                    "plan_output":plan_output,"new_model_calls":0});
+                if cli.json {
+                    emit(&compact)?;
+                } else {
+                    println!(
+                        "Planned {} raw windows; SHA-256 {} (zero model calls; worst-case caps {})",
+                        plan.unit_count,
+                        plan.plan_sha256,
+                        if worst_case_within_caps {
+                            "sufficient"
+                        } else {
+                            "insufficient"
+                        }
+                    );
+                }
+            } else {
+                let report = gptgrep_host::enrich(&root, &config).await?;
+                if cli.json {
+                    emit(&serde_json::to_value(&report)?)?;
+                } else {
+                    println!(
+                        "Enrichment {}: {} windows complete, {} reused; plan {}",
+                        report.status,
+                        report.windows_completed,
+                        report.windows_reused,
+                        report.plan_sha256
+                    );
+                }
+                return Ok(if report.status == "complete" { 0 } else { 2 });
             }
         }
         Command::Search {
@@ -734,5 +911,63 @@ mod query_plan_cli_tests {
             schema["commands"]["ask"]["options"]["experimental-evidence-roles"]["requires"],
             "experimental-query-plan"
         );
+    }
+
+    #[test]
+    fn enrichment_has_a_separate_builder_model_and_offline_plan() {
+        let plan = Cli::try_parse_from([
+            "gptgrep",
+            "enrich",
+            ".",
+            "--ledger-path",
+            "/tmp/gptgrep-builder.jsonl",
+            "--max-builder-calls",
+            "12",
+            "--max-jev-calls",
+            "12",
+            "--plan-only",
+        ])
+        .expect("explicit zero-model enrichment plan");
+        assert!(matches!(plan.command, Some(Command::Enrich {
+            plan_only: true, host: EnrichHostArgs { builder_model, .. }, ..
+        }) if builder_model == "gpt-6-luna"));
+        assert!(
+            Cli::try_parse_from([
+                "gptgrep",
+                "enrich",
+                ".",
+                "--ledger-path",
+                "/tmp/gptgrep-builder.jsonl",
+                "--max-builder-calls",
+                "12",
+                "--max-jev-calls",
+                "12",
+                "--plan-output",
+                "/tmp/gptgrep-plan.json",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "gptgrep",
+                "enrich",
+                ".",
+                "--ledger-path",
+                "/tmp/gptgrep-builder.jsonl",
+                "--max-builder-calls",
+                "12",
+                "--max-jev-calls",
+                "12",
+                "--model",
+                "gpt-5.6-luna",
+            ])
+            .is_err()
+        );
+        let schema = contract();
+        assert_eq!(
+            schema["commands"]["enrich"]["defaults"]["builder_model"],
+            "gpt-6-luna"
+        );
+        assert_eq!(schema["commands"]["enrich"]["plan_only_model_calls"], 0);
     }
 }

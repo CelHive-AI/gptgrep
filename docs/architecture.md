@@ -181,6 +181,21 @@ the corresponding agentic service role, while Flash extraction parity remains a
 separate stage-by-stage differential evaluation. See the source research and
 crate notices for implemented stages and remaining differences.
 
+## Optional reasoning-index enrichment
+
+`index` publishes the deterministic LiteParse/tree/tgrep generation without a
+model. Explicit `enrich` then traverses every admitted document through a
+source-pinned UTF-8 byte cursor. Its no-model plan binds all windows and worst
+case budgets; live Codex (builder default `gpt-6-luna`) proposes small closed
+schema hints, and Jev classifies their support against exact raw anchors.
+Builder/Jev attempts use a separate durable ledger, and validated complete
+windows can be reused after a safe budget pause. Incomplete work does not
+publish an active overlay. A complete overlay has its own atomic pointer bound
+to the original generation and source bytes. Hints are navigation-only data:
+they neither rewrite tree coordinates nor grant citation authority. Ordinary
+`ask` does not yet consume this overlay; opt-in Jev navigation is a separate
+integration stage before a quality claim.
+
 
 ## Experimental query planning
 
