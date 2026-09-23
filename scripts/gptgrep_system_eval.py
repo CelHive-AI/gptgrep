@@ -44,7 +44,32 @@ def query_strategy_flags(args) -> tuple[bool, bool]:
 
 def selected_planner_profile(args) -> dict:
     model = getattr(args, "planner_model", None)
-    return planner_profile(DEFAULT_PLANNER_MODEL if model is None else model)
+    return planner_profile(DEFAULT_PLANNER_MODEL if model is None else model,
+                           getattr(args, "reasoning_effort", None) or "max")
+
+
+def _builder_models():
+    # The legacy branch does not import or depend on the enrichment validator.
+    import native_builder_models
+    return native_builder_models
+
+
+def enrichment_enabled(args) -> bool:
+    value = getattr(args, "experimental_enrichment", False)
+    if type(value) is not bool:
+        raise ValueError("Experimental enrichment flag must be boolean")
+    return value
+
+
+def navigation_arguments(args) -> list[str]:
+    if not enrichment_enabled(args):
+        return []
+    publication = getattr(args, "_enrichment_publication", None)
+    if not isinstance(publication, dict):
+        raise ValueError("enrichment_complete_overlay_required_before_reader")
+    return ["--navigation-overlay-sha256", publication["artifact_sha256"],
+            "--navigation-max-jev-calls", str(args._enrichment_config["navigation_max_jev_calls"]),
+            "--navigation-max-request-bytes", str(args._enrichment_config["navigation_max_request_bytes"])]
 
 
 def ask_arguments(binary: Path, root: Path, row: dict, args) -> list[str]:
@@ -58,12 +83,363 @@ def ask_arguments(binary: Path, root: Path, row: dict, args) -> list[str]:
             "--max-tool-calls", str(args.max_tool_calls),
             "--max-input-bytes", str(getattr(args, "max_input_bytes", 262144))] + (
                 ["--experimental-query-plan", "--planner-model", selected_planner_profile(args)["model"]] if planned else []
-            ) + (["--experimental-evidence-roles"] if evidence_roles else []) + [
+            ) + (["--experimental-evidence-roles"] if evidence_roles else []) + navigation_arguments(args) + [
                 "--json", "--", row["question"], str(root)]
 
 
 def build_arguments(binary: Path, corpus: Path, optimize_merge: bool) -> list[str]:
     return [str(binary), "index", str(corpus), "--json"] + (["--optimize-merge"] if optimize_merge else [])
+
+
+def enrichment_config(args, profile):
+    if not enrichment_enabled(args):
+        return None
+    bm = _builder_models()
+    planned, _ = query_strategy_flags(args)
+    bm.require(planned and args.rows == "all" and not args.retry_failed,
+               "enrichment_requires_complete_cohort_planning_and_no_blanket_retry")
+    reader = profile["roles"]["chat"]
+    builder = {"model": getattr(args, "builder_model", None) or reader["model"],
+               "reasoning_effort": getattr(args, "builder_reasoning_effort", None) or reader["reasoning_effort"], "service_tier": "fast"}
+    bm.require(builder["reasoning_effort"] in ("high", "xhigh", "max"), "enrichment_builder_effort_invalid")
+    bm.require(reader == builder == selected_planner_profile(args), "enrichment_builder_planner_reader_profiles_must_match")
+    bm.require(profile["roles"]["judge"] == {"model": "gpt-5.6-luna", "reasoning_effort": "high", "service_tier": "fast"}
+               and args.jev_model == "typesafe/jev-1.13", "enrichment_fixed_judge_or_jev_profile_changed")
+    values = {
+        "builder": builder, "jev_model": args.jev_model,
+        "max_builder_calls": getattr(args, "max_builder_calls", None),
+        "max_jev_calls": getattr(args, "max_builder_jev_calls", None),
+        "window_bytes": getattr(args, "enrich_window_bytes", 8192),
+        "max_hints_per_window": getattr(args, "enrich_max_hints_per_window", 4),
+        "max_ledger_bytes": getattr(args, "enrich_max_ledger_bytes", 64 * 1024 * 1024),
+        "max_windows_per_run": getattr(args, "enrich_max_windows_per_run", 65536),
+        "deadline_seconds": getattr(args, "enrich_deadline_seconds", 900),
+        "call_timeout_secs": getattr(args, "builder_timeout", 180),
+        "max_input_bytes": args.max_input_bytes,
+        "navigation_max_jev_calls": getattr(args, "navigation_max_jev_calls", 32),
+        "navigation_max_request_bytes": getattr(args, "navigation_max_request_bytes", 2 * 1024 * 1024),
+        "outer_invocation_cap": args.max_model_calls,
+    }
+    for name in ("max_builder_calls", "max_jev_calls", "max_windows_per_run"):
+        bm.integer(values[name], positive=True, maximum=65536)
+    bm.require(4 <= values["window_bytes"] <= 65536 and 1 <= values["max_hints_per_window"] <= 4,
+               "enrichment_window_or_hint_bound_invalid")
+    bm.require(256 * 1024 <= values["max_ledger_bytes"] <= 256 * 1024 * 1024, "enrichment_ledger_cap_invalid")
+    bm.integer(values["deadline_seconds"], positive=True, maximum=86400)
+    bm.integer(values["call_timeout_secs"], positive=True, maximum=900)
+    bm.integer(values["navigation_max_jev_calls"], positive=True, maximum=128)
+    bm.integer(values["navigation_max_request_bytes"], positive=True, maximum=8 * 1024 * 1024)
+    bm.integer(values["outer_invocation_cap"], positive=True)
+    return values
+
+
+def enrichment_preflight(binary, run_dir):
+    process = owned_process([str(binary), "--schema"], run_dir, 30)
+    bm = _builder_models()
+    bm.require(process.returncode == 0 and len(process.stdout) <= 1024 * 1024,
+               "enrichment_cli_schema_unavailable_zero_model_preflight")
+    contract = bm.parse(process.stdout)
+    bm.check_cli_contract(contract)
+    for name in ("navigation-max-jev-calls", "navigation-max-request-bytes"):
+        bm.require(contract["commands"]["ask"]["options"].get(name, {}).get("type") == "integer",
+                   "enrichment_navigation_budget_cli_contract_unavailable_zero_model_preflight")
+    return hashlib.sha256(process.stdout).hexdigest()
+
+
+def enrichment_arguments(binary, corpus, args, directory, *, plan_only=False, semantic_sha=None, resume=False):
+    config = args._enrichment_config
+    command = [str(binary), "enrich", str(corpus), "--ledger-path", str(directory / "ledger.jsonl"),
+               "--builder-model", config["builder"]["model"], "--reasoning-effort", config["builder"]["reasoning_effort"], "--service-tier", "fast",
+               "--jev-model", config["jev_model"], "--codex-bin", args.codex_bin,
+               "--codex-home", str(args.codex_home.expanduser().resolve()),
+               "--timeout", str(config["call_timeout_secs"]), "--max-input-bytes", str(config["max_input_bytes"]),
+               "--window-bytes", str(config["window_bytes"]), "--max-hints-per-window", str(config["max_hints_per_window"]),
+               "--max-builder-calls", str(config["max_builder_calls"]), "--max-jev-calls", str(config["max_jev_calls"]),
+               "--max-ledger-bytes", str(config["max_ledger_bytes"]), "--max-windows-per-run", str(config["max_windows_per_run"]),
+               "--deadline-seconds", str(config["deadline_seconds"]), "--json"]
+    if plan_only:
+        command += ["--plan-only", "--plan-output", str(directory / "plan.json")]
+    if semantic_sha is not None:
+        command += ["--expected-plan-sha256", semantic_sha]
+    if resume:
+        command += ["--resume"]
+    return command
+
+
+def enrichment_new_json(path, value):
+    bm = _builder_models()
+    path = Path(path)
+    bm.require(not path.is_symlink() and all(not parent.is_symlink() for parent in path.parents), "enrichment_artifact_redirected")
+    raw = bm.encoded(value) + b"\n"
+    bm.require(len(raw) <= bm.MAX_LEDGER_BYTES, "enrichment_artifact_byte_limit")
+    with path.open("xb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def enrichment_plan_inputs(corpus, build, canonical, args):
+    bm = _builder_models()
+    generation = build["generation_binding"]
+    path = corpus / ".gptgrep/generations" / generation["generation"] / "manifest.json"
+    bm.require(bm.digest(path) == generation["manifest_sha256"], "enrichment_generation_manifest_changed")
+    manifest = bm.read_json(path, 128 * 1024 * 1024)
+    documents = {doc["path"]: {"document_id": doc["id"], "path": doc["path"], "source_sha256": doc["source_sha256"],
+                               "text_sha256": doc["text_sha256"], "text_bytes": len(canonical[doc["path"]])}
+                 for doc in manifest["documents"]}
+    config = args._enrichment_config
+    binding = {"schema_version": "gptgrep.enrich.binding.v1", "root": str(corpus.resolve()),
+               "source": {"generation": generation["generation"], "manifest_sha256": generation["manifest_sha256"],
+                          "documents_total": len(documents), "nodes_total": sum(len(doc["nodes"]) for doc in manifest["documents"])},
+               "builder_model": config["builder"]["model"], "reasoning_effort": config["builder"]["reasoning_effort"], "service_tier": "fast",
+               "codex_bin": args.codex_bin, "codex_home": str(args.codex_home.expanduser().resolve()),
+               **{key: config[key] for key in ("call_timeout_secs", "max_input_bytes", "jev_model", "window_bytes",
+                                              "max_hints_per_window", "max_builder_calls", "max_jev_calls", "max_ledger_bytes")}}
+    return binding, documents
+
+
+def prepare_enrichment(binary, corpus, args, run_dir, manifest, build, canonical):
+    bm = _builder_models()
+    directory = run_dir / "enrichment"
+    private_directory(directory)
+    plan_path, prepared_path = directory / "plan.json", directory / "prepared.json"
+    expected, documents = enrichment_plan_inputs(corpus, build, canonical, args)
+    if prepared_path.exists():
+        prepared = bm.read_json(prepared_path)
+        bm.require(prepared["run_binding"] == run_binding(manifest) and prepared["plan_file_sha256"] == bm.digest(plan_path),
+                   "enrichment_prepared_binding_changed")
+        plan = bm.validate_plan(bm.read_json(plan_path), expected, documents, canonical)
+        bm.require(prepared["plan_sha256"] == plan["plan_sha256"], "enrichment_prepared_plan_changed")
+    else:
+        bm.require(args.stage == "plan", "enrichment_requires_zero_model_plan_stage_first")
+        bm.require(not plan_path.exists() and not (directory / "ledger.jsonl").exists(), "enrichment_unbound_preparation_artifact")
+        process = owned_process(enrichment_arguments(binary, corpus, args, directory, plan_only=True), run_dir, args.build_timeout)
+        bm.require(process.returncode == 0 and len(process.stdout) <= 1024 * 1024, "enrichment_zero_model_plan_failed")
+        compact = bm.parse(process.stdout)
+        bm.require(compact.get("schema_version") == "gptgrep.enrich-plan.v1" and compact.get("status") == "plan_prepared"
+                   and compact.get("new_model_calls") == 0 and compact.get("worst_case_within_declared_caps") is True,
+                   "enrichment_zero_model_plan_or_caps_invalid")
+        plan = bm.validate_plan(bm.read_json(plan_path), expected, documents, canonical)
+        bm.require(compact.get("plan_sha256") == plan["plan_sha256"] and compact.get("unit_count") == plan["unit_count"],
+                   "enrichment_compact_plan_differs")
+        prepared = {"schema_version": "gptgrep.system-enrichment-prepared.v1", "run_binding": run_binding(manifest),
+                    "plan_sha256": plan["plan_sha256"], "plan_file_sha256": bm.digest(plan_path),
+                    "generation_binding": build["generation_binding"], "config": args._enrichment_config,
+                    "zero_model_plan_stdout_sha256": hashlib.sha256(process.stdout).hexdigest(),
+                    "ledger_path": str(directory / "ledger.jsonl"), "unit_count": plan["unit_count"]}
+        enrichment_new_json(directory / "plan-receipt.json", compact)
+        enrichment_new_json(prepared_path, prepared)
+    bm.require(prepared["generation_binding"] == build["generation_binding"] and prepared["config"] == args._enrichment_config
+               and prepared["ledger_path"] == str(directory / "ledger.jsonl"), "enrichment_prepared_conditions_changed")
+    if args.stage == "run":
+        bm.require(getattr(args, "expected_enrichment_plan_sha256", None) == plan["plan_sha256"],
+                   "enrichment_explicit_expected_plan_sha256_required")
+    return prepared, plan
+
+
+def enrichment_payload(args, prepared, *, resume):
+    # Explicit allowlist: no task row, question, gold, annotations or answer state.
+    return {"operation": "enrich", "phase": "enrichment:native", **args._enrichment_config["builder"],
+            "config": args._enrichment_config, "plan_sha256": prepared["plan_sha256"],
+            "plan_file_sha256": prepared["plan_file_sha256"], "generation_binding": prepared["generation_binding"],
+            "ledger_path": prepared["ledger_path"], "resume": resume}
+
+
+def enrichment_accounting_view(ledger):
+    if ledger is None:
+        return {"available": False, "builder": None, "jev": None, "unknown_attempts": True}
+    builder = {key: value for key, value in ledger["builder"].items() if key != "model_turns"}
+    turns = ledger["builder"]["model_turns"]
+    builder.update(observed_model_turns=len(turns), model_turn_identity_sha256=fingerprint(
+        [[turn["thread_id"], turn["turn_id"]] for turn in turns]))
+    return {"available": True, "ledger_sha256": ledger["ledger_sha256"], "ledger_bytes": ledger["ledger_bytes"],
+            "validated_chain": ledger["validated_chain"], "validation_error": ledger["validation_error"],
+            "builder": builder, "jev": ledger["jev"], "windows_completed": len(ledger["windows"]),
+            "scope": "One cumulative enrichment ledger, counted once across all outer enrichment invocations",
+            "limits": ledger["limits"]}
+
+
+def invoke_enrichment(shared, arguments, payload, timeout, plan, *, price_card=None):
+    bm = _builder_models()
+    report, ledger = {}, None
+    with shared.external_attempt(payload, phase=payload["phase"], model=payload["model"], effort=payload["reasoning_effort"],
+                                 service_tier=payload["service_tier"], role="index", operation="native_enrich") as attempt:
+        receipt = attempt.receipt
+        response_path = shared.run_dir / "calls" / f"{receipt['ordinal']:05d}.response.json"
+        try:
+            process = attempt.run(arguments, timeout=timeout)
+            bm.require(len(process.stdout) <= 4 * 1024 * 1024, "enrichment_report_byte_limit")
+            with response_path.open("xb") as stream:
+                stream.write(process.stdout)
+                stream.flush()
+                os.fsync(stream.fileno())
+            receipt.update(response_sha256=bm.digest(response_path), exit_code=process.returncode)
+            report = bm.parse(process.stdout)
+            ledger = bm.validate_ledger(Path(payload["ledger_path"]), plan, allow_partial=report.get("status") != "complete", price_card=price_card)
+            bm.validate_enrich_report(report, ledger, plan, Path(payload["ledger_path"]))
+            bm.require(process.returncode == (0 if report["status"] == "complete" else 2), "enrichment_exit_status_differs")
+            receipt.update(status="completed" if report["status"] == "complete" else "failed", enrichment_status=report["status"],
+                           error_code=None if report["status"] == "complete" else "enrichment_" + report["status"])
+        except Exception as error:
+            receipt.update(status="failed", error_code="enrichment_outer_or_validation_failed", error_type=type(error).__name__)
+            if ledger is None and Path(payload["ledger_path"]).exists():
+                try:
+                    ledger = bm.validate_ledger(Path(payload["ledger_path"]), plan, allow_partial=True, price_card=price_card)
+                except (ValueError, OSError, KeyError, TypeError):
+                    pass
+            if hasattr(error, "cleanup"):
+                receipt["timeout_cleanup"] = error.cleanup
+        receipt["enrichment_accounting"] = enrichment_accounting_view(ledger)
+        receipt["usage_scope"] = "outer_process_only; builder/Jev usage is in the separate cumulative ledger"
+    return report, shared.call_by_ordinal(receipt["ordinal"]), ledger
+
+
+def run_enrichment(binary, corpus, args, run_dir, shared, prepared, plan):
+    bm = _builder_models()
+    directory = run_dir / "enrichment"
+    ledger_path = directory / "ledger.jsonl"
+    attempts = [call for call in shared.calls if call.get("operation") == "native_enrich"]
+    prior, report, ledger = None, {}, None
+    for position, call in enumerate(attempts):
+        retained = call.get("enrichment_accounting") or {}
+        if retained.get("available") is True:
+            size = bm.integer(retained.get("ledger_bytes"), maximum=args._enrichment_config["max_ledger_bytes"])
+            expected = bm.sha(retained.get("ledger_sha256"))
+            observed = hashlib.sha256()
+            with bm.regular(ledger_path).open("rb") as stream:
+                remaining = size
+                while remaining:
+                    block = stream.read(min(1024 * 1024, remaining))
+                    bm.require(block, "enrichment_prior_ledger_truncated")
+                    observed.update(block)
+                    remaining -= len(block)
+            bm.require(observed.hexdigest() == expected, "enrichment_prior_ledger_prefix_changed")
+        request_path = run_dir / "calls" / f"{call['ordinal']:05d}.request.json"
+        response_path = run_dir / "calls" / f"{call['ordinal']:05d}.response.json"
+        request = bm.read_json(request_path)
+        bm.require(call.get("request_sha256") == bm.digest(request_path)
+                   and request == enrichment_payload(args, prepared, resume=request.get("resume")), "enrichment_retained_request_changed")
+        bm.require(type(request.get("resume")) is bool, "enrichment_resume_binding_invalid")
+        if response_path.exists():
+            bm.require(call.get("response_sha256") == bm.digest(response_path), "enrichment_retained_response_changed")
+            value = bm.read_json(response_path, 4 * 1024 * 1024)
+            if value.get("status") == "complete":
+                bm.require(call.get("status") == "completed", "enrichment_completed_response_lacks_valid_receipt")
+                bm.require(position == len(attempts) - 1, "enrichment_attempt_after_completed_publication")
+                report, prior = value, call
+                break
+            report = value
+        prior = call
+    if prior is not None:
+        ledger = bm.validate_ledger(ledger_path, plan, allow_partial=report.get("status") != "complete", price_card=args._price_card) if ledger_path.exists() else None
+        if report.get("status") == "complete":
+            bm.validate_enrich_report(report, ledger, plan, ledger_path)
+        elif not getattr(args, "resume_enrichment", False):
+            return {"status": "incomplete" if report.get("status") == "incomplete" else "failed", "report": report,
+                    "accounting": enrichment_accounting_view(ledger), "outer_invocations": len(attempts), "reader_admitted": False}
+        else:
+            bm.require(report.get("status") == "incomplete" and report.get("resume_safe") is True and ledger is not None
+                       and ledger["resume_safe"] and ledger["validated_chain"], "enrichment_failed_pending_or_uncommitted_work_cannot_resume")
+            bm.validate_enrich_report(report, ledger, plan, ledger_path)
+    else:
+        bm.require(not ledger_path.exists() and not getattr(args, "resume_enrichment", False), "enrichment_orphan_ledger_or_invalid_resume")
+    if report.get("status") != "complete":
+        resume = prior is not None
+        payload = enrichment_payload(args, prepared, resume=resume)
+        report, receipt, ledger = invoke_enrichment(shared,
+            enrichment_arguments(binary, corpus, args, directory, semantic_sha=plan["plan_sha256"], resume=resume),
+            payload, args._enrichment_config["deadline_seconds"] + 60, plan, price_card=args._price_card)
+        attempts = [call for call in shared.calls if call.get("operation") == "native_enrich"]
+        if receipt.get("status") != "completed" or report.get("status") != "complete":
+            return {"status": "incomplete" if report.get("status") == "incomplete" else "failed", "report": report,
+                    "accounting": enrichment_accounting_view(ledger), "outer_invocations": len(attempts), "reader_admitted": False}
+    publication = bm.validate_publication(corpus, report, ledger, plan)
+    ready = {"schema_version": "gptgrep.system-enrichment-ready.v1", "run_binding": prepared["run_binding"], "plan_file_sha256": prepared["plan_file_sha256"],
+             "plan_sha256": plan["plan_sha256"], "publication": publication, "ledger_sha256": ledger["ledger_sha256"],
+             "ledger_bytes": ledger["ledger_bytes"]}
+    ready_path = directory / "ready.json"
+    if ready_path.exists():
+        bm.require(bm.read_json(ready_path) == ready, "enrichment_ready_binding_changed")
+    else:
+        enrichment_new_json(ready_path, ready)
+    args._enrichment_publication = publication
+    return {"status": "complete", "report": report, "prepared": prepared, "ready": ready,
+            "accounting": enrichment_accounting_view(ledger), "outer_invocations": len(attempts), "reader_admitted": True}
+
+
+def enrichment_preparation_failure(manifest, rows, run_dir, build, enrichment, *, stage):
+    cases = []
+    for row in rows:
+        path = run_dir / "cases" / f"{row['source_row']:03d}" / "case.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            case = locks.read_json(path)
+            if case.get("reader_attempt") is not None or case.get("host_receipt") is not None:
+                raise ValueError("enrichment_preparation_changed_beneath_retained_reader")
+        case = {"source_row": row["source_row"], "doc_id": row["doc_id"], "status": stage,
+                "case_identity": fingerprint({"row": row, "run_binding": run_binding(manifest)}),
+                "reader_not_started": True, "judge": {"status": "not_started"}}
+        write_json(path, case)
+        cases.append(case)
+    report = {**manifest, "status": "incomplete", "build_result": build, "enrichment_result": enrichment,
+              "cases": cases, "summary": summarize(cases, len(rows)), "comparison_eligible": False,
+              "host_invocations": len((run_dir / "host-calls.jsonl").read_text().splitlines()) if (run_dir / "host-calls.jsonl").exists() else 0,
+              "model_usage_note": "Incomplete preparation does not admit readers; failed/unknown builder work remains separately accounted."}
+    write_json(run_dir / "summary.json", report)
+    return report
+
+
+def enrichment_cost_projection(args, cumulative, shared, enrichment, summary, manifest):
+    bm = _builder_models()
+    turns = [record for attempt in cumulative["attempts"] for record in (attempt.get("model_attempts") or [])]
+    unknown = cumulative["native_model_turn_accounting"]["unavailable_native_ask_accounting"]
+    jev_calls = [attempt["cost"].get("attempted_calls") for attempt in cumulative["attempts"]]
+    qa_jev = {"attempted_calls": sum(jev_calls) if all(type(value) is int for value in jev_calls) else None,
+              "accounting_complete": cumulative["accounting_complete"],
+              "measured_cost_usd": cumulative["measured_jev_cost_usd"],
+              "known_cost_subtotal_usd": cumulative["known_jev_cost_subtotal_usd"]}
+    count = summary["question_denominator"]
+    expected_roles = {"query_planner": count, "final_reader": count}
+    actual = bm.combined_model_jev_cost(bm.price_model_turns(turns, unknown_groups=unknown, price_card=args._price_card, expected_roles=expected_roles), qa_jev, count)
+    standard = bm.combined_model_jev_cost(bm.price_model_turns(turns, unknown_groups=unknown, price_card=args._price_card, normalization="standard", expected_roles=expected_roles), qa_jev, count)
+    index = enrichment["accounting"]
+    if index.get("available"):
+        observed = index["jev"]
+        index_jev = {"attempted_calls": observed["summary"]["attempted_calls"],
+                     "accounting_complete": observed["accounting_complete"] and observed["missing_cost_calls"] == 0,
+                     "measured_cost_usd": observed["measured_cost_usd"], "known_cost_subtotal_usd": observed["known_cost_subtotal_usd"]}
+        index_projection = {
+            "effective_tier": bm.combined_model_jev_cost(index["builder"]["api_price_equivalent"], index_jev),
+            "standard_normalized": bm.combined_model_jev_cost(index["builder"]["standard_normalized_api_price_equivalent"], index_jev),
+            "deterministic_index_model_calls": 0, "local_compute_cost_measured": False,
+            "excluded_from_g5": True,
+        }
+    else:
+        index_projection = {"complete": False, "excluded_from_g5": True}
+    judge_records = [{"role": "independent_judge", "model": call.get("model"), "thread_id": call.get("thread_id"),
+                      "turn_id": call.get("turn_id"), "effective_service_tier": call.get("effective_service_tier"),
+                      "usage": call.get("usage"), "accounting_complete": call.get("status") == "completed"}
+                     for call in shared.calls if call.get("phase", "").startswith("judge:native:")]
+    references = {}
+    metadata = manifest["external_reference_bindings"].get("original_pageindex_documents")
+    if metadata:
+        references["original_pageindex_index"] = {**bm.original_index_costs(bm.read_json(Path(metadata["path"])), sorted(manifest["source_hashes"])),
+                                                  "source_sha256": metadata["sha256"]}
+    adapted = manifest["external_reference_bindings"].get("adapted_trace_summary")
+    if adapted:
+        raw = bm.read_json(Path(adapted["path"]))
+        origin = raw.get("historical_index_origin")
+        references["adapted_live_index"] = {"source_sha256": adapted["sha256"], "billing_usd": None,
+            "scope": "Historical index origin is separate from the original benchmark and G5; missing usage is not zero",
+            "origin_usage_missing": origin.get("origin_usage_missing") if isinstance(origin, dict) else None}
+    return {"price_card": manifest["price_card"], "actual_account_billing_usd": None,
+            "qa_standard_normalized": standard, "qa_effective_tier_api_equivalent": actual,
+            "standard_normalized_qa_usd_per_question": standard["per_question_usd_equivalent"],
+            "effective_tier_qa_api_equivalent_usd_per_question": actual["per_question_usd_equivalent"],
+            "index_enrichment_separate": index_projection,
+            "independent_judge_separate": bm.price_model_turns(judge_records, price_card=args._price_card),
+            "external_index_references": references,
+            "g5_dual_gate_observation": bm.qa_dual_gate_observation(summary, standard)}
 
 
 def jev_receipt(report: dict) -> dict | None:
@@ -247,6 +623,8 @@ def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeo
             role_policy = evidence_role_policy(report, payload)
             if role_policy is not None:
                 receipt["evidence_role_policy"] = role_policy
+            if "navigation_overlay" in payload:
+                receipt["navigation"] = _builder_models().navigation_receipt(report, payload)
             receipt.update(status="completed", model=report["model"], model_provider=report["model_provider"],
                            thread_id=report["thread_id"], turn_id=report["turn_id"], usage=report.get("usage"),
                            reported_host_elapsed_ms=report.get("elapsed_ms"))
@@ -526,6 +904,8 @@ def materialize_corpus(source_directory: Path, corpus: Path, source_hashes: dict
 
 
 def run_binding(manifest: dict) -> str:
+    if manifest.get("schema_version") == "gptgrep.system-eval.v4":
+        return fingerprint(manifest)
     # The invocation ceiling may change; existing attempts still consume it.
     # This never changes reader conditions or the selected cohort.
     return fingerprint({key: value for key, value in manifest.items() if key != "max_host_invocations"})
@@ -602,6 +982,8 @@ def completed_host_response(ordinal: int, request: dict, model: str, effort: str
             raise ValueError("Retained nested model accounting differs from its bound response")
         if call.get("evidence_role_policy") != evidence_role_policy(report, request):
             raise ValueError("Retained evidence-role qualification differs from its bound response")
+        if "navigation_overlay" in request and call.get("navigation") != _builder_models().navigation_receipt(report, request):
+            raise ValueError("Retained navigation receipt differs from its bound response")
     return report, call
 
 
@@ -634,9 +1016,15 @@ def reader_payload(row: dict, args) -> dict:
     if planned:
         payload["experimental_query_plan"] = True
         payload["planner_model"] = selected_planner_profile(args)["model"]
+        payload["planner_reasoning_effort"] = selected_planner_profile(args)["reasoning_effort"]
         payload["max_input_bytes"] = getattr(args, "max_input_bytes", 262144)
     if evidence_roles:
         payload["experimental_evidence_roles"] = True
+    if enrichment_enabled(args):
+        navigation_arguments(args)  # Fail closed when enrichment is not complete.
+        payload["navigation_overlay"] = dict(args._enrichment_publication)
+        payload["navigation_max_jev_calls"] = args._enrichment_config["navigation_max_jev_calls"]
+        payload["navigation_max_request_bytes"] = args._enrichment_config["navigation_max_request_bytes"]
     return payload
 
 
@@ -805,12 +1193,24 @@ def execute(args) -> dict:
         profile["roles"]["query_planner"] = dict(planner)
     profile["roles"]["index"] = {"engine": "deterministic_native", "model": None, "reasoning_effort": None, "service_tier": None}
     profile["index_effort_note"] = "Native build is deterministic; no Jev or generative indexing stage is claimed."
+    enrichment = enrichment_config(args, profile)
+    if enrichment is not None:
+        args._enrichment_config = enrichment
+        profile["roles"]["builder"] = dict(enrichment["builder"])
+        if getattr(args, "price_card", None) is None:
+            raise ValueError("enrichment_requires_explicit_price_card")
+        price_path = args.price_card.expanduser().resolve()
+        args._price_card = _builder_models().validate_price_card(_builder_models().read_json(price_path, 1024 * 1024))
     if not 1 <= args.reader_concurrency <= 64 or not 1 <= args.judge_concurrency <= 64:
         raise ValueError("Reader/judge concurrency must be1..64")
     binary = args.binary.expanduser().resolve()
     judge_binary = (args.judge_binary or args.binary).expanduser().resolve()
     benchmark, upstream = args.benchmark.expanduser().resolve(), args.upstream.expanduser().resolve()
     judge_source = args.judge_source.expanduser().resolve()
+    if enrichment is not None:
+        run_dir = args.run_dir.expanduser().resolve()
+        private_directory(run_dir)
+        cli_contract_sha256 = enrichment_preflight(binary, run_dir)
     verified = locks.verify(upstream, benchmark, judge_source)
     questions = locks.read_json(benchmark / "questions.json")
     groups, cohort_sha = cohorts.load(len(questions), locks.digest(benchmark / "questions.json"))
@@ -870,12 +1270,53 @@ def execute(args) -> dict:
                 "scope_changes": "invalidate the delivered role hint",
                 "cost_note": "Extra judgments and request bytes are measured within the existing union call; request count alone does not establish cost neutrality.",
             }
+    if enrichment is not None:
+        if args.max_model_calls < 2 * len(rows) + 1:
+            raise ValueError("enrichment_outer_cap_cannot_cover_one_complete_primary_cohort")
+        manifest.update(schema_version="gptgrep.system-eval.v4", variant="gptgrep-native-enriched-navigation",
+                        cli_contract_sha256=cli_contract_sha256,
+                        enrichment={"protocol": "raw-complete-overlay-v1", **enrichment,
+                                    "prepared_binding": "enrichment/prepared.json", "reader_binding": "enrichment/ready.json",
+                                    "no_reader_fallback": True, "no_failed_call_retry": True,
+                                    "logical_primary_model_turn_upper_bound": enrichment["max_builder_calls"] + 3 * len(rows),
+                                    "scope": "Deterministic index, separate raw-only builder, selected-model planner/reader, fixed judge/Jev"})
+        manifest["price_card"] = {"path": str(price_path), "sha256": locks.digest(price_path), "card_id": args._price_card["card_id"],
+                                  "schema_version": args._price_card["schema_version"]}
+        manifest["cost_comparison_policy"] = {
+            "g5_scope": "QA planner+reader Standard-normalized API-equivalent plus observed ask Jev cost",
+            "g5_excludes": ["deterministic_index", "enrichment_builder_and_support_jev", "independent_judge"],
+            "price_normalization": "Standard is a comparison normalization; live service remains the requested Fast tier",
+            "baseline_tier_basis": "Original PageIndex Standard is inferred from README/no Fast declaration, not billing proof",
+            "qa_strict_threshold_usd_equivalent": _builder_models().QA_COST_THRESHOLD,
+            "full_cohort_questions": 62, "quality_min_correct": 61,
+            "actual_chatgpt_billing_observed": False, "missing_metering_or_receipts": "unavailable; gate does not pass",
+        }
+        manifest["adapter_files"]["native_builder_models.py"] = locks.digest(REPO / "scripts/pageindex_baseline/native_builder_models.py")
+        manifest["query_strategy"]["navigation"] = {
+            "required": True, "report_schema": "gptgrep.navigation-query.v1",
+            "expected_overlay_binding": "enrichment/ready.json", "full_hint_scan_required": True,
+            "max_jev_calls": enrichment["navigation_max_jev_calls"],
+            "max_request_bytes": enrichment["navigation_max_request_bytes"], "citation_authority": False,
+        }
+        references = {}
+        for attribute, name, scope in (("original_pageindex_results", "original_pageindex_results", "original_oss_aggregate_reference"),
+                                       ("baseline_summary", "adapted_trace_summary", "live_adapted_trace_reference")):
+            value = getattr(args, attribute, None)
+            if value is not None:
+                path = value.expanduser().resolve()
+                references[name] = {"path": str(path), "sha256": locks.digest(path), "scope": scope}
+        original_documents = getattr(args, "original_pageindex_documents", None) or benchmark / "documents.json"
+        if original_documents.exists():
+            path = original_documents.expanduser().resolve()
+            references["original_pageindex_documents"] = {"path": str(path), "sha256": locks.digest(path), "scope": "original_oss_index_cost_metadata_only"}
+        manifest["external_reference_bindings"] = references
+        manifest["comparison_note"] = "Original PageIndex results and adapted live trace are separate references; model/profile differences require explicit external interpretation."
     with (run_dir / ".owner.lock").open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         binding = reuse_manifest(run_dir / "manifest.json", manifest)
         checkpoint_attempt(run_dir / "invocation.json", {"stage": args.stage, "run_binding": binding,
                            "max_host_invocations": args.max_model_calls, "retry_failed": args.retry_failed})
-        if args.stage == "plan":
+        if args.stage == "plan" and enrichment is None:
             ledger = run_dir / "host-calls.jsonl"
             count = len(ledger.read_text().splitlines()) if ledger.exists() else 0
             return {**manifest, "status": "plan_prepared", "comparison_eligible": False,
@@ -883,14 +1324,15 @@ def execute(args) -> dict:
         if args.max_model_calls <= 0:
             raise ValueError("Live evaluation requires an explicit positive host-invocation budget")
         materialize_corpus(benchmark / "documents", corpus, manifest["source_hashes"])
-        shared = LocalCodex(judge_binary, args.codex_bin, args.codex_home.expanduser().resolve(), run_dir,
+        shared = None if enrichment is not None and args.stage == "plan" else LocalCodex(judge_binary, args.codex_bin, args.codex_home.expanduser().resolve(), run_dir,
                             args.max_model_calls, args.timeout, args.model, args.reasoning_effort, args.max_input_bytes,
                             service_tier=args.service_tier, reader_concurrency=args.reader_concurrency,
                             judge_concurrency=args.judge_concurrency)
         build_path = run_dir / "build.json"
         build = locks.read_json(build_path) if build_path.exists() else {"status": "not_built"}
         if build["status"] != "completed" and (build["status"] == "not_built" or args.retry_failed):
-            if any(call.get("phase", "").startswith("answer:native:") for call in shared.calls):
+            retained_calls = shared.calls if shared is not None else [json.loads(line) for line in (run_dir / "host-calls.jsonl").read_text().splitlines()] if (run_dir / "host-calls.jsonl").exists() else []
+            if any(call.get("phase", "").startswith("answer:native:") or call.get("operation") == "native_enrich" for call in retained_calls):
                 raise ValueError("Refuse to rebuild an index beneath retained reader attempts or citations")
             attempt = int(build.get("build_attempt", 0)) + 1
             build = {"status": "started", "build_attempt": attempt, "model_invocations": 0, "jev_indexing_stage": False}
@@ -915,6 +1357,40 @@ def execute(args) -> dict:
         if build_ok and locks.read_json(corpus / ".gptgrep/CURRENT.json") != build["generation_binding"]:
             raise ValueError("Cached native generation changed; never rebuild beneath saved citations")
         canonical = native_snapshot(corpus, manifest["source_hashes"]) if build_ok else {}
+        enrichment_result = None
+        if enrichment is not None:
+            if not build_ok:
+                if shared is not None:
+                    shared.close(cancel=True)
+                return enrichment_preparation_failure(manifest, rows, run_dir, build,
+                    {"status": "not_started", "reader_admitted": False, "accounting": {"available": False}}, stage="build_failed")
+            enrichment_plan = None
+            try:
+                prepared, enrichment_plan = prepare_enrichment(binary, corpus, args, run_dir, manifest, build, canonical)
+                if args.stage == "plan":
+                    return {**manifest, "status": "plan_prepared", "comparison_eligible": False, "build_result": build,
+                            "enrichment_prepared": prepared, "host_invocations": 0, "new_host_invocations": 0,
+                            "expected_enrichment_plan_sha256": prepared["plan_sha256"]}
+                enrichment_result = run_enrichment(binary, corpus, args, run_dir, shared, prepared, enrichment_plan)
+            except Exception as error:
+                retained_accounting = {"available": False}
+                ledger_path = run_dir / "enrichment/ledger.jsonl"
+                retained_changed = any(marker in str(error) for marker in (
+                    "prior_ledger_", "retained_request_changed", "retained_response_changed", "ready_binding_changed"))
+                if enrichment_plan is not None and ledger_path.exists() and not retained_changed:
+                    try:
+                        retained_accounting = enrichment_accounting_view(_builder_models().validate_ledger(
+                            ledger_path, enrichment_plan, allow_partial=True, price_card=args._price_card))
+                    except (ValueError, OSError, KeyError, TypeError):
+                        pass
+                enrichment_result = {"status": "failed", "reader_admitted": False, "error_type": type(error).__name__,
+                                     "error": str(error) if isinstance(error, ValueError) else "enrichment_preparation_or_admission_failed",
+                                     "accounting": retained_accounting}
+            if enrichment_result.get("reader_admitted") is not True:
+                if shared is not None:
+                    shared.close(cancel=True)
+                return enrichment_preparation_failure(manifest, rows, run_dir, build, enrichment_result,
+                    stage="enrichment_incomplete" if enrichment_result["status"] == "incomplete" else "enrichment_failed")
         constants = judge_constants(judge_source)
         def read_case(row):
             case_dir = run_dir / "cases" / f"{row['source_row']:03d}"
@@ -925,6 +1401,10 @@ def execute(args) -> dict:
             case = locks.read_json(case_path) if case_path.exists() else initial.copy()
             if case.get("case_identity") != identity:
                 raise ValueError("Cached native case inputs differ")
+            if enrichment is not None and case.get("status") in ("build_failed", "enrichment_failed", "enrichment_incomplete"):
+                if case.get("reader_attempt") is not None or case.get("host_receipt") is not None:
+                    raise ValueError("enrichment_failed_preparation_has_retained_reader")
+                case = initial.copy()
             if case["status"] != "completed" and case.get("reader_attempt") is not None:
                 attempt_dir = case_dir / "reader-attempts" / f"{case['reader_attempt']:04d}"
                 payload = reader_payload(row, args)
@@ -1176,6 +1656,20 @@ def execute(args) -> dict:
                               for name, members in groups.items()},
                   "timing_note": "Native ask latency includes Jev and Codex. Fresh-host SDK and persistent native-reader overhead remain distinct.",
                   "model_usage_note": "Host invocations are not provider-internal request counts; unknown usage/billing stays null."}
+        if enrichment is not None:
+            report["enrichment_result"] = enrichment_result
+            report["reader_binding"] = enrichment_result["ready"]
+            report["summary"]["enrichment_accounting"] = enrichment_result["accounting"]
+            report["summary"]["enrichment_usage_scope"] = "Builder model turns and support Jev are counted once from their cumulative ledger, separately from native asks and judges."
+            report["cost_projection"] = enrichment_cost_projection(args, cumulative, shared, enrichment_result, summary, manifest)
+            report["summary"].update({name: report["cost_projection"][name] for name in (
+                "standard_normalized_qa_usd_per_question", "effective_tier_qa_api_equivalent_usd_per_question", "g5_dual_gate_observation")})
+            if locks.digest(price_path) != manifest["price_card"]["sha256"]:
+                raise ValueError("enrichment_price_card_changed_during_evaluation")
+            report["timing_note"] += " Deterministic index and enrichment preparation are separate retained stages; summed outer durations are not concurrent cohort wall time."
+            for reference in manifest["external_reference_bindings"].values():
+                if locks.digest(Path(reference["path"])) != reference["sha256"]:
+                    raise ValueError("enrichment_external_reference_changed")
         if args.baseline_summary:
             report["paired_comparison"] = compare_reports(report, locks.read_json(args.baseline_summary.expanduser().resolve()))
         write_json(run_dir / "summary.json", report)
@@ -1213,6 +1707,26 @@ def main() -> int:
     parser.add_argument("--planner-model", help=f"Query-planner model, independent of reader and judge; defaults to {DEFAULT_PLANNER_MODEL} for new planned runs. Requires --experimental-query-plan.")
     parser.add_argument("--experimental-evidence-roles", action="store_true",
                         help="Add bounded Jev evidence-role judgments to the planned union request; requires --experimental-query-plan")
+    parser.add_argument("--experimental-enrichment", action="store_true",
+                        help="Strict v4 full-cohort raw builder + bound navigation; plan stage indexes and writes a zero-model full enrichment plan")
+    parser.add_argument("--builder-model", help="Enrichment model; must match the selected planner and reader")
+    parser.add_argument("--builder-reasoning-effort", choices=["high", "xhigh", "max"],
+                        help="Enrichment effort; defaults to and must match the selected planner/reader effort")
+    parser.add_argument("--max-builder-calls", type=int)
+    parser.add_argument("--max-builder-jev-calls", type=int)
+    parser.add_argument("--builder-timeout", type=int, default=180)
+    parser.add_argument("--enrich-window-bytes", type=int, default=8192)
+    parser.add_argument("--enrich-max-hints-per-window", type=int, default=4)
+    parser.add_argument("--enrich-max-ledger-bytes", type=int, default=64 * 1024 * 1024)
+    parser.add_argument("--enrich-max-windows-per-run", type=int, default=65536)
+    parser.add_argument("--enrich-deadline-seconds", type=int, default=900)
+    parser.add_argument("--expected-enrichment-plan-sha256")
+    parser.add_argument("--resume-enrichment", action="store_true", help="Resume only a validated safe incomplete checkpoint under the same fixed ledger and caps")
+    parser.add_argument("--navigation-max-jev-calls", type=int, default=32)
+    parser.add_argument("--navigation-max-request-bytes", type=int, default=2 * 1024 * 1024)
+    parser.add_argument("--original-pageindex-results", type=Path, help="Hash-bind the original aggregate results separately from the adapted --baseline-summary trace")
+    parser.add_argument("--original-pageindex-documents", type=Path, help="Original documents.json numeric index-cost metadata; defaults to BENCHMARK/documents.json when present")
+    parser.add_argument("--price-card", type=Path, help="Required v4 versioned API price-card JSON; exact SHA is immutable in the run manifest")
     args = parser.parse_args()
     if min(args.timeout, args.build_timeout, args.max_tool_calls, args.max_input_bytes) <= 0 or args.max_model_calls < 0:
         parser.error("Invalid execution bounds")
