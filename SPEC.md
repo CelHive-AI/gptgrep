@@ -72,6 +72,11 @@ live PageIndex Flash baseline on the pinned PageIndex-OSS-Benchmark tasks. A sou
 release, passing process, synthetic smoke or GPTgrep-only corpus run does not meet
 this goal. Retain the same corpus/task cohort, pinned source revisions, declared prompt
 and tool budgets, judge and failure denominators for each comparison. The
+benchmark repository's original local-OSS `results.json` is a separately labelled
+native reference: PageIndex Flash plus GPT-5.6 Luna/high reports 60/62. Our
+qualified R8 live SDK/Codex adapter also reports 60/62 with Luna/max reader and
+retained paired tool evidence. Equal aggregate counts do not merge their answer,
+backend, effort, indexing-cost or timing provenance. The
 GPTgrep 5.6-versus-6 Luna ablation changes only the declared Codex builder and
 retrieval-worker model between its arms. For the user-selected first-release
 target, GPTgrep 6 Luna is compared with the frozen PageIndex Flash plus GPT-5.6
